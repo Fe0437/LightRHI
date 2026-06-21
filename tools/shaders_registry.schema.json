@@ -1,0 +1,37 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "LightRHI shader registry",
+    "description": "Lists the Slang shader entry points tools/compile_shaders.py compiles into backend-specific artifacts (SPIR-V for Vulkan, MSL source for Metal). Used by any shaders_registry.generated.json in this module, not just tests.",
+    "type": "object",
+    "required": ["shaders"],
+    "additionalProperties": false,
+    "properties": {
+        "shaders": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "source", "entryPoint", "stage"],
+                "additionalProperties": false,
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_]+$",
+                        "description": "Output artifact stem: <name>.generated.spv / <name>.generated.metal"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Path to the .slang source file, relative to the registry file"
+                    },
+                    "entryPoint": {
+                        "type": "string",
+                        "description": "Slang entry point function name"
+                    },
+                    "stage": {
+                        "type": "string",
+                        "enum": ["vertex", "fragment", "compute"]
+                    }
+                }
+            }
+        }
+    }
+}

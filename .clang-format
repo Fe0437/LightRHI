@@ -1,0 +1,58 @@
+BasedOnStyle: LLVM
+
+# --- Indentation & Layout -----------------------------------------------------
+IndentWidth: 4          # Clear, readable indentation for technical code
+TabWidth: 4
+UseTab: Never           # Tabs cause diff noise; spaces are stable
+ColumnLimit: 120        # OpenUSD names are long; 120 avoids excessive wrapping
+
+# --- Braces -------------------------------------------------------------------
+BreakBeforeBraces: Allman   # Maximizes readability and stable diffs
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: true
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  BeforeElse: true
+
+# --- Pointers & References ----------------------------------------------------
+PointerAlignment: Right     # int* ptr; not int *ptr;
+ReferenceAlignment: Right   # const T& value;
+
+# --- Spacing ------------------------------------------------------------------
+SpaceBeforeParens: ControlStatements  # if (x), while (y), but Foo(x)
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceAfterCStyleCast: false
+
+# --- Alignment ---------------------------------------------------------------
+AlignConsecutiveAssignments: true     # Improves readability of structured data
+AlignConsecutiveDeclarations: true
+AlignTrailingComments: true
+
+# --- Includes -----------------------------------------------------------------
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup     # Groups STL / Pixar / project includes cleanly
+
+# --- Namespaces ---------------------------------------------------------------
+NamespaceIndentation: All
+IndentCaseLabels: true
+
+# --- C++20 Features -----------------------------------------------------------
+RequiresClausePosition: WithPreceding
+BreakBeforeConceptDeclarations: true   # Concepts and requires clauses are clearer
+
+# --- Initialization -----------------------------------------------------------
+Cpp11BracedListStyle: true  # Enforces brace initialization everywhere
+
+# --- Short statements ---------------------------------------------------------
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# --- Control Statements & Braces Enforcement ---------------------------------
+InsertBraces: true          
+RemoveBracesLLVM: false     
