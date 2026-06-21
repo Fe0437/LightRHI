@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "lightrhi",
+  "version": "0.1.0",
+  "description": "Modern C++23 GPU abstraction layer (bindless, Vulkan 1.3 / Metal)",
+  "dependencies": [
+    {
+      "name": "metal-cpp",
+      "platform": "osx"
+    },
+    {
+      "name": "vulkan-memory-allocator",
+      "platform": "!osx"
+    },
+    {
+      "name": "volk",
+      "platform": "!osx"
+    }
+  ]
+}

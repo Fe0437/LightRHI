@@ -1,0 +1,62 @@
+#pragma once
+
+// Tiny backend-neutral shader breadcrumb buffer. A caller selects one GPU
+// thread and gives it the address of one ShaderDebugRecord. The selected
+// thread can leave up to 16 symbol/value pairs for the CPU to inspect
+// after the dispatch. There are deliberately no atomics, strings, rendering,
+// or global bindings in this first iteration.
+
+#ifndef DEBUG_ENABLED
+#define DEBUG_ENABLED 0
+#endif
+
+#if DEBUG_ENABLED
+
+static const uint kShaderDebugSlotCount = 16;
+
+struct ShaderDebugRecord
+{
+    uint ThreadIndex;
+    // Use vectors rather than scalar arrays. Slang's device-memory layout can
+    // give scalar array elements a 16-byte stride on Metal; uint4 stays a
+    // tightly packed 16 bytes on every backend and matches the C++ record.
+    uint4 Symbols0;
+    uint4 Symbols1;
+    uint4 Symbols2;
+    uint4 Symbols3;
+    uint4 Values0;
+    uint4 Values1;
+    uint4 Values2;
+    uint4 Values3;
+};
+
+struct ShaderDebugContext
+{
+    uint64_t RecordAddress;
+    uint     ThreadIndex;
+    bool     Active;
+};
+
+ShaderDebugContext InitShaderDebugContext(uint64_t recordAddress, uint threadIndex, bool active)
+{
+    ShaderDebugContext ctx;
+    ctx.RecordAddress = recordAddress;
+    ctx.ThreadIndex   = threadIndex;
+    ctx.Active        = active && recordAddress != 0;
+    return ctx;
+}
+
+void ShaderDebugWrite(ShaderDebugContext ctx, uint slot, uint symbol, uint value = 0)
+{
+    if (!ctx.Active || slot >= kShaderDebugSlotCount)
+        return;
+
+    // Address as words so backend-specific aggregate layout rules cannot
+    // affect the wire format consumed by the C++ POD.
+    uint *words                  = (uint *)ctx.RecordAddress;
+    words[0]                     = ctx.ThreadIndex;
+    words[1 + slot]              = symbol;
+    words[1 + kShaderDebugSlotCount + slot] = value;
+}
+
+#endif // DEBUG_ENABLED
