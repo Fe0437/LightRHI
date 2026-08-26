@@ -1,6 +1,11 @@
-// RHI.cppm — top-level module unit.
-// Consumers write:  import rhi;
-// and get everything: types, handles, descriptors, pipelines, device, command list.
+/// \file
+/// \brief Re-exports the complete backend-neutral LightRHI API as `rhi`.
+///
+/// \code{.cpp}
+/// import rhi;
+/// \endcode
+/// Applications normally import the backend's `lightRHI` module, which re-exports
+/// this module and provides CreateDevice().
 
 export module rhi;
 

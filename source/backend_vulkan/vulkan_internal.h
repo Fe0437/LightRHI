@@ -19,7 +19,6 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -125,6 +124,12 @@ namespace rhi::vulkan
     struct VkSampler_
     {
         VkSampler sampler{VK_NULL_HANDLE};
+    };
+
+    struct VkTimestampQueryPool_
+    {
+        VkQueryPool pool{VK_NULL_HANDLE};
+        uint32_t    count{0};
     };
 
     struct VkPipeline_
@@ -264,6 +269,7 @@ namespace rhi::vulkan
         static constexpr uint32_t kMaxSamplers{2048};
         static constexpr uint32_t kMaxPipelines{65536};
         static constexpr uint32_t kMaxAccelerationStructures{65536};
+        static constexpr uint32_t kMaxTimestampQueryPools{1024};
 
         explicit VulkanDevice(const DeviceDesc &desc);
         ~VulkanDevice() override;
@@ -296,6 +302,13 @@ namespace rhi::vulkan
         [[nodiscard]] SamplerHandle CreateSampler(const SamplerDesc &d) override;
         void                        DestroySampler(SamplerHandle h) override;
         [[nodiscard]] GpuAddress    SamplerAddress(SamplerHandle h) const override;
+
+        [[nodiscard]] bool                     SupportsComputeTimestamps() const noexcept override;
+        [[nodiscard]] double                   TimestampPeriodNanoseconds() const noexcept override;
+        [[nodiscard]] TimestampQueryPoolHandle CreateTimestampQueryPool(uint32_t count) override;
+        void                                   DestroyTimestampQueryPool(TimestampQueryPoolHandle pool) override;
+        void ResetTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, uint32_t count) override;
+        void ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, std::span<uint64_t> results) override;
 
         [[nodiscard]] PipelineHandle CreateGraphicsPipeline(const GraphicsPipelineDesc &d) override;
         [[nodiscard]] PipelineHandle CreateComputePipeline(const ComputePipelineDesc &d) override;
@@ -350,6 +363,10 @@ namespace rhi::vulkan
         [[nodiscard]] inline VkPipeline_ &Pipeline(PipelineHandle h) noexcept
         {
             return _pipelines.get(h.Index);
+        }
+        [[nodiscard]] inline VkTimestampQueryPool_ &TimestampQueryPool(TimestampQueryPoolHandle h) noexcept
+        {
+            return _timestampQueryPools.get(h.Index);
         }
         [[nodiscard]] inline VulkanBindlessHeap &Heap() noexcept
         {
@@ -432,12 +449,13 @@ namespace rhi::vulkan
         VkPipelineLayout         _globalLayout{VK_NULL_HANDLE};
         uint32_t                 _maxPushConstantBytes{128};
 
-        SlotPool<VkBuffer_>      _buffers{kMaxBuffers};
-        SlotPool<VkTexture_>     _textures{kMaxTextures};
-        SlotPool<VkSampler_>     _samplers{kMaxSamplers};
-        SlotPool<VkPipeline_>    _pipelines{kMaxPipelines};
-        SlotPool<VkAccelStruct_> _accelStructs{kMaxAccelerationStructures};
-        VulkanBindlessHeap       _heap;
+        SlotPool<VkBuffer_>             _buffers{kMaxBuffers};
+        SlotPool<VkTexture_>            _textures{kMaxTextures};
+        SlotPool<VkSampler_>            _samplers{kMaxSamplers};
+        SlotPool<VkPipeline_>           _pipelines{kMaxPipelines};
+        SlotPool<VkAccelStruct_>        _accelStructs{kMaxAccelerationStructures};
+        SlotPool<VkTimestampQueryPool_> _timestampQueryPools{kMaxTimestampQueryPools};
+        VulkanBindlessHeap              _heap;
 
         // Set once in _pickPhysicalDevice; reflects whether
         // VK_KHR_acceleration_structure + VK_KHR_ray_query + their required
@@ -445,7 +463,9 @@ namespace rhi::vulkan
         // both are optional extensions here (unlike VK_EXT_descriptor_buffer,
         // which device selection requires), so a driver/device lacking them
         // still creates a working (non-ray-tracing) VulkanDevice.
-        bool _raytracingSupported{false};
+        bool   _raytracingSupported{false};
+        bool   _computeTimestampsSupported{false};
+        double _timestampPeriodNanoseconds{0.0};
 
         std::string _adapterName;
         uint64_t    _videoMemoryBytes{0};

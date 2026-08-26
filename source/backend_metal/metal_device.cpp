@@ -26,6 +26,7 @@ module;
 #include <dispatch/dispatch.h>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -156,6 +157,10 @@ namespace rhi::metal
     MetalSampler &MetalDevice::Sampler(SamplerHandle h)
     {
         return _samplers.get(h.Index);
+    }
+    MetalTimestampQueryPool &MetalDevice::TimestampQueryPool(TimestampQueryPoolHandle h)
+    {
+        return _timestampQueryPools.get(h.Index);
     }
     MetalPipeline &MetalDevice::Pipeline(PipelineHandle h)
     {
@@ -621,6 +626,79 @@ namespace rhi::metal
             return {};
         }
         return GpuAddress{h.Index};
+    }
+
+    // ============================================================================
+    // Timestamp queries
+    // ============================================================================
+
+    bool MetalDevice::SupportsComputeTimestamps() const noexcept
+    {
+        return _device && _device->queryTimestampFrequency() > 0;
+    }
+
+    double MetalDevice::TimestampPeriodNanoseconds() const noexcept
+    {
+        const uint64_t frequency{_device ? _device->queryTimestampFrequency() : 0};
+        return frequency > 0 ? 1.0e9 / static_cast<double>(frequency) : 0.0;
+    }
+
+    TimestampQueryPoolHandle MetalDevice::CreateTimestampQueryPool(uint32_t count)
+    {
+        if (count == 0)
+        {
+            return {};
+        }
+
+        auto descriptor{NS::TransferPtr(MTL4::CounterHeapDescriptor::alloc()->init())};
+        descriptor->setType(MTL4::CounterHeapTypeTimestamp);
+        descriptor->setCount(count);
+        NS::Error *error{nullptr};
+        auto       heap{NS::TransferPtr(_device->newCounterHeap(descriptor.get(), &error))};
+        if (!heap)
+        {
+            const char *message{error ? error->localizedDescription()->utf8String() : "unknown"};
+            throw std::runtime_error(std::string{"[LightRHI] MTLDevice::newCounterHeap failed: "} + message);
+        }
+
+        const uint32_t index{_timestampQueryPools.alloc()};
+        _timestampQueryPools.get(index) = MetalTimestampQueryPool{.heap = std::move(heap), .count = count};
+        return TimestampQueryPoolHandle{index};
+    }
+
+    void MetalDevice::DestroyTimestampQueryPool(TimestampQueryPoolHandle pool)
+    {
+        if (pool.Valid())
+        {
+            _timestampQueryPools.free(pool.Index);
+        }
+    }
+
+    void MetalDevice::ResetTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, uint32_t count)
+    {
+        if (!pool.Valid() || count == 0)
+        {
+            return;
+        }
+        auto &record{_timestampQueryPools.get(pool.Index)};
+        assert(first <= record.count && count <= record.count - first);
+        record.heap->invalidateCounterRange(NS::Range{first, count});
+    }
+
+    void MetalDevice::ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, std::span<uint64_t> results)
+    {
+        if (!pool.Valid() || results.empty())
+        {
+            return;
+        }
+        auto &record{_timestampQueryPools.get(pool.Index)};
+        assert(first <= record.count && results.size() <= record.count - first);
+        NS::Data *data{record.heap->resolveCounterRange(NS::Range{first, results.size()})};
+        if (!data || data->length() < results.size_bytes())
+        {
+            throw std::runtime_error("[LightRHI] MTL4 timestamp counter resolve failed");
+        }
+        std::memcpy(results.data(), data->bytes(), results.size_bytes());
     }
 
     // ============================================================================

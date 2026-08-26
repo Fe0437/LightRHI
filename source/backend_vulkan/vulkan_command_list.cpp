@@ -496,6 +496,14 @@ namespace rhi::vulkan
             vkCmdFillBuffer(_cmd, _lookupBuf(buf), off, sz, val);
         }
 
+        void WriteComputeTimestamp(TimestampQueryPoolHandle pool, uint32_t index) override
+        {
+            const auto &record{_dev->TimestampQueryPool(pool)};
+            assert(index < record.count);
+            FlushBarriers();
+            vkCmdWriteTimestamp2(_cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, record.pool, index);
+        }
+
         // ---- Debug ----
 
         void BeginDebugGroup(std::string_view name, float r, float g, float b) override

@@ -2,6 +2,7 @@
 
 // Standard headers must precede module imports to avoid include-guard
 // isolation issues (__promote_t redefinition) with LLVM libc++ and C++23 modules.
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -43,17 +44,19 @@ import lightRHI;
 
 TEST(handles_are_invalid_by_default)
 {
-    rhi::BufferHandle   buf{};
-    rhi::TextureHandle  tex{};
-    rhi::SamplerHandle  smp{};
-    rhi::PipelineHandle pip{};
-    rhi::FenceHandle    fen{};
-    rhi::GpuAddress     adr{};
+    rhi::BufferHandle             buf{};
+    rhi::TextureHandle            tex{};
+    rhi::SamplerHandle            smp{};
+    rhi::PipelineHandle           pip{};
+    rhi::TimestampQueryPoolHandle timestamps{};
+    rhi::FenceHandle              fen{};
+    rhi::GpuAddress               adr{};
 
     REQUIRE(!buf.Valid());
     REQUIRE(!tex.Valid());
     REQUIRE(!smp.Valid());
     REQUIRE(!pip.Valid());
+    REQUIRE(!timestamps.Valid());
     REQUIRE(!fen.Valid());
     REQUIRE(!adr.Valid());
 }
@@ -263,6 +266,67 @@ TEST(command_list_begin_end)
     REQUIRE(fence.Valid());
     device->WaitForFence(fence);
     REQUIRE(device->IsFenceComplete(fence));
+}
+
+TEST(timestamp_queries_measure_gpu_work)
+{
+    auto device = rhi::CreateDevice({});
+    if (!device->SupportsComputeTimestamps())
+    {
+        std::printf("  timestamp queries unsupported on compute queue -- skipped\n");
+        return;
+    }
+
+    constexpr uint32_t kCount{1U << 20U};
+    auto               buffer   = device->CreateBuffer({
+        .Size       = static_cast<uint64_t>(kCount) * sizeof(uint32_t),
+        .Usage      = rhi::BufferUsage::Storage | rhi::BufferUsage::DeviceAddress,
+        .MemoryType = rhi::MemoryType::CpuToGpu,
+        .DebugName  = "timestamp_query_work",
+    });
+    const auto         pipeline = device->CreateComputePipeline({
+        .Shader    = rhitest::loadShaderArtifact("compute_fill_bda", "fill_via_bda", rhi::ShaderStage::Compute),
+        .DebugName = "timestamp_query_pipeline",
+    });
+    const auto         queries{device->CreateTimestampQueryPool(2)};
+    REQUIRE(buffer.Valid());
+    REQUIRE(pipeline.Valid());
+    REQUIRE(queries.Valid());
+    REQUIRE(device->TimestampPeriodNanoseconds() > 0.0);
+
+    struct alignas(8) PushConstants
+    {
+        uint64_t OutputAddress;
+        uint32_t Value;
+        uint32_t Count;
+    };
+    const PushConstants constants{
+        .OutputAddress = device->BufferAddress(buffer).Address,
+        .Value         = 0x5AU,
+        .Count         = kCount,
+    };
+
+    device->ResetTimestampQueries(queries, 0, 2);
+    auto command = device->CreateCommandList(rhi::QueueType::Compute, "timestamp_query_command");
+    command->Begin();
+    command->SetPipeline(pipeline);
+    command->SetPushConstants(constants);
+    command->WriteComputeTimestamp(queries, 0);
+    command->Dispatch((kCount + 63U) / 64U, 1, 1);
+    command->WriteComputeTimestamp(queries, 1);
+    command->End();
+    device->WaitForFence(device->Submit(*command));
+
+    std::array<uint64_t, 2> ticks{};
+    device->ReadTimestampQueries(queries, 0, ticks);
+    REQUIRE(ticks[1] > ticks[0]);
+    const double elapsedMs{static_cast<double>(ticks[1] - ticks[0]) * device->TimestampPeriodNanoseconds() / 1.0e6};
+    REQUIRE(elapsedMs > 0.0);
+    std::printf("  timestamp query: %.3f ms GPU time\n", elapsedMs);
+
+    device->DestroyTimestampQueryPool(queries);
+    device->DestroyPipeline(pipeline);
+    device->DestroyBuffer(buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1571,7 @@ int main()
     test_device_texture_and_sampler();
     test_bindless_heap_tracks_resource_lifetimes();
     test_command_list_begin_end();
+    test_timestamp_queries_measure_gpu_work();
 
     std::printf("\n── Integration tests ───────────────────────────\n");
     test_buffer_upload_readback();

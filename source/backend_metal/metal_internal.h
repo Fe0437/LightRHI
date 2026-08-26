@@ -105,6 +105,12 @@ namespace rhi::metal
         NS::SharedPtr<MTL::SamplerState> state;
     };
 
+    struct MetalTimestampQueryPool
+    {
+        NS::SharedPtr<MTL4::CounterHeap> heap;
+        uint32_t                         count{0};
+    };
+
     struct MetalAccelerationStructure
     {
         NS::SharedPtr<MTL::AccelerationStructure> as;
@@ -212,6 +218,7 @@ namespace rhi::metal
         static constexpr uint32_t kMaxSamplers{2048};
         static constexpr uint32_t kMaxPipelines{65536};
         static constexpr uint32_t kMaxAccelerationStructures{65536};
+        static constexpr uint32_t kMaxTimestampQueryPools{1024};
 
         explicit MetalDevice(const DeviceDesc &desc);
         ~MetalDevice() override;
@@ -235,6 +242,13 @@ namespace rhi::metal
         [[nodiscard]] SamplerHandle CreateSampler(const SamplerDesc &d) override;
         void                        DestroySampler(SamplerHandle h) override;
         [[nodiscard]] GpuAddress    SamplerAddress(SamplerHandle h) const override;
+
+        [[nodiscard]] bool                     SupportsComputeTimestamps() const noexcept override;
+        [[nodiscard]] double                   TimestampPeriodNanoseconds() const noexcept override;
+        [[nodiscard]] TimestampQueryPoolHandle CreateTimestampQueryPool(uint32_t count) override;
+        void                                   DestroyTimestampQueryPool(TimestampQueryPoolHandle pool) override;
+        void ResetTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, uint32_t count) override;
+        void ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, std::span<uint64_t> results) override;
 
         [[nodiscard]] PipelineHandle CreateGraphicsPipeline(const GraphicsPipelineDesc &d) override;
         [[nodiscard]] PipelineHandle CreateComputePipeline(const ComputePipelineDesc &d) override;
@@ -271,6 +285,7 @@ namespace rhi::metal
         [[nodiscard]] MetalBuffer                &Buffer(BufferHandle h);
         [[nodiscard]] MetalTexture               &Texture(TextureHandle h);
         [[nodiscard]] MetalSampler               &Sampler(SamplerHandle h);
+        [[nodiscard]] MetalTimestampQueryPool    &TimestampQueryPool(TimestampQueryPoolHandle h);
         [[nodiscard]] MetalPipeline              &Pipeline(PipelineHandle h);
         [[nodiscard]] MetalAccelerationStructure &AccelStruct(AccelerationStructureHandle h);
         [[nodiscard]] FenceHandle                 NextFence() noexcept;
@@ -344,6 +359,7 @@ namespace rhi::metal
         SlotPool<MetalSampler>               _samplers{kMaxSamplers};
         SlotPool<MetalPipeline>              _pipelines{kMaxPipelines};
         SlotPool<MetalAccelerationStructure> _accelStructs{kMaxAccelerationStructures};
+        SlotPool<MetalTimestampQueryPool>    _timestampQueryPools{kMaxTimestampQueryPools};
 
         // Reverse lookup: base GPU address of a live buffer -> its slot index.
         // Needed because AccelerationStructureDesc addresses vertex/index data

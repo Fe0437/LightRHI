@@ -28,7 +28,6 @@ namespace rhi::vulkan
 
     void VulkanDevice::EndCaptureScope() {}
 
-
     // ============================================================================
     // Debug callback
     // ============================================================================
@@ -348,7 +347,8 @@ namespace rhi::vulkan
         descBufProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         VkPhysicalDeviceProperties2 p2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &descBufProps};
         vkGetPhysicalDeviceProperties2(_physDev, &p2);
-        _maxPushConstantBytes = p2.properties.limits.maxPushConstantsSize;
+        _maxPushConstantBytes       = p2.properties.limits.maxPushConstantsSize;
+        _timestampPeriodNanoseconds = static_cast<double>(p2.properties.limits.timestampPeriod);
 
         // Ray tracing (VK_KHR_acceleration_structure + VK_KHR_ray_query) —
         // optional, unlike VK_EXT_descriptor_buffer above: detected here but
@@ -431,6 +431,16 @@ namespace rhi::vulkan
         {
             transferQ.family = gfxQ.family;
         }
+
+        VkPhysicalDeviceVulkan12Features timestampFeatures{.sType =
+                                                               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2        timestampFeatures2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                            .pNext = &timestampFeatures};
+        vkGetPhysicalDeviceFeatures2(_physDev, &timestampFeatures2);
+        const bool hostResetSupported{timestampFeatures.hostQueryReset == VK_TRUE};
+        const bool computeAndGraphicsSupported{timestampFeatures2.features.timestampComputeAndGraphics == VK_TRUE};
+        _computeTimestampsSupported =
+            hostResetSupported && computeAndGraphicsSupported && qfp[computeQ.family].timestampValidBits > 0;
     }
 
     void VulkanDevice::_createLogicalDevice()
@@ -497,6 +507,7 @@ namespace rhi::vulkan
         f12.scalarBlockLayout               = VK_TRUE;
         f12.timelineSemaphore               = VK_TRUE;
         f12.bufferDeviceAddress             = VK_TRUE;
+        f12.hostQueryReset                  = _computeTimestampsSupported;
         VkPhysicalDeviceFeatures features{
             .shaderInt64 = VK_TRUE,
         };
@@ -627,9 +638,9 @@ namespace rhi::vulkan
 
     void VulkanBindlessHeap::Init(VkDevice vkDev, VmaAllocator allocator,
                                   const VkPhysicalDeviceDescriptorBufferPropertiesEXT &properties,
-                                  PFN_vkGetDescriptorEXT getDescriptor,
-                                  PFN_vkGetDescriptorSetLayoutSizeEXT getLayoutSize,
-                                  PFN_vkGetDescriptorSetLayoutBindingOffsetEXT getBindingOffset)
+                                  PFN_vkGetDescriptorEXT                               getDescriptor,
+                                  PFN_vkGetDescriptorSetLayoutSizeEXT                  getLayoutSize,
+                                  PFN_vkGetDescriptorSetLayoutBindingOffsetEXT         getBindingOffset)
     {
         _vkDev            = vkDev;
         _allocator        = allocator;
@@ -839,8 +850,8 @@ namespace rhi::vulkan
         const auto size{_properties.sampledImageDescriptorSize};
         std::memset(static_cast<char *>(_descMapped) + _texBindOff + static_cast<VkDeviceSize>(slot) * size, 0,
                     static_cast<std::size_t>(size));
-        VK_CHECK(vmaFlushAllocation(_allocator, _descAlloc,
-                                    _texBindOff + static_cast<VkDeviceSize>(slot) * size, size));
+        VK_CHECK(
+            vmaFlushAllocation(_allocator, _descAlloc, _texBindOff + static_cast<VkDeviceSize>(slot) * size, size));
         if (_usedTexs)
         {
             --_usedTexs;
@@ -852,8 +863,8 @@ namespace rhi::vulkan
         const auto size{_properties.samplerDescriptorSize};
         std::memset(static_cast<char *>(_descMapped) + _smpBindOff + static_cast<VkDeviceSize>(slot) * size, 0,
                     static_cast<std::size_t>(size));
-        VK_CHECK(vmaFlushAllocation(_allocator, _descAlloc,
-                                    _smpBindOff + static_cast<VkDeviceSize>(slot) * size, size));
+        VK_CHECK(
+            vmaFlushAllocation(_allocator, _descAlloc, _smpBindOff + static_cast<VkDeviceSize>(slot) * size, size));
         if (_usedSmps)
         {
             --_usedSmps;
@@ -976,7 +987,7 @@ namespace rhi::vulkan
     {
         std::array<uint32_t, 3> queueFamilies{gfxQ.family, computeQ.family, transferQ.family};
         const uint32_t          queueFamilyCount{uniqueQueueFamilies(queueFamilies)};
-        VkBufferCreateInfo bci{
+        VkBufferCreateInfo      bci{
             .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size                  = d.Size,
             .usage                 = _toBufUsage(d.Usage),
@@ -1053,7 +1064,7 @@ namespace rhi::vulkan
         {
             return {};
         }
-        auto  &buffer{_buffers.get(h.Index)};
+        auto &buffer{_buffers.get(h.Index)};
         void *ptr{nullptr};
         VK_CHECK(vmaMapMemory(_allocator, buffer.alloc, &ptr));
         VK_CHECK(vmaInvalidateAllocation(_allocator, buffer.alloc, 0, VK_WHOLE_SIZE));
@@ -1117,20 +1128,20 @@ namespace rhi::vulkan
         std::array<uint32_t, 3> queueFamilies{gfxQ.family, computeQ.family, transferQ.family};
         const uint32_t          queueFamilyCount{uniqueQueueFamilies(queueFamilies)};
         VkImageCreateInfo       ici{
-                  .sType     = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                  .flags     = cubeFlags,
-                  .imageType = imgType,
-                  .format    = fmt,
-                  .extent = {d.Extent.Width, d.Extent.Height, d.Dimension == TextureDimension::Tex3D ? d.Extent.Depth : 1u},
-                  .mipLevels               = d.MipLevels,
-                  .arrayLayers             = d.ArrayLayers,
-                  .samples                 = static_cast<VkSampleCountFlagBits>(d.SampleCount),
-                  .tiling                  = VK_IMAGE_TILING_OPTIMAL,
-                  .usage                   = _toImageUsage(d.Usage),
-                  .sharingMode = queueFamilyCount > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
-                  .queueFamilyIndexCount   = queueFamilyCount > 1 ? queueFamilyCount : 0,
-                  .pQueueFamilyIndices     = queueFamilyCount > 1 ? queueFamilies.data() : nullptr,
-                  .initialLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+            .sType     = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags     = cubeFlags,
+            .imageType = imgType,
+            .format    = fmt,
+            .extent = {d.Extent.Width, d.Extent.Height, d.Dimension == TextureDimension::Tex3D ? d.Extent.Depth : 1u},
+            .mipLevels             = d.MipLevels,
+            .arrayLayers           = d.ArrayLayers,
+            .samples               = static_cast<VkSampleCountFlagBits>(d.SampleCount),
+            .tiling                = VK_IMAGE_TILING_OPTIMAL,
+            .usage                 = _toImageUsage(d.Usage),
+            .sharingMode           = queueFamilyCount > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = queueFamilyCount > 1 ? queueFamilyCount : 0,
+            .pQueueFamilyIndices   = queueFamilyCount > 1 ? queueFamilies.data() : nullptr,
+            .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
         };
         VmaAllocationCreateInfo aci{.usage = VMA_MEMORY_USAGE_GPU_ONLY};
 
@@ -1241,6 +1252,73 @@ namespace rhi::vulkan
             return {};
         }
         return GpuAddress{h.Index};
+    }
+
+    // ============================================================================
+    // Timestamp queries
+    // ============================================================================
+
+    bool VulkanDevice::SupportsComputeTimestamps() const noexcept
+    {
+        return _computeTimestampsSupported;
+    }
+
+    double VulkanDevice::TimestampPeriodNanoseconds() const noexcept
+    {
+        return _timestampPeriodNanoseconds;
+    }
+
+    TimestampQueryPoolHandle VulkanDevice::CreateTimestampQueryPool(uint32_t count)
+    {
+        if (count == 0)
+        {
+            return {};
+        }
+
+        VkQueryPoolCreateInfo createInfo{
+            .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = count,
+        };
+        const uint32_t index{_timestampQueryPools.alloc()};
+        auto          &record{_timestampQueryPools.get(index)};
+        VK_CHECK(vkCreateQueryPool(_device, &createInfo, nullptr, &record.pool));
+        record.count = count;
+        return TimestampQueryPoolHandle{index};
+    }
+
+    void VulkanDevice::DestroyTimestampQueryPool(TimestampQueryPoolHandle pool)
+    {
+        if (!pool.Valid())
+        {
+            return;
+        }
+        vkDestroyQueryPool(_device, _timestampQueryPools.get(pool.Index).pool, nullptr);
+        _timestampQueryPools.free(pool.Index);
+    }
+
+    void VulkanDevice::ResetTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, uint32_t count)
+    {
+        if (!pool.Valid() || count == 0)
+        {
+            return;
+        }
+        const auto &record{_timestampQueryPools.get(pool.Index)};
+        assert(first <= record.count && count <= record.count - first);
+        vkResetQueryPool(_device, record.pool, first, count);
+    }
+
+    void VulkanDevice::ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, std::span<uint64_t> results)
+    {
+        if (!pool.Valid() || results.empty())
+        {
+            return;
+        }
+        const auto &record{_timestampQueryPools.get(pool.Index)};
+        assert(first <= record.count && results.size() <= record.count - first);
+        VK_CHECK(vkGetQueryPoolResults(_device, record.pool, first, static_cast<uint32_t>(results.size()),
+                                       results.size_bytes(), results.data(), sizeof(uint64_t),
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
     }
 
     // ============================================================================

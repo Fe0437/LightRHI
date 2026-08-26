@@ -186,7 +186,19 @@ namespace rhi::metal
         {
             if (_encoderType == EncoderType::Compute)
             {
-                _computeEncoder->barrierAfterStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
+                // barrierAfterEncoderStages, not barrierAfterStages: only the
+                // former orders one dispatch against the next *within* a
+                // compute encoder. With barrierAfterStages the second dispatch
+                // read the first one's buffer writes as they stood before it
+                // ran — measured, not inferred: HdRestir's accumulation writes
+                // a per-pixel luminance history and reduces it in the next
+                // dispatch, and the reduction saw the previous frame's history
+                // while dividing by this frame's sample count.
+                //
+                // A global memory barrier must be at least as strong as the
+                // BufferBarrier below, so it uses the same mechanism with the
+                // widest stage scope.
+                _computeEncoder->barrierAfterEncoderStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
             }
         }
 
@@ -195,9 +207,14 @@ namespace rhi::metal
             // Metal has no separate AS resource-barrier scope; StageAll also
             // covers acceleration structures for purposes of read-after-write
             // ordering between encoders (e.g. BLAS build -> TLAS build).
+            //
+            // Uses barrierAfterEncoderStages for the same reason as the memory
+            // barrier above: within one compute encoder, barrierAfterStages
+            // does not order a dispatch against the next, so a TLAS build
+            // could read BLASes the preceding build had not finished writing.
             if (_encoderType == EncoderType::Compute)
             {
-                _computeEncoder->barrierAfterStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
+                _computeEncoder->barrierAfterEncoderStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
             }
         }
 
@@ -554,6 +571,14 @@ namespace rhi::metal
             // fill, a compute kernel is needed; we use the low byte for now.
             _computeEncoder->fillBuffer(_lookupBuffer(buf), NS::Range::Make(offset, size),
                                         static_cast<uint8_t>(value & 0xFF));
+        }
+
+        void WriteComputeTimestamp(TimestampQueryPoolHandle pool, uint32_t index) override
+        {
+            const auto &record{_device->TimestampQueryPool(pool)};
+            assert(index < record.count);
+            _ensureComputeEncoder();
+            _computeEncoder->writeTimestamp(MTL4::TimestampGranularityPrecise, record.heap.get(), index);
         }
 
         // ---- Debug ----
