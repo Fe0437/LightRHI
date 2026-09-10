@@ -132,12 +132,38 @@ matching destroy calls until a concrete ownership wrapper is needed.
 
 ## Public API documentation
 
-Document every exported type, free function, and interface method with Doxygen
-comments. Describe the contract from the caller's point of view: when to call
-the operation, valid call order, ownership and lifetime, required resource
-state or synchronization, and the meaning of results or unsupported behavior.
-Use the backslash command form consistently: `\brief`, `\param`, `\return`,
-`\pre`, and `\note` rather than the equivalent `@` commands.
+Document every exported type, free function, and interface method. Describe the
+contract from the caller's point of view: when to call the operation, valid call
+order, ownership and lifetime, required resource state or synchronization, and
+the meaning of results or unsupported behavior.
+
+Write a declaration's documentation as a block comment carrying brace tags:
+
+```cpp
+/** {brief} Opaque handle to a buffer owned by an IDevice. */
+struct BufferHandle
+{
+    uint32_t Index{kInvalidIndex}; ///< Opaque device-owned slot; do not manufacture indices.
+};
+
+/**
+ * {brief} Copies a contiguous range of completed timestamp results to CPU memory.
+ * {param pool} Pool containing the results.
+ * {param first} Index of the first result to read.
+ * {pre} The requested range is within the pool and its fence has completed.
+ */
+virtual void ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first,
+                                  std::span<uint64_t> results) = 0;
+```
+
+The tags are `{file}`, `{brief}`, `{param name}`, `{tparam name}`, `{returns}`,
+`{note}`, `{warning}`, `{pre}` and `{post}`. A description that follows the member
+it documents stays on the same line after `///<`. Use a fenced ```` ```cpp ````
+block for an example, not `\code`.
+
+This replaced the earlier `\brief` backslash form, which the documentation
+generator does not read. `just generate-docs` builds the API reference from these
+comments, so a declaration documented in the old form silently disappears from it.
 
 Do not document backend machinery in the public declaration. Vulkan objects,
 Metal encoders, allocation strategies, and implementation anecdotes belong in

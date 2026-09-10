@@ -10,7 +10,7 @@ export namespace rhi
 
     // ---- Texture subresources ----
 
-    /// \brief Selects contiguous mip levels and array layers within a texture.
+    /** {brief} Selects contiguous mip levels and array layers within a texture. */
     struct SubresourceRange
     {
         uint32_t BaseMip{0};      ///< First selected mip level.
@@ -21,16 +21,18 @@ export namespace rhi
 
     // ---- Explicit resource barriers ----
 
-    /// \brief Describes an explicit state transition for selected texture subresources.
-    /// \note The caller tracks the current state; LightRHI does not infer `Before`.
-    ///
-    /// \code{.cpp}
-    /// cmd->Transition(texture, ResourceState::Undefined, ResourceState::TransferDst);
-    /// cmd->FlushBarriers();
-    /// cmd->CopyBufferToTexture(staging, 0, texture, region);
-    /// cmd->Transition(texture, ResourceState::TransferDst, ResourceState::ShaderRead);
-    /// cmd->FlushBarriers();
-    /// \endcode
+    /**
+     * {brief} Describes an explicit state transition for selected texture subresources.
+     * {note} The caller tracks the current state; LightRHI does not infer `Before`.
+     *
+     * ```cpp
+     * cmd->Transition(texture, ResourceState::Undefined, ResourceState::TransferDst);
+     * cmd->FlushBarriers();
+     * cmd->CopyBufferToTexture(staging, 0, texture, region);
+     * cmd->Transition(texture, ResourceState::TransferDst, ResourceState::ShaderRead);
+     * cmd->FlushBarriers();
+     * ```
+     */
     struct TextureBarrier
     {
         TextureHandle    Texture; ///< Texture being transitioned.
@@ -39,7 +41,7 @@ export namespace rhi
         SubresourceRange Range{}; ///< Affected subresources; defaults to the whole texture.
     };
 
-    /// \brief Describes an explicit state transition for a byte range of a buffer.
+    /** {brief} Describes an explicit state transition for a byte range of a buffer. */
     struct BufferBarrier
     {
         BufferHandle  Buffer;      ///< Buffer being transitioned.
@@ -49,8 +51,10 @@ export namespace rhi
         uint64_t      Size{~0ULL}; ///< Number of bytes, or `~0ULL` for the rest of the buffer.
     };
 
-    /// \brief Orders all accesses in one state class before all accesses in another.
-    /// \note Prefer resource-scoped barriers when the dependency concerns a known resource.
+    /**
+     * {brief} Orders all accesses in one state class before all accesses in another.
+     * {note} Prefer resource-scoped barriers when the dependency concerns a known resource.
+     */
     struct MemoryBarrier
     {
         ResourceState Before; ///< State of accesses that must complete first.
@@ -59,12 +63,12 @@ export namespace rhi
 
     // ---- Timeline points ----
 
-    /// \brief Represents an optional value on a GPU submission timeline.
+    /** {brief} Represents an optional value on a GPU submission timeline. */
     struct TimelinePoint
     {
         uint64_t Value{0}; ///< Timeline value; zero means no point was selected.
 
-        /// \brief Reports whether a non-zero timeline value is present.
+        /** {brief} Reports whether a non-zero timeline value is present. */
         [[nodiscard]] constexpr bool Valid() const noexcept
         {
             return Value != 0;

@@ -1,0 +1,21 @@
+{
+  "sources": [
+    [
+      "source/rhi",
+      "*.cppm"
+    ]
+  ],
+  "package_titles": {
+    "rhi": "RHI"
+  },
+  "repository_url": "https://github.com/Fe0437/LightRHI/blob/main",
+  "intro": [
+    "Each page covers one package. It first lists its public types, then documents each",
+    "declaration.",
+    "",
+    "This reference is generated from the comments beside the C++ declarations. Only the",
+    "`rhi` module under `source/rhi/` appears here; the Metal and Vulkan backends are",
+    "private implementations and are not part of the surface a consumer uses."
+  ],
+  "package_note": []
+}

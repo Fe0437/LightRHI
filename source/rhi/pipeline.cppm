@@ -16,46 +16,52 @@ export namespace rhi
 
     // ---- Shader artifacts ----
 
-    /// \brief Non-owning view of SPIR-V words supplied to pipeline creation.
+    /** {brief} Non-owning view of SPIR-V words supplied to pipeline creation. */
     struct SpirvBytecode
     {
         std::span<const uint32_t> Words; ///< Complete SPIR-V module, aligned as 32-bit words.
     };
 
-    /// \brief Non-owning view of a precompiled Metal library supplied to pipeline creation.
+    /** {brief} Non-owning view of a precompiled Metal library supplied to pipeline creation. */
     struct MetalLibBytecode
     {
         std::span<const uint8_t> Bytes; ///< Complete `.metallib` file contents.
     };
 
-    /// \brief Non-owning view of Metal Shading Language source supplied to pipeline creation.
+    /** {brief} Non-owning view of Metal Shading Language source supplied to pipeline creation. */
     struct MslSource
     {
         std::string_view Source; ///< Complete source text containing the requested entry point.
     };
 
-    /// \brief Discriminated union of the shader artifact encodings accepted by pipeline creation.
-    /// \note A default-constructed value is `std::monostate`, meaning no shader was supplied.
-    ///
-    /// Select SpirvBytecode for a Vulkan device and MslSource or
-    /// MetalLibBytecode for a Metal device. Applications that load tagged shader
-    /// assets can use ShaderArtifactView and ToShaderDesc() instead of constructing
-    /// the alternative directly.
+    /**
+     * {brief} Discriminated union of the shader artifact encodings accepted by pipeline creation.
+     * {note} A default-constructed value is `std::monostate`, meaning no shader was supplied.
+     *
+     * Select SpirvBytecode for a Vulkan device and MslSource or
+     * MetalLibBytecode for a Metal device. Applications that load tagged shader
+     * assets can use ShaderArtifactView and ToShaderDesc() instead of constructing
+     * the alternative directly.
+     */
     using ShaderBytecode = std::variant<std::monostate, SpirvBytecode, MetalLibBytecode, MslSource>;
 
-    /// \brief Selects one compiled shader entry point for pipeline creation.
-    /// \note The bytecode storage must remain valid until CreateGraphicsPipeline() or
-    /// CreateComputePipeline() returns.
+    /**
+     * {brief} Selects one compiled shader entry point for pipeline creation.
+     * {note} The bytecode storage must remain valid until CreateGraphicsPipeline() or
+     * CreateComputePipeline() returns.
+     */
     struct ShaderDesc
     {
         ShaderBytecode   Bytecode;           ///< Compiled artifact accepted by the active backend.
         std::string_view EntryPoint{"main"}; ///< Function name to use from the artifact.
     };
 
-    /// \brief Describes a non-owning, already-compiled shader artifact.
-    ///
-    /// Use ToShaderDesc() to adapt loaded artifact bytes to a pipeline descriptor.
-    /// The caller owns `Data` and must retain it while the converted ShaderDesc is used.
+    /**
+     * {brief} Describes a non-owning, already-compiled shader artifact.
+     *
+     * Use ToShaderDesc() to adapt loaded artifact bytes to a pipeline descriptor.
+     * The caller owns `Data` and must retain it while the converted ShaderDesc is used.
+     */
     struct ShaderArtifactView
     {
         ShaderFormat               Format{ShaderFormat::Spirv}; ///< Encoding of `Data`.
@@ -64,27 +70,29 @@ export namespace rhi
         std::span<const std::byte> Data{};                      ///< Complete artifact bytes.
     };
 
-    /// \brief Recoverable validation errors returned by ToShaderDesc().
+    /** {brief} Recoverable validation errors returned by ToShaderDesc(). */
     enum class ShaderArtifactError
     {
         SpirvSizeNotWordAligned, ///< SPIR-V data size is not a multiple of one 32-bit word.
     };
 
-    /// \brief Creates a ShaderDesc that views the storage in `artifact`.
-    /// \return A descriptor on success, or a validation error for malformed input.
-    /// \note The returned descriptor does not own the artifact bytes.
-    ///
-    /// \code{.cpp}
-    /// const auto shader = ToShaderDesc(artifact);
-    /// if (!shader)
-    /// {
-    ///     return shader.error();
-    /// }
-    /// const PipelineHandle pipeline = device->CreateComputePipeline({
-    ///     .Shader = *shader,
-    ///     .ThreadGroupSize = {.Width = 8, .Height = 8, .Depth = 1},
-    /// });
-    /// \endcode
+    /**
+     * {brief} Creates a ShaderDesc that views the storage in `artifact`.
+     * {returns} A descriptor on success, or a validation error for malformed input.
+     * {note} The returned descriptor does not own the artifact bytes.
+     *
+     * ```cpp
+     * const auto shader = ToShaderDesc(artifact);
+     * if (!shader)
+     * {
+     *     return shader.error();
+     * }
+     * const PipelineHandle pipeline = device->CreateComputePipeline({
+     *     .Shader = *shader,
+     *     .ThreadGroupSize = {.Width = 8, .Height = 8, .Depth = 1},
+     * });
+     * ```
+     */
     [[nodiscard]] inline std::expected<ShaderDesc, ShaderArtifactError> ToShaderDesc(const ShaderArtifactView &artifact)
     {
         ShaderDesc desc{.EntryPoint = artifact.EntryPoint};
@@ -115,7 +123,7 @@ export namespace rhi
 
     // ---- Blend state ----
 
-    /// \brief Selects blending and color writes for one color attachment.
+    /** {brief} Selects blending and color writes for one color attachment. */
     struct BlendState
     {
         bool        Enable{false};               ///< Enables source/destination blending.
@@ -128,13 +136,13 @@ export namespace rhi
         uint8_t     WriteMask{0xF};              ///< RGBA bit mask; bit zero controls red.
     };
 
-    /// \brief Returns opaque replacement blending with all color channels writable.
+    /** {brief} Returns opaque replacement blending with all color channels writable. */
     [[nodiscard]] inline BlendState BlendDisabled()
     {
         return BlendState{.Enable = false};
     }
 
-    /// \brief Returns conventional source-over blending for premultiplied-alpha colors.
+    /** {brief} Returns conventional source-over blending for premultiplied-alpha colors. */
     [[nodiscard]] inline BlendState BlendAlphaPremultiplied()
     {
         return BlendState{
@@ -146,7 +154,7 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns conventional source-over blending for straight-alpha colors.
+    /** {brief} Returns conventional source-over blending for straight-alpha colors. */
     [[nodiscard]] inline BlendState BlendAlphaTraditional()
     {
         return BlendState{
@@ -160,7 +168,7 @@ export namespace rhi
 
     // ---- Depth and stencil state ----
 
-    /// \brief Selects depth testing, depth writes, and optional stencil testing.
+    /** {brief} Selects depth testing, depth writes, and optional stencil testing. */
     struct DepthStencilState
     {
         bool      DepthTest{true};          ///< Enables comparison against the depth attachment.
@@ -169,19 +177,19 @@ export namespace rhi
         bool      StencilTest{false};       ///< Enables stencil testing with the API's default stencil behavior.
     };
 
-    /// \brief Returns a depth state that tests and writes passing fragments.
+    /** {brief} Returns a depth state that tests and writes passing fragments. */
     [[nodiscard]] inline DepthStencilState DepthReadWrite(CompareOp op = CompareOp::Less)
     {
         return DepthStencilState{.DepthTest = true, .DepthWrite = true, .DepthOp = op};
     }
 
-    /// \brief Returns a depth state that tests without modifying the depth attachment.
+    /** {brief} Returns a depth state that tests without modifying the depth attachment. */
     [[nodiscard]] inline DepthStencilState DepthReadOnly(CompareOp op = CompareOp::Less)
     {
         return DepthStencilState{.DepthTest = true, .DepthWrite = false, .DepthOp = op};
     }
 
-    /// \brief Returns a state with depth testing and writing disabled.
+    /** {brief} Returns a state with depth testing and writing disabled. */
     [[nodiscard]] inline DepthStencilState DepthDisabled()
     {
         return DepthStencilState{.DepthTest = false, .DepthWrite = false};
@@ -189,7 +197,7 @@ export namespace rhi
 
     // ---- Rasterizer state ----
 
-    /// \brief Selects triangle culling, fill, winding, and depth-bias behavior.
+    /** {brief} Selects triangle culling, fill, winding, and depth-bias behavior. */
     struct RasterizerState
     {
         CullMode  CullMode{CullMode::Back};               ///< Triangle faces discarded before rasterization.
@@ -203,9 +211,11 @@ export namespace rhi
 
     // ---- Graphics pipelines ----
 
-    /// \brief Completely describes a graphics pipeline for dynamic rendering.
-    /// \note `ColorFormats`, `DepthFormat`, and `SampleCount` must match every
-    /// RenderingDesc used with the resulting pipeline.
+    /**
+     * {brief} Completely describes a graphics pipeline for dynamic rendering.
+     * {note} `ColorFormats`, `DepthFormat`, and `SampleCount` must match every
+     * RenderingDesc used with the resulting pipeline.
+     */
     struct GraphicsPipelineDesc
     {
         ShaderDesc VertexShader;   ///< Required vertex-stage entry point.
@@ -228,14 +238,16 @@ export namespace rhi
 
     // ---- Compute pipelines ----
 
-    /// \brief Completely describes a compute pipeline.
+    /** {brief} Completely describes a compute pipeline. */
     struct ComputePipelineDesc
     {
         ShaderDesc Shader;                 ///< Required compute-stage entry point.
         uint32_t   PushConstantBytes{128}; ///< Bytes available to SetPushConstants().
 
-        /// \brief Thread-group shape declared by the shader; zero components request
-        /// discovery from the compiled artifact when supported.
+        /**
+         * {brief} Thread-group shape declared by the shader; zero components request
+         * discovery from the compiled artifact when supported.
+         */
         Extent3D ThreadGroupSize{.Width = 0, .Height = 0, .Depth = 0};
 
         std::string_view DebugName{}; ///< Optional diagnostic name, copied during creation.
@@ -243,7 +255,7 @@ export namespace rhi
 
     // ---- Dynamic rendering ----
 
-    /// \brief Describes one color attachment used by BeginRendering().
+    /** {brief} Describes one color attachment used by BeginRendering(). */
     struct ColorAttachment
     {
         TextureHandle Texture;                 ///< Render target for this attachment slot.
@@ -253,7 +265,7 @@ export namespace rhi
         ClearColor    ClearValue{};            ///< Value used when LoadOp is Clear.
     };
 
-    /// \brief Describes the optional depth/stencil attachment used by BeginRendering().
+    /** {brief} Describes the optional depth/stencil attachment used by BeginRendering(). */
     struct DepthAttachment
     {
         TextureHandle     Texture;                    ///< Depth texture; invalid disables the attachment.
@@ -262,7 +274,7 @@ export namespace rhi
         ClearDepthStencil ClearValue{};               ///< Value used when LoadOp is Clear.
     };
 
-    /// \brief Selects attachments and bounds for one dynamic rendering region.
+    /** {brief} Selects attachments and bounds for one dynamic rendering region. */
     struct RenderingDesc
     {
         std::vector<ColorAttachment> Color;         ///< Ordered color attachments, matching pipeline formats.

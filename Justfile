@@ -20,6 +20,7 @@
 #   just build-asan     # ASAN + UBSAN build
 #   just test-asan      # build-asan + run tests
 #   just clean          # remove build directories
+#   just generate-docs  # build the HTML documentation into build/docs/html
 
 # just defaults to `sh`, which isn't present on a stock Windows. Use PowerShell
 # there; POSIX shells everywhere else.
@@ -109,6 +110,10 @@ test-asan: build-asan
 # `cmake -E rm -rf` is portable — no rm / Remove-Item shell differences.
 clean:
     cmake -E rm -rf {{BUILD_DIR}} {{BUILD_DIR}}-asan {{BUILD_DIR}}-tsan
+
+# Build the HTML documentation site into build/docs/html.
+generate-docs:
+    python3 tools/docs/build_docs.py
 
 # Print resolved backend for this platform
 info:

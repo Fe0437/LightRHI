@@ -14,7 +14,7 @@ export namespace rhi
     // Device
     // ---------------------------------------------------------------------------
 
-    /// \brief Selects validation behavior and the application name when creating a device.
+    /** {brief} Selects validation behavior and the application name when creating a device. */
     struct DeviceDesc
     {
         bool        EnableValidation{true};     ///< Enables API validation when the backend provides it.
@@ -26,7 +26,7 @@ export namespace rhi
     // Buffer
     // ---------------------------------------------------------------------------
 
-    /// \brief Describes the storage, access modes, and memory placement of a buffer.
+    /** {brief} Describes the storage, access modes, and memory placement of a buffer. */
     struct BufferDesc
     {
         uint64_t         Size{};                          ///< Allocation size in bytes; must be non-zero.
@@ -39,7 +39,7 @@ export namespace rhi
     // Texture
     // ---------------------------------------------------------------------------
 
-    /// \brief Describes a texture and all of its subresources.
+    /** {brief} Describes a texture and all of its subresources. */
     struct TextureDesc
     {
         TextureDimension Dimension{TextureDimension::Tex2D};          ///< Dimensionality visible to shaders.
@@ -53,8 +53,10 @@ export namespace rhi
         std::string_view DebugName{};                            ///< Optional diagnostic name, copied during creation.
     };
 
-    /// \brief Returns a descriptor for a sampled two-dimensional texture.
-    /// \note Add storage, render-target, or transfer-source usage before creation when needed.
+    /**
+     * {brief} Returns a descriptor for a sampled two-dimensional texture.
+     * {note} Add storage, render-target, or transfer-source usage before creation when needed.
+     */
     [[nodiscard]] inline TextureDesc Texture2D(uint32_t width, uint32_t height, Format fmt = Format::RGBA8Unorm,
                                                TextureUsage     use = TextureUsage::Sampled | TextureUsage::TransferDst,
                                                std::string_view name = {})
@@ -68,7 +70,7 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns a descriptor for a single-sample color render target that can also be sampled.
+    /** {brief} Returns a descriptor for a single-sample color render target that can also be sampled. */
     [[nodiscard]] inline TextureDesc RenderTarget2D(uint32_t width, uint32_t height, Format fmt = Format::RGBA8Unorm,
                                                     std::string_view name = {})
     {
@@ -81,8 +83,10 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns a descriptor for a single-sample depth target that can also be sampled.
-    /// \pre `fmt` is a depth format.
+    /**
+     * {brief} Returns a descriptor for a single-sample depth target that can also be sampled.
+     * {pre} `fmt` is a depth format.
+     */
     [[nodiscard]] inline TextureDesc DepthTarget2D(uint32_t width, uint32_t height, Format fmt = Format::D32Float,
                                                    std::string_view name = {})
     {
@@ -99,7 +103,7 @@ export namespace rhi
     // Sampler
     // ---------------------------------------------------------------------------
 
-    /// \brief Describes filtering, addressing, level-of-detail, and comparison sampling.
+    /** {brief} Describes filtering, addressing, level-of-detail, and comparison sampling. */
     struct SamplerDesc
     {
         SamplerFilter      MinFilter{SamplerFilter::Linear};      ///< Filter used when reducing the image.
@@ -119,7 +123,7 @@ export namespace rhi
         std::string_view   DebugName{};                           ///< Optional diagnostic name, copied during creation.
     };
 
-    /// \brief Returns a trilinear sampler that repeats in every coordinate.
+    /** {brief} Returns a trilinear sampler that repeats in every coordinate. */
     [[nodiscard]] inline SamplerDesc LinearRepeat()
     {
         return SamplerDesc{
@@ -129,7 +133,7 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns a nearest-neighbor sampler clamped to the edge in every coordinate.
+    /** {brief} Returns a nearest-neighbor sampler clamped to the edge in every coordinate. */
     [[nodiscard]] inline SamplerDesc NearestClamp()
     {
         return SamplerDesc{
@@ -142,7 +146,7 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns a comparison sampler suitable for conventional less-equal shadow maps.
+    /** {brief} Returns a comparison sampler suitable for conventional less-equal shadow maps. */
     [[nodiscard]] inline SamplerDesc ShadowSampler()
     {
         return SamplerDesc{
@@ -161,7 +165,7 @@ export namespace rhi
     // Copy / upload regions
     // ---------------------------------------------------------------------------
 
-    /// \brief Selects a contiguous byte range for a buffer-to-buffer copy.
+    /** {brief} Selects a contiguous byte range for a buffer-to-buffer copy. */
     struct BufferCopyRegion
     {
         uint64_t SrcOffset{0}; ///< First source byte.
@@ -169,7 +173,7 @@ export namespace rhi
         uint64_t Size{0};      ///< Number of bytes to copy.
     };
 
-    /// \brief Selects one mip/layer and a three-dimensional region for a texture copy.
+    /** {brief} Selects one mip/layer and a three-dimensional region for a texture copy. */
     struct TextureCopyRegion
     {
         uint32_t MipLevel{0};   ///< Mip level to copy.
@@ -182,21 +186,25 @@ export namespace rhi
     // Mapped Buffer (returned by IDevice::MapBuffer / UnmapBuffer)
     // ---------------------------------------------------------------------------
 
-    /// \brief Non-owning view of a buffer mapped into CPU address space.
-    /// \note The view and pointers obtained from it become invalid at UnmapBuffer().
+    /**
+     * {brief} Non-owning view of a buffer mapped into CPU address space.
+     * {note} The view and pointers obtained from it become invalid at UnmapBuffer().
+     */
     struct MappedBuffer
     {
         void    *Data{nullptr}; ///< First mapped byte, or null when invalid.
         uint64_t Size{0};       ///< Number of mapped bytes.
 
-        /// \brief Interprets the first mapped byte as `T` without changing ownership.
-        /// \pre The mapping is valid, suitably aligned, and large enough for `T`.
+        /**
+         * {brief} Interprets the first mapped byte as `T` without changing ownership.
+         * {pre} The mapping is valid, suitably aligned, and large enough for `T`.
+         */
         template <typename T> [[nodiscard]] T *As() const noexcept
         {
             return static_cast<T *>(Data);
         }
 
-        /// \brief Reports whether this view refers to mapped memory.
+        /** {brief} Reports whether this view refers to mapped memory. */
         [[nodiscard]] bool Valid() const noexcept
         {
             return Data != nullptr;

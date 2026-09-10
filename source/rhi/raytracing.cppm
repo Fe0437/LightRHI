@@ -13,30 +13,30 @@ export namespace rhi
 
     // ---- Acceleration-structure handles ----
 
-    /// \brief Opaque handle to a bottom-level or top-level acceleration structure.
+    /** {brief} Opaque handle to a bottom-level or top-level acceleration structure. */
     struct AccelerationStructureHandle
     {
         uint32_t Index{kInvalidIndex}; ///< Opaque device-owned slot; do not manufacture indices.
 
-        /// \brief Reports whether the handle names a resource slot.
+        /** {brief} Reports whether the handle names a resource slot. */
         [[nodiscard]] constexpr bool Valid() const noexcept
         {
             return Index != kInvalidIndex;
         }
-        /// \brief Compares opaque handle identity.
+        /** {brief} Compares opaque handle identity. */
         [[nodiscard]] constexpr bool operator==(const AccelerationStructureHandle &) const noexcept = default;
     };
 
     // ---- Acceleration-structure construction ----
 
-    /// \brief Selects whether an acceleration structure contains triangles or instances.
+    /** {brief} Selects whether an acceleration structure contains triangles or instances. */
     enum class AccelerationStructureType : uint8_t
     {
         BottomLevel,
         TopLevel,
     };
 
-    /// \brief Modifies culling and opacity for one top-level acceleration-structure instance.
+    /** {brief} Modifies culling and opacity for one top-level acceleration-structure instance. */
     enum class AccelerationStructureInstanceFlags : uint32_t
     {
         None                          = 0,      ///< Uses the geometry's default culling and opacity.
@@ -46,18 +46,18 @@ export namespace rhi
         ForceNonOpaque                = 1 << 3, ///< Treats all geometry in the instance as non-opaque.
     };
 
-    /// \brief Combines acceleration-structure instance flags.
+    /** {brief} Combines acceleration-structure instance flags. */
     [[nodiscard]] constexpr AccelerationStructureInstanceFlags operator|(AccelerationStructureInstanceFlags a,
                                                                          AccelerationStructureInstanceFlags b) noexcept
     {
         return static_cast<AccelerationStructureInstanceFlags>(std::to_underlying(a) | std::to_underlying(b));
     }
 
-    /// \brief Places one already-built BLAS in a TLAS.
+    /** {brief} Places one already-built BLAS in a TLAS. */
     struct AccelerationStructureInstance
     {
         AccelerationStructureHandle Blas; ///< Live BLAS referenced by this instance.
-        /// \brief Row-major 3x4 object-to-world transform.
+        /** {brief} Row-major 3x4 object-to-world transform. */
         float Transform[3][4]{
             {1.F, 0.F, 0.F, 0.F},
             {0.F, 1.F, 0.F, 0.F},
@@ -69,30 +69,32 @@ export namespace rhi
             AccelerationStructureInstanceFlags::None}; ///< Per-instance traversal flags.
     };
 
-    /// \brief Describes the input used to size, allocate, and build one acceleration structure.
-    /// \note Reuse the same descriptor values for the size query, creation, and recorded build.
-    ///
-    /// A bottom-level acceleration structure (BLAS) contains triangles read from
-    /// GPU-addressable vertex and optional index buffers. A top-level acceleration
-    /// structure (TLAS) contains transformed instances of already-built BLAS handles.
-    ///
-    /// \par Build sequence
-    /// \code{.cpp}
-    /// auto desc = BlasFromTriangleBuffer(
-    ///     device->BufferAddress(vertices), sizeof(Vertex), vertexCount);
-    /// const auto sizes = device->QueryAccelerationStructureBuildSizes(desc);
-    /// const auto accelerationStructure = device->CreateAccelerationStructure(desc);
-    /// const auto scratch = device->CreateBuffer({
-    ///     .Size = sizes.BuildScratchSize,
-    ///     .Usage = BufferUsage::Storage | BufferUsage::DeviceAddress,
-    /// });
-    ///
-    /// cmd->BuildAccelerationStructure(accelerationStructure, desc, scratch);
-    /// cmd->Transition(accelerationStructure,
-    ///                 ResourceState::AccelerationStructureWrite,
-    ///                 ResourceState::AccelerationStructureRead);
-    /// cmd->FlushBarriers();
-    /// \endcode
+    /**
+     * {brief} Describes the input used to size, allocate, and build one acceleration structure.
+     * {note} Reuse the same descriptor values for the size query, creation, and recorded build.
+     *
+     * A bottom-level acceleration structure (BLAS) contains triangles read from
+     * GPU-addressable vertex and optional index buffers. A top-level acceleration
+     * structure (TLAS) contains transformed instances of already-built BLAS handles.
+     *
+     * \par Build sequence
+     * ```cpp
+     * auto desc = BlasFromTriangleBuffer(
+     *     device->BufferAddress(vertices), sizeof(Vertex), vertexCount);
+     * const auto sizes = device->QueryAccelerationStructureBuildSizes(desc);
+     * const auto accelerationStructure = device->CreateAccelerationStructure(desc);
+     * const auto scratch = device->CreateBuffer({
+     *     .Size = sizes.BuildScratchSize,
+     *     .Usage = BufferUsage::Storage | BufferUsage::DeviceAddress,
+     * });
+     *
+     * cmd->BuildAccelerationStructure(accelerationStructure, desc, scratch);
+     * cmd->Transition(accelerationStructure,
+     *                 ResourceState::AccelerationStructureWrite,
+     *                 ResourceState::AccelerationStructureRead);
+     * cmd->FlushBarriers();
+     * ```
+     */
     struct AccelerationStructureDesc
     {
         AccelerationStructureType Type{
@@ -113,9 +115,11 @@ export namespace rhi
         std::string_view DebugName;             ///< Optional diagnostic name, copied during creation.
     };
 
-    /// \brief Returns a BLAS descriptor for a triangle list stored in GPU-addressable buffers.
-    /// \param indexBufferAddress Leave invalid for non-indexed triangles.
-    /// \pre Vertex and optional index buffers remain live until the build completes.
+    /**
+     * {brief} Returns a BLAS descriptor for a triangle list stored in GPU-addressable buffers.
+     * {param indexBufferAddress} Leave invalid for non-indexed triangles.
+     * {pre} Vertex and optional index buffers remain live until the build completes.
+     */
     [[nodiscard]] inline AccelerationStructureDesc
     BlasFromTriangleBuffer(GpuAddress vertexBufferAddress, uint32_t vertexStride, uint32_t vertexCount,
                            GpuAddress indexBufferAddress = {}, uint32_t indexCount = 0,
@@ -133,8 +137,10 @@ export namespace rhi
         };
     }
 
-    /// \brief Returns a TLAS descriptor that takes ownership of `instances`.
-    /// \pre Every instance references an already-built BLAS that remains live through the TLAS build and use.
+    /**
+     * {brief} Returns a TLAS descriptor that takes ownership of `instances`.
+     * {pre} Every instance references an already-built BLAS that remains live through the TLAS build and use.
+     */
     [[nodiscard]] inline AccelerationStructureDesc
     TlasFromInstances(std::vector<AccelerationStructureInstance> &&instances, std::string_view name = {})
     {
@@ -147,7 +153,7 @@ export namespace rhi
 
     // ---- Build requirements ----
 
-    /// \brief Storage requirements returned before an acceleration-structure build.
+    /** {brief} Storage requirements returned before an acceleration-structure build. */
     struct AccelerationStructureBuildSizes
     {
         uint64_t AccelerationStructureSize{0}; ///< Bytes reserved by CreateAccelerationStructure().
@@ -157,7 +163,7 @@ export namespace rhi
 
     // ---- Barriers ----
 
-    /// \brief Orders access to one acceleration structure between build and traversal commands.
+    /** {brief} Orders access to one acceleration structure between build and traversal commands. */
     struct AccelerationStructureBarrier
     {
         AccelerationStructureHandle AccelerationStructure; ///< Resource whose access is ordered.

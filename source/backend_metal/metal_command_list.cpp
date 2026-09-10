@@ -1,6 +1,6 @@
 // metal_command_list.cpp — MetalCommandList + MetalDevice::CreateCommandList / Submit
 //
-// Targets Metal 4 exclusively — see API_GUIDELINES.md and metal_internal.h's
+// Targets Metal 4 exclusively — see docs/API_GUIDELINES.md and metal_internal.h's
 // header comment. MTL4::ComputeCommandEncoder has no setBytes/setBuffer/
 // setTexture/setSamplerState at all ("all binding goes through the argument
 // table"); MTL4::RenderCommandEncoder likewise has no setVertexBuffer/

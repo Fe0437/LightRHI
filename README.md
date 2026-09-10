@@ -11,9 +11,9 @@ submission, and synchronization are caller-visible.
 
 ## Start here
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) explains the module layout, CMake targets,
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the module layout, CMake targets,
   backend selection, bindless model, shader pipeline, and build requirements.
-- [API_GUIDELINES.md](API_GUIDELINES.md) captures the public API rules used by
+- [API_GUIDELINES.md](docs/API_GUIDELINES.md) captures the public API rules used by
   the code in `source/rhi`.
 - [AGENTS.md](AGENTS.md) contains local development constraints for contributors
   and coding agents working in this repository.
@@ -61,5 +61,5 @@ ctest --test-dir build --output-on-failure
 ```
 
 Install `slangc` to build shader-using examples and tests. See
-[ARCHITECTURE.md](ARCHITECTURE.md#shader-pipeline) for the current shader
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#shader-pipeline) for the current shader
 artifact pipeline.

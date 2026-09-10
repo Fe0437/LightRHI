@@ -8,14 +8,16 @@ export namespace rhi
 {
 
 #if DEBUG_ENABLED
-    /// \brief Number of symbolic values available in one shader debug record.
+    /** {brief} Number of symbolic values available in one shader debug record. */
     inline constexpr std::size_t ShaderDebugSlotCount{16};
 
-    /// \brief CPU-readable record written by one shader invocation selected for debugging.
-    ///
-    /// Bind a buffer of this layout through the matching helpers in
-    /// `shaders/shader_debug.slangh`, then read it only after the dispatch completes.
-    /// \note This layout is a host/shader ABI and must remain identical to the Slang definition.
+    /**
+     * {brief} CPU-readable record written by one shader invocation selected for debugging.
+     *
+     * Bind a buffer of this layout through the matching helpers in
+     * `shaders/shader_debug.slangh`, then read it only after the dispatch completes.
+     * {note} This layout is a host/shader ABI and must remain identical to the Slang definition.
+     */
     struct ShaderDebugRecord
     {
         std::uint32_t ThreadIndex{0};                  ///< Linear invocation index that wrote the record.

@@ -12,10 +12,12 @@ export namespace rhi
 
     // ---- Texture views ----
 
-    /// \brief Selects a typed mip/layer view of a texture.
-    ///
-    /// Use a view when an operation addresses fewer subresources than the full
-    /// texture or needs a compatible format reinterpretation.
+    /**
+     * {brief} Selects a typed mip/layer view of a texture.
+     *
+     * Use a view when an operation addresses fewer subresources than the full
+     * texture or needs a compatible format reinterpretation.
+     */
     struct TextureView
     {
         TextureHandle    Texture; ///< Texture containing the selected subresources.
@@ -26,7 +28,7 @@ export namespace rhi
 
     // ---- Buffer information ----
 
-    /// \brief Describes a live buffer returned by IDevice::GetBufferInfo().
+    /** {brief} Describes a live buffer returned by IDevice::GetBufferInfo(). */
     struct BufferInfo
     {
         uint64_t    Size{0};         ///< Allocation size in bytes.
@@ -38,11 +40,13 @@ export namespace rhi
 
     // ---- Indirect commands ----
 
-    /// \brief GPU-readable arguments consumed by ICommandList::DrawIndirect().
-    ///
-    /// Store one or more entries in a buffer created with
-    /// BufferUsage::IndirectArgs, transition it to ResourceState::IndirectArgument,
-    /// and pass its byte offset and stride to DrawIndirect().
+    /**
+     * {brief} GPU-readable arguments consumed by ICommandList::DrawIndirect().
+     *
+     * Store one or more entries in a buffer created with
+     * BufferUsage::IndirectArgs, transition it to ResourceState::IndirectArgument,
+     * and pass its byte offset and stride to DrawIndirect().
+     */
     struct DrawIndirectArgs
     {
         uint32_t VertexCount{0};   ///< Vertices generated per instance.
@@ -51,8 +55,10 @@ export namespace rhi
         uint32_t FirstInstance{0}; ///< First instance index supplied to the shader.
     };
 
-    /// \brief GPU-readable arguments consumed by ICommandList::DrawIndexedIndirect().
-    /// \note The field order is the portable GPU indirect-command layout; do not add host-only fields.
+    /**
+     * {brief} GPU-readable arguments consumed by ICommandList::DrawIndexedIndirect().
+     * {note} The field order is the portable GPU indirect-command layout; do not add host-only fields.
+     */
     struct DrawIndexedIndirectArgs
     {
         uint32_t IndexCount{0};    ///< Indices consumed per instance.
@@ -62,8 +68,10 @@ export namespace rhi
         uint32_t FirstInstance{0}; ///< First instance index supplied to the shader.
     };
 
-    /// \brief GPU-readable thread-group counts consumed by ICommandList::DispatchIndirect().
-    /// \note Place this value in a buffer ready for ResourceState::IndirectArgument access.
+    /**
+     * {brief} GPU-readable thread-group counts consumed by ICommandList::DispatchIndirect().
+     * {note} Place this value in a buffer ready for ResourceState::IndirectArgument access.
+     */
     struct DispatchIndirectArgs
     {
         uint32_t X{1}; ///< Thread-group count in X.

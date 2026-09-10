@@ -1,11 +1,13 @@
-/// \file
-/// \brief Re-exports the complete backend-neutral LightRHI API as `rhi`.
-///
-/// \code{.cpp}
-/// import rhi;
-/// \endcode
-/// Applications normally import the backend's `lightRHI` module, which re-exports
-/// this module and provides CreateDevice().
+/**
+ * {file}
+ * {brief} Re-exports the complete backend-neutral LightRHI API as `rhi`.
+ *
+ * ```cpp
+ * import rhi;
+ * ```
+ * Applications normally import the backend's `lightRHI` module, which re-exports
+ * this module and provides CreateDevice().
+ */
 
 export module rhi;
 

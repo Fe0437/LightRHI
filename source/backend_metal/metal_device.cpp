@@ -2,7 +2,7 @@
 // Pure C++ / metal-cpp — no Objective-C or .mm required.
 //
 // Targets Metal 4 exclusively (MTL4CommandQueue/MTL4Compiler/MTL4ArgumentTable/
-// MTLResidencySet) — see API_GUIDELINES.md's "Target the latest platform API
+// MTLResidencySet) — see docs/API_GUIDELINES.md's "Target the latest platform API
 // version — always" section and metal_internal.h's header comment.
 //
 // NS_PRIVATE_IMPLEMENTATION / MTL_PRIVATE_IMPLEMENTATION / CA_PRIVATE_IMPLEMENTATION

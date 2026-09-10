@@ -4,7 +4,7 @@
 // Included by both metal_device.cpp and metal_command_list.cpp.
 //
 // Targets Metal 4 (MTL4CommandQueue/MTL4CommandBuffer/MTL4Compiler/
-// MTL4ArgumentTable/MTLResidencySet) exclusively — see API_GUIDELINES.md's
+// MTL4ArgumentTable/MTLResidencySet) exclusively — see docs/API_GUIDELINES.md's
 // "Target the latest platform API version — always" section. This requires
 // macOS 26 / iOS 26 as the minimum deployment target; there is no classic-
 // Metal fallback path.
@@ -297,7 +297,7 @@ namespace rhi::metal
         // Acceleration structures deliberately stay on the CLASSIC (non-MTL4)
         // Metal raytracing API — everything else in this backend targets
         // MTL4 exclusively (see this class's header comment and
-        // API_GUIDELINES.md), but MTL4's
+        // docs/API_GUIDELINES.md), but MTL4's
         // MTL4::ComputeCommandEncoder::buildAccelerationStructure requires
         // real RT hardware and throws "Metal 4 does not support raytracing
         // with software emulation" on GPUs without it (discovered at runtime
