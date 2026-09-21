@@ -7,6 +7,7 @@
 
 import lightRHI;
 
+#include "device_result.h"
 #include "shader_artifact_loader.h"
 
 #define REQUIRE(expr)                                                                                                  \
@@ -23,9 +24,8 @@ namespace
 {
     void TestResourceLifetimeAccounting()
     {
-        auto  device = rhi::CreateDevice({});
-        auto &heap   = device->BindlessHeap();
-
+        auto  device{rhitest::Required(rhi::CreateDevice({}))};
+        auto &heap{device->BindlessHeap()};
         REQUIRE(heap.MaxBuffers() > 0);
         REQUIRE(heap.MaxTextures() > 0);
         REQUIRE(heap.MaxSamplers() > 0);
@@ -34,15 +34,15 @@ namespace
         const uint32_t texturesBefore{heap.UsedTextures()};
         const uint32_t samplersBefore{heap.UsedSamplers()};
 
-        auto buffer  = device->CreateBuffer({
+        auto buffer{rhitest::Required(device->CreateBuffer({
             .Size       = 64,
             .Usage      = rhi::BufferUsage::Storage | rhi::BufferUsage::DeviceAddress,
             .MemoryType = rhi::MemoryType::CpuToGpu,
             .DebugName  = "bindless_lifetime.buffer",
-        });
-        auto texture = device->CreateTexture(
-            rhi::Texture2D(1, 1, rhi::Format::RGBA8Unorm, rhi::TextureUsage::Sampled, "bindless_lifetime.texture"));
-        auto sampler = device->CreateSampler(rhi::NearestClamp());
+        }))};
+        auto texture{rhitest::Required(device->CreateTexture(
+            rhi::Texture2D(1, 1, rhi::Format::RGBA8Unorm, rhi::TextureUsage::Sampled, "bindless_lifetime.texture")))};
+        auto sampler{rhitest::Required(device->CreateSampler(rhi::NearestClamp()))};
 
         REQUIRE(buffer.Valid());
         REQUIRE(texture.Valid());
@@ -61,24 +61,25 @@ namespace
 
     void TestTextureSelectionAndSampling()
     {
-        auto           device = rhi::CreateDevice({});
+        auto           device{rhitest::Required(rhi::CreateDevice({}))};
         const uint32_t texturesBefore{device->BindlessHeap().UsedTextures()};
 
-        auto pipeline = device->CreateComputePipeline({
+        auto pipeline{rhitest::Required(device->CreateComputePipeline({
             .Shader          = rhitest::loadShaderArtifact("bindless_texture_test", "bindless_texture_test_main",
                                                            rhi::ShaderStage::Compute),
             .ThreadGroupSize = {8, 1, 1},
             .DebugName       = "bindless_texture_test.pso",
-        });
+        }))};
         REQUIRE(pipeline.Valid());
 
-        const auto textureDesc = [](const char *name)
-        {
-            return rhi::Texture2D(2, 2, rhi::Format::RGBA8Unorm,
-                                  rhi::TextureUsage::Sampled | rhi::TextureUsage::TransferDst, name);
-        };
-        auto texture0 = device->CreateTexture(textureDesc("bindless_texture_test.texture0"));
-        auto texture1 = device->CreateTexture(textureDesc("bindless_texture_test.texture1"));
+        const auto textureDesc{[](const char *name)
+                               {
+                                   return rhi::Texture2D(2, 2, rhi::Format::RGBA8Unorm,
+                                                         rhi::TextureUsage::Sampled | rhi::TextureUsage::TransferDst,
+                                                         name);
+                               }};
+        auto       texture0{rhitest::Required(device->CreateTexture(textureDesc("bindless_texture_test.texture0")))};
+        auto       texture1{rhitest::Required(device->CreateTexture(textureDesc("bindless_texture_test.texture1")))};
         REQUIRE(texture0.Valid());
         REQUIRE(texture1.Valid());
         REQUIRE(texture0.Index != texture1.Index);
@@ -92,7 +93,8 @@ namespace
         device->UploadTexture(texture0, pixels0, rowPitch, slicePitch, region);
         device->UploadTexture(texture1, pixels1, rowPitch, slicePitch, region);
 
-        auto transition = device->CreateCommandList(rhi::QueueType::Compute, "bindless_texture_test.transition");
+        auto transition{
+            rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "bindless_texture_test.transition"))};
         transition->Begin();
         transition->Transition(texture0, rhi::ResourceState::TransferDst, rhi::ResourceState::ShaderRead);
         transition->Transition(texture1, rhi::ResourceState::TransferDst, rhi::ResourceState::ShaderRead);
@@ -100,36 +102,37 @@ namespace
         transition->End();
         device->WaitForFence(device->Submit(*transition));
 
-        auto output = device->CreateBuffer({
+        auto output{rhitest::Required(device->CreateBuffer({
             .Size       = 32 * sizeof(float),
             .Usage      = rhi::BufferUsage::Storage | rhi::BufferUsage::DeviceAddress,
             .MemoryType = rhi::MemoryType::GpuToCpu,
             .DebugName  = "bindless_texture_test.output",
-        });
+        }))};
         REQUIRE(output.Valid());
 
         struct alignas(8) PushConstants
         {
-            uint64_t outputAddress;
-            uint64_t texture0;
-            uint64_t texture1;
+            uint64_t outputAddress{};
+            uint64_t texture0{};
+            uint64_t texture1{};
         };
         const PushConstants pc{device->BufferAddress(output).Address, device->TextureAddress(texture0).Address,
                                device->TextureAddress(texture1).Address};
 
-        auto command = device->CreateCommandList(rhi::QueueType::Compute, "bindless_texture_test.dispatch");
+        auto command{
+            rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "bindless_texture_test.dispatch"))};
         command->Begin();
         command->SetPipeline(pipeline);
-        command->SetPushConstants(&pc, sizeof(pc), 0);
+        command->SetPushConstants(pc);
         command->Dispatch(1, 1, 1);
         command->End();
         device->WaitForFence(device->Submit(*command));
 
         constexpr float expected[32]{1.F, 0.F, 0.F, 1.F, 0.F, 1.F, 0.F, 1.F, 0.F, 0.F, 1.F, 1.F, 1.F, 1.F, 0.F, 1.F,
                                      0.F, 1.F, 1.F, 1.F, 1.F, 0.F, 1.F, 1.F, 1.F, 1.F, 1.F, 1.F, 0.F, 0.F, 0.F, 1.F};
-        const auto      mapped = device->MapBuffer(output);
+        const auto      mapped{device->MapBuffer(output)};
         REQUIRE(mapped.Data != nullptr);
-        const auto *actual = static_cast<const float *>(mapped.Data);
+        const auto *actual{static_cast<const float *>(mapped.Data)};
         bool        matches{true};
         for (uint32_t i{0}; i < 32; ++i)
         {

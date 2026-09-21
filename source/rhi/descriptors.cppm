@@ -1,6 +1,12 @@
+/**
+ * {file} descriptors.cppm
+ * {brief} Defines backend-neutral resource and device creation descriptors.
+ */
 module;
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 export module rhi:descriptors;
@@ -14,7 +20,7 @@ export namespace rhi
     // Device
     // ---------------------------------------------------------------------------
 
-    /** {brief} Selects validation behavior and the application name when creating a device. */
+    /** {brief} Selects validation behavior and application metadata when creating a device. */
     struct DeviceDesc
     {
         bool        EnableValidation{true};     ///< Enables API validation when the backend provides it.
@@ -51,6 +57,55 @@ export namespace rhi
         TextureUsage     Usage{TextureUsage::Sampled | TextureUsage::TransferDst}; ///< All intended texture operations.
         ResourceState    InitialState{ResourceState::Undefined}; ///< State tracked immediately after creation.
         std::string_view DebugName{};                            ///< Optional diagnostic name, copied during creation.
+    };
+
+    // ---------------------------------------------------------------------------
+    // Memory placement
+    // ---------------------------------------------------------------------------
+
+    /**
+     * {brief} Describes a heap of device memory that the caller places textures into.
+     *
+     * This is a heap of bytes. IBindlessHeap is a heap of shader-visible descriptor slots. Both are
+     * pools the caller draws from, which is why both are heaps; the qualifier says which resource
+     * each one hands out.
+     */
+    struct MemoryHeapDesc
+    {
+        uint64_t         Size{};                          ///< Heap size in bytes; must be non-zero.
+        MemoryType       MemoryType{MemoryType::GpuOnly}; ///< CPU/GPU visibility shared by every placement.
+        std::string_view DebugName{};                     ///< Optional diagnostic name, copied during creation.
+    };
+
+    /** {brief} Memory one resource occupies when it is placed in a heap. */
+    struct PlacementRequirements
+    {
+        uint64_t Size{};      ///< Bytes the resource occupies, which may exceed its logical data.
+        uint64_t Alignment{}; ///< Offset alignment the device requires; always a power of two.
+    };
+
+    /**
+     * {brief} Names where a placed resource lives in a memory heap.
+     *
+     * The caller chooses the offset and keeps live placements from overlapping. A placement may be
+     * reused for another resource only after the timeline point covering the previous one's last
+     * use has completed.
+     */
+    struct HeapPlacement
+    {
+        MemoryHeapHandle Heap{};   ///< Heap supplying the memory.
+        uint64_t         Offset{}; ///< Byte offset satisfying PlacementRequirements::Alignment.
+    };
+
+    /** {brief} Why a device could not report or accept a resource placement. */
+    enum class PlacementError : uint8_t
+    {
+        InvalidHeap,        ///< The placement names no live memory heap.
+        MisalignedOffset,   ///< The offset does not satisfy the reported alignment.
+        OutOfRange,         ///< The offset and required size do not fit inside the heap.
+        IncompatibleMemory, ///< The device cannot place this resource in the heap's memory type.
+        Overlapping,        ///< Validation found a live placement covering the same bytes.
+        CreationFailed      ///< The backend could not query or create the resource.
     };
 
     /**
@@ -202,6 +257,13 @@ export namespace rhi
         template <typename T> [[nodiscard]] T *As() const noexcept
         {
             return static_cast<T *>(Data);
+        }
+
+        /** {brief} Views the mapped bytes, or an empty span when this view is invalid. */
+        [[nodiscard]] std::span<std::byte> Bytes() const noexcept
+        {
+            return Data != nullptr ? std::span{static_cast<std::byte *>(Data), static_cast<std::size_t>(Size)}
+                                   : std::span<std::byte>{};
         }
 
         /** {brief} Reports whether this view refers to mapped memory. */

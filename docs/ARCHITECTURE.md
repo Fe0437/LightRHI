@@ -59,7 +59,8 @@ rhi::BufferHandle buf = device->createBuffer({...});
 `lightRHI` is implemented by `LightRHIBackend` (one shared library per platform). It:
 
 - `export import rhi;` — re-exports all nine `rhi` partitions to the consumer
-- Exports `rhi::createDevice(const DeviceDesc&) → unique_ptr<IDevice>`
+- Exports `rhi::CreateDevice(const DeviceDesc&) → expected<unique_ptr<IDevice>, DeviceError>`
+- Exports typed `CreateExternalTextureProvider` factories owned by the selected backend
 - Implements all pure-virtual interfaces from `rhi`
 - Keeps internal types in `rhi::metal::` / `rhi::vulkan::` (not exported)
 
@@ -90,6 +91,87 @@ Resource lifecycle:
 - `createTexture / destroyTexture`
 - `createSampler / destroySampler`
 - `createGraphicsPipeline / createComputePipeline / destroyPipeline`
+
+Presentation:
+
+- backend surface descriptor — the application's own native surface, handed to a provider factory
+- `CreateExternalTextureProvider(device, surface)` → `IExternalTextureProvider` — textures this
+  library did not make, offered one at a time to be drawn and shown
+- `ITextureFormatProvider::TextureFormat()` — what to build pipelines against, before any frame exists
+- `ITextureProvider::NextTexture()` — the texture for this frame, borrowed until it is shown
+- `IExternalTextureProvider::Handle()` — names the provider so a present can be recorded against it
+- `ICommandList::Present(handle)` — recorded like any other work; the submission carrying it shows
+  the frame
+
+> The two abilities are separate interfaces because they are used separately: a pipeline is built
+> once from the format alone, while textures are taken every frame. `IExternalTextureProvider` is
+> their union plus the handle, which is what a presentable surface actually offers.
+>
+> LightRHI owns the one step a backend cannot delegate: handing out memory the display scans out.
+> It creates no window, negotiates no present mode, paces no frames and tracks no damage — all of
+> that stays with the application. There is no swapchain object in the API, and a device that never
+> presents answers for nothing extra: one device serves as many surfaces as an application makes
+> targets for.
+>
+> A provider answers for nothing it does not have to. How big this frame is comes from the frame:
+> `GetTextureInfo(handle)` describes any texture, a borrowed surface frame included, so work is
+> sized by the image being drawn into rather than by a window that may have changed since.
+>
+> `ExternalTextureError::Unavailable` is a normal skipped frame — the surface has no area, or the
+> platform has no image to give. `ExternalTextureError::Lost` means the surface or its device is
+> gone, and recovery
+> is the caller's policy.
+>
+> Presentation is recorded rather than submitted separately because both backends order it with the
+> submission that drew the frame: Metal signals the drawable on the queue after the commit, Vulkan
+> signals the binary semaphore its queue present waits on. A submission that knows it ends in a
+> present carries that ordering itself, so a frame costs one submission.
+>
+> The fence returned by that submission proves the GPU finished the commands, **not** that the
+> display has shown them. Presentation latency must not be measured from it.
+>
+> Metal exposes `MetalSurfaceDesc`, which carries a typed `CA::MetalLayer *` — one description for
+> every Apple platform. Vulkan takes a `VkSurfaceKHR` the caller already made, with
+> `NativeInstance(device)` to make it from: window toolkits create surfaces themselves
+> (`SDL_Vulkan_CreateSurface`, `glfwCreateWindowSurface`) and each asks for the instance. So the
+> backend has no Win32, Wayland, XCB or Xlib spelling in its API at all, and never guesses the
+> active window system — the toolkit that owns the window already knows it. Surface instance
+> extensions are enabled from what the loader reports, since a device is created before any window
+> is known, which is also what makes a toolkit-made surface work against this instance. Vulkan
+> builds a FIFO swapchain on that surface and rebuilds it whenever its size changes or the chain
+> goes out of date.
+
+Caller-owned memory:
+
+- `CreateMemoryHeap / DestroyMemoryHeap` — one allocation the application suballocates itself
+- `TexturePlacementRequirements(desc, memory)` — the size and alignment one texture needs in a heap
+  of that memory type, or a `PlacementError` when the device cannot place it there
+- `BufferPlacementRequirements(desc)` — the non-zero size and alignment one buffer needs, or a
+  `PlacementError` when the device cannot place it
+- `CreateTexture(desc, placement)` — a texture whose storage is the caller's bytes at an offset
+- `CreateBuffer(desc, placement)` — a buffer whose storage is the caller's bytes at an offset
+
+> **Two kinds of heap.** Both are pools the caller draws from, so both are called heaps; the
+> qualifier is the whole difference. A **memory heap** hands out bytes. The **bindless heap**
+> (`IBindlessHeap`) hands out shader-visible descriptor slots.
+>
+> The device never chooses an offset and keeps no suballocator; it validates the offset a caller
+> gives it and refuses an overlapping, misaligned or out-of-range placement through
+> `std::expected<TextureHandle, PlacementError>`. A range whose texture has been destroyed may be
+> reused once the timeline point covering its last use has completed.
+>
+> **Best available layout, with a fallback.** A heap of any memory type can hold a texture where the
+> device allows it. Metal places textures in a heap whose storage mode follows the memory type,
+> which unified memory supports directly, so CPU-visible placement is native. Vulkan asks for
+> optimal tiling first and falls back to linear tiling when the adapter refuses optimal images
+> host-visible memory — the same call keeps working, at a different cost. `IncompatibleMemory` is
+> reported only when no layout fits, so a caller can ask before it commits without interpreting a
+> sentinel size.
+>
+> Metal backs a heap with an `MTLHeap` of type placement and Vulkan with one `VkDeviceMemory`
+> allocation bound at an offset. On Metal the heap is what joins the queue residency set, so its
+> placed textures do not each commit it — allocating 1024 small textures measured roughly twice as
+> fast placed as created individually.
 
 Mapping and addressing:
 
@@ -210,11 +292,11 @@ All shaders use the same explicit Metal buffer slot assignment so the backend ca
 | 0    | Buffer GPU-address table | `[[vk::binding(0, 0)]] StructuredBuffer<uint64_t>` |
 | 1    | Texture slot table       | `[[vk::binding(1, 0)]] StructuredBuffer<uint64_t>` |
 | 2    | Sampler slot table       | `[[vk::binding(2, 0)]] StructuredBuffer<uint64_t>` |
-| 30   | Push constants           | `[[vk::push_constant]] ConstantBuffer<PC>`         |
+| 30   | Push constants           | `register(LIGHTRHI_PUSH_CONSTANT_REGISTER)`        |
 
-`[[vk::push_constant]]` compiles to `[[buffer(30)]]` in Metal MSL output, matching the `kPushConstantSlot = 30` constant in the Metal command list encoder.
+Shaders include `light_rhi_shader_abi.slangh` and use `LIGHTRHI_PUSH_CONSTANT_REGISTER` in an otherwise explicit push-constant declaration. The macro keeps the reserved register synchronized across shaders while leaving the resource kind and binding visible at each declaration.
 
-> `[[vk::push_constant]]` is a Slang/HLSL semantic attribute that maps to `layout(push_constant)` in GLSL/SPIR-V and to `[[buffer(30)]]` in Slang's Metal codegen. The `[[vk::binding(N, set)]]` attribute sets explicit descriptor binding numbers; for Metal, Slang uses the binding number directly as the `[[buffer(N)]]` index.
+> `[[vk::push_constant]]` is a Slang/HLSL semantic attribute that maps to `layout(push_constant)` in GLSL/SPIR-V. Together with LightRHI's reserved register, it maps to `[[buffer(30)]]` in Metal codegen. The `[[vk::binding(N, set)]]` attribute sets explicit descriptor binding numbers; for Metal, Slang uses the binding number directly as the `[[buffer(N)]]` index.
 > Reference: [Slang — Resource Binding](https://shader-slang.com/slang/user-guide/a1-04-semantic-attributes.html)
 
 For compute shaders the `[numthreads(X, Y, Z)]` annotation emits `[[max_total_threads_per_threadgroup(X)]]` in Metal, which the backend reads from the PSO via [`maxTotalThreadsPerThreadgroup()`](https://developer.apple.com/documentation/metal/mtlcomputepipelinestate/maxtotalthreadsperthreadgroup).

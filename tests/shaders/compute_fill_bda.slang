@@ -2,14 +2,15 @@
 // Compute kernel: writes a value to a buffer via a raw GPU address in push constants.
 // Tests the BDA path (uint* cast from uint64_t address).
 
+#include "light_rhi_shader_abi.slangh"
+
 struct PC {
     uint64_t outputAddr;
     uint     value;
     uint     count;
 };
 
-// register(b30) forces Metal buffer(30) — matches kPushConstantSlot in the backend.
-[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(b30);  // Vulkan push constant; register(b30) pins Metal buffer(30)
+[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
 
 [shader("compute")]
 [numthreads(64, 1, 1)]

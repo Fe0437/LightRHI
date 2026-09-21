@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Checks whose automatic fixes must never be applied in this repository.",
+    "Each entry is here because its fix-it broke the build, and the reason is structural",
+    "rather than a one-off - so a future run would break it again.",
+    "Diagnostics from these checks are still reported; only the automatic rewrite is off."
+  ],
+  "clang_tidy_never_autofix_checks_add": [
+    "misc-non-private-member-variables-in-classes",
+    "cppcoreguidelines-non-private-member-variables-in-classes"
+  ],
+  "_reasons": {
+    "misc-non-private-member-variables-in-classes": [
+      "The handle types in source/rhi/handles.cppm are deliberate aggregates: a public",
+      "`Index` is what lets them be built with designated initialisers and passed by value",
+      "like any other trivially copyable id. Making it private turns them into non-aggregates",
+      "and every construction site stops compiling."
+    ],
+    "_note": [
+      "misc-include-cleaner is not listed here: it is disabled outright in .clang-tidy,",
+      "because its reports are unfixable in this project rather than merely unwanted."
+    ]
+  }
+}

@@ -440,7 +440,7 @@ def _parse_fields(body: str, default_access: str, docs: dict[str, str] | None = 
 
 
 BASE_CLAUSE = re.compile(r":\s*(?P<bases>[^{]+)$")
-BASE_NAME = re.compile(r"(?:public|private|protected|virtual)?\s*([A-Za-z_][\w:]*)")
+BASE_NAME = re.compile(r"(?:public|private|protected|virtual)?\s*((?:::)?[A-Za-z_][\w:]*)")
 
 
 def _parse_bases(signature: str) -> list[str]:
@@ -861,14 +861,18 @@ def _render_doc(doc: DocComment, indent: str = "") -> list[str]:
     if doc.returns:
         lines.append(f"{indent}**Returns** — {doc.returns}")
         lines.append("")
-    for entries, style in (
-        (doc.preconditions, "note"),
-        (doc.notes, "note"),
-        (doc.warnings, "warning"),
-        (doc.postconditions, "note"),
+    for entries, directive, title in (
+        (doc.preconditions, "admonition", "Precondition"),
+        (doc.notes, "note", ""),
+        (doc.warnings, "warning", ""),
+        (doc.postconditions, "admonition", "Postcondition"),
     ):
         for entry in entries:
-            lines.append(f"{indent}```{{{style}}}")
+            suffix = f" {title}" if title else ""
+            lines.append(f"{indent}```{{{directive}}}{suffix}")
+            if title:
+                lines.append(f"{indent}:class: note")
+                lines.append("")
             lines.append(f"{indent}{entry}")
             lines.append(f"{indent}```")
             lines.append("")
@@ -1041,7 +1045,9 @@ def _mentions(text: str, names: set[str]) -> set[str]:
     return {name for name in names if re.search(rf"\b{re.escape(name)}\b", text)}
 
 
-def _relations(drawn: list[Entity], index: TypeIndex) -> tuple[list[tuple[str, str, str, str]], set[str]]:
+def _relations(
+    entities: list[Entity], drawn: list[Entity], index: TypeIndex
+) -> tuple[list[tuple[str, str, str, str]], set[str]]:
     """The edges of the diagram, and the outside types they reach.
 
     Three kinds, because they mean different things: a base class is inheritance, a field is
@@ -1071,6 +1077,12 @@ def _relations(drawn: list[Entity], index: TypeIndex) -> tuple[list[tuple[str, s
                 continue
             for target in _mentions(declaration, known):
                 _record(entity.name, target, "-->", field_name)
+
+    for entity in entities:
+        if entity.kind != "function" or entity.owner not in local:
+            continue
+        for target in _mentions(entity.signature, known):
+            _record(entity.owner, target, "..>", entity.name)
 
     edges: list[tuple[str, str, str, str]] = []
     for (source, target, arrow), labels in sorted(grouped.items()):
@@ -1112,12 +1124,13 @@ def render_diagram(document: FileDoc, index: TypeIndex, operations: dict[str, li
     if not drawn:
         return None
 
-    edges, outside = _relations(drawn, index)
+    edges, outside = _relations(document.entities, drawn, index)
     if not edges and len(drawn) < 2:
         return None
 
     lines = [
         "@startuml",
+        "!pragma layout elk",
         f"title {document.title}",
         "skinparam classAttributeIconSize 0",
         "skinparam shadowing false",

@@ -9,8 +9,9 @@
 // rhi::ToShaderDesc() path — the same artifact flow the tests use.
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -23,12 +24,18 @@
 namespace rhiexample
 {
 
+    /** {brief} Stops with a message: a missing or unreadable artifact means the build is wrong. */
+    [[noreturn]] inline void failArtifact(const std::string &message)
+    {
+        std::fprintf(stderr, "[example] %s\n", message.c_str());
+        std::exit(1);
+    }
     inline std::vector<std::byte> readShaderArtifactBytes(const std::string &path)
     {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file)
         {
-            throw std::runtime_error("[example] failed to open shader artifact: " + path);
+            failArtifact("[example] failed to open shader artifact: " + path);
         }
 
         const std::streamsize size{file.tellg()};
@@ -37,7 +44,7 @@ namespace rhiexample
         std::vector<std::byte> bytes(static_cast<size_t>(size));
         if (size > 0 && !file.read(reinterpret_cast<char *>(bytes.data()), size))
         {
-            throw std::runtime_error("[example] failed to read shader artifact: " + path);
+            failArtifact("[example] failed to read shader artifact: " + path);
         }
         return bytes;
     }
@@ -63,23 +70,22 @@ namespace rhiexample
 #error "loadShaderArtifact: no RHI_BACKEND_METAL / RHI_BACKEND_VULKAN defined"
 #endif
 
-        auto [it, inserted] = cache.try_emplace(name);
+        auto [it, inserted]{cache.try_emplace(name)};
         if (inserted)
         {
             it->second = readShaderArtifactBytes(path);
         }
-        const auto &bytes = it->second;
-
+        const auto             &bytes{it->second};
         rhi::ShaderArtifactView artifact{
             .Format     = format,
             .Stage      = stage,
             .EntryPoint = backendEntryPoint,
             .Data       = bytes,
         };
-        auto desc = rhi::ToShaderDesc(artifact);
+        auto desc{rhi::ToShaderDesc(artifact)};
         if (!desc)
         {
-            throw std::runtime_error("[example] ToShaderDesc failed for shader artifact: " + path);
+            failArtifact("[example] ToShaderDesc failed for shader artifact: " + path);
         }
         return *desc;
     }

@@ -15,8 +15,6 @@ submission, and synchronization are caller-visible.
   backend selection, bindless model, shader pipeline, and build requirements.
 - [API_GUIDELINES.md](docs/API_GUIDELINES.md) captures the public API rules used by
   the code in `source/rhi`.
-- [AGENTS.md](AGENTS.md) contains local development constraints for contributors
-  and coding agents working in this repository.
 
 ## Repository layout
 
@@ -29,6 +27,39 @@ tests/                  Smoke and GPU integration tests
 cmake/                  Build helpers for warnings, sanitizers, Slang, shaders
 tools/                  Shader artifact tooling
 ```
+
+## Dependencies
+
+LightRHI resolves every dependency itself. Each is tried with `find_package()`
+first, so a vcpkg or system install is used when present, and fetched into
+`_deps/` otherwise. A parent project that adds LightRHI as a submodule does not
+need to install or declare any of these.
+
+| Dependency | Version | When | Why |
+| --- | --- | --- | --- |
+| Metal, Foundation, QuartzCore | system SDK | Apple | Frameworks the Metal backend links. |
+| [metal-cpp](https://github.com/bkaradzic/metal-cpp) | `metal-cpp_27` | Apple | Header-only C++ wrapper for Metal; no Objective-C is compiled. |
+| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | `vulkan-sdk-1.3.290.0` | non-Apple | Headers only — the loader is never linked (see below). |
+| [VulkanMemoryAllocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) | `v3.1.0` | non-Apple | Device memory suballocation for the Vulkan backend. |
+| [volk](https://github.com/zeux/volk) | `1.3.270` | non-Apple | Loads Vulkan entry points at run time. |
+| [Slang](https://github.com/shader-slang/slang) | `2026.13` | shaders | `slangc` compiles the `.slang` sources; a prebuilt release is fetched only when no usable `slangc` is on the system. |
+| Python 3 | interpreter | shaders | Runs the shader artifact tooling in `tools/`. |
+
+Only one backend's dependencies are resolved per build: `LIGHT_RHI_BACKEND`
+selects Metal on Apple and Vulkan elsewhere, and the other backend's sources are
+not configured.
+
+The Vulkan backend needs no SDK install. It resolves entry points through volk
+against the loader that ships with every GPU driver, so `vulkan-1.lib` /
+`libvulkan.so` is never linked and only the headers are required.
+
+### Build-time tools
+
+| Tool | Minimum | Why |
+| --- | --- | --- |
+| CMake | 3.28 | C++23 module dependency scanning. |
+| Ninja | any | The only generator that drives module scanning here. |
+| Clang | 21 | C++23 named modules, built with `-fno-exceptions` and `-fno-rtti`. |
 
 ## Consumer usage
 

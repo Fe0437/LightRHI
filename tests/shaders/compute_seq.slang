@@ -3,12 +3,14 @@
 // fill_a writes 0xAAAAAAAA; xor_b XORs with 0x55555555 → result 0xFFFFFFFF.
 // A UAV barrier between them is inserted by the test to prove ordering.
 
+#include "light_rhi_shader_abi.slangh"
+
 struct PC {
     uint64_t bufAddr;
     uint     count;
 };
 
-[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(b30);  // Vulkan push constant; register(b30) pins Metal buffer(30)
+[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
 
 [shader("compute")]
 [numthreads(64, 1, 1)]

@@ -1,10 +1,18 @@
+/**
+ * {file} device.cppm
+ * {brief} Defines the backend-neutral device lifecycle and synchronized access contract.
+ */
 module;
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <span>
-#include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 export module rhi:device;
@@ -14,6 +22,7 @@ import :descriptors;
 import :pipeline;
 import :sync;
 import :bindless;
+import :diagnostics;
 import :commandList;
 import :raytracing;
 
@@ -46,7 +55,7 @@ export namespace rhi
      *
      * \par Typical frame recording
      * ```cpp
-     * auto cmd = device->CreateCommandList(QueueType::Graphics, "main frame");
+     * auto cmd{device->CreateCommandList(QueueType::Graphics, "main frame")};
      * cmd->Begin();
      * cmd->Transition(backbuffer, ResourceState::Undefined, ResourceState::RenderTarget);
      * cmd->FlushBarriers();
@@ -64,8 +73,10 @@ export namespace rhi
      * const FenceHandle fence = device->Submit(*cmd);
      * device->WaitForFence(fence);
      * ```
-     * A window or presentation layer may present the texture after the submitted
-     * transition to ResourceState::Present; presentation is outside IDevice.
+     * Work meant to be seen is submitted the same way: take this frame's texture from an
+     * IExternalTextureProvider, record work against it, record ICommandList::Present() and submit. The
+     * device stays what it is — resources, queues and submission — and what the window is, how big
+     * it is and when to draw are the provider's and the caller's business.
      */
     class IDevice
     {
@@ -95,17 +106,73 @@ export namespace rhi
          */
         [[nodiscard]] virtual IBindlessHeap &BindlessHeap() noexcept = 0;
 
+        // ---- Memory ----
+
+        /**
+         * {brief} Creates a heap of device memory that the caller places textures into.
+         *
+         * Use a heap when the placement pattern is the caller's to decide: reusing one region for
+         * many short-lived textures, or keeping related textures in one allocation. The device
+         * neither chooses offsets nor tracks what a placement means.
+         * {returns} A valid handle owned by this device.
+         * {pre} `desc.Size` is non-zero.
+         */
+        [[nodiscard]] virtual std::expected<MemoryHeapHandle, DeviceError>
+        CreateMemoryHeap(const MemoryHeapDesc &desc) = 0;
+
+        /**
+         * {brief} Destroys a memory heap created by this device.
+         * {pre} Every texture placed in `handle` has been destroyed and no pending GPU work uses them.
+         */
+        virtual void DestroyMemoryHeap(MemoryHeapHandle handle) = 0;
+
+        /**
+         * {brief} Reports the memory one texture needs when placed in a heap of `memory`.
+         *
+         * Query this before creating the heap, because the requirement depends on the memory that
+         * heap will hold: a device that cannot give its fastest texture layout CPU-visible memory
+         * reports what its next-best layout needs there instead.
+         * {returns} Non-zero size and alignment to place `desc`, or why the device cannot place it.
+         */
+        [[nodiscard]] virtual std::expected<PlacementRequirements, PlacementError>
+        TexturePlacementRequirements(const TextureDesc &desc, MemoryType memory) const = 0;
+
         // ---- Buffer ----
 
         /**
          * {brief} Creates a buffer described by `desc`.
          * {returns} A valid handle owned by this device.
          */
-        [[nodiscard]] virtual BufferHandle CreateBuffer(const BufferDesc &desc) = 0;
+        [[nodiscard]] virtual std::expected<BufferHandle, DeviceError> CreateBuffer(const BufferDesc &desc) = 0;
+
+        /**
+         * {brief} Reports the memory one buffer needs when placed in a heap.
+         *
+         * The requirement follows `desc`, including the memory it asks for, so query it before
+         * creating the heap the buffer will live in.
+         * {returns} Non-zero size and alignment to place `desc`, or why the device cannot place it.
+         */
+        [[nodiscard]] virtual std::expected<PlacementRequirements, PlacementError>
+        BufferPlacementRequirements(const BufferDesc &desc) const = 0;
+
+        /**
+         * {brief} Creates a buffer that occupies caller-owned memory at `placement`.
+         *
+         * The buffer behaves like any other buffer, BufferAddress() included, so shaders reach it
+         * through the same address they would use for one that owns its allocation; only its
+         * storage differs. The heap's memory type must match the one `desc` asks for. The offset
+         * must satisfy BufferPlacementRequirements() and must not overlap a live placement.
+         * Reusing the bytes of a destroyed placement is allowed once the timeline point covering
+         * its last use has completed; reusing them earlier is undefined.
+         * {returns} A valid handle, or the reason the placement was refused.
+         */
+        [[nodiscard]] virtual std::expected<BufferHandle, PlacementError>
+        CreateBuffer(const BufferDesc &desc, const HeapPlacement &placement) = 0;
 
         /**
          * {brief} Destroys a buffer created by this device.
          * {pre} No pending or future GPU work references `handle`.
+         * {note} Destroying a placed buffer releases the buffer, never its memory heap.
          */
         virtual void DestroyBuffer(BufferHandle handle) = 0;
 
@@ -121,6 +188,13 @@ export namespace rhi
          * {pre} `handle` names a live buffer created by this device.
          */
         [[nodiscard]] virtual BufferInfo GetBufferInfo(BufferHandle handle) const = 0;
+
+        /**
+         * {brief} Returns the size, format and usage of a texture.
+         * {pre} `handle` names a live texture created by this device, or a frame taken from a
+         * provider and not yet shown.
+         */
+        [[nodiscard]] virtual TextureInfo GetTextureInfo(TextureHandle handle) const = 0;
 
         /**
          * {brief} Maps a CPU-visible buffer and returns its writable or readable byte range.
@@ -142,11 +216,28 @@ export namespace rhi
          * {brief} Creates a texture described by `desc` without uploading texel data.
          * {returns} A valid handle owned by this device.
          */
-        [[nodiscard]] virtual TextureHandle CreateTexture(const TextureDesc &desc) = 0;
+        [[nodiscard]] virtual std::expected<TextureHandle, DeviceError> CreateTexture(const TextureDesc &desc) = 0;
+
+        /**
+         * {brief} Creates a texture that occupies caller-owned memory at `placement`.
+         *
+         * The texture behaves like any other texture and is destroyed with DestroyTexture(); only
+         * its storage differs. A heap of any memory type can hold a texture where the device allows
+         * it; where the fastest layout cannot live in that memory, the device uses the best layout
+         * that can, so the same call keeps working with different performance. When no layout fits,
+         * the result is PlacementError::IncompatibleMemory rather than a surprise. The offset must
+         * satisfy TexturePlacementRequirements() for the heap's memory type and must not overlap a
+         * live placement. Reusing the bytes of a destroyed placement is allowed once the
+         * timeline point covering its last use has completed; reusing them earlier is undefined.
+         * {returns} A valid handle, or the reason the placement was refused.
+         */
+        [[nodiscard]] virtual std::expected<TextureHandle, PlacementError>
+        CreateTexture(const TextureDesc &desc, const HeapPlacement &placement) = 0;
 
         /**
          * {brief} Destroys a texture created by this device.
          * {pre} No pending or future GPU work references `handle`.
+         * {note} Destroying a placed texture releases the texture, never its memory heap.
          */
         virtual void DestroyTexture(TextureHandle handle) = 0;
 
@@ -164,7 +255,7 @@ export namespace rhi
          * {brief} Creates an immutable sampler described by `desc`.
          * {returns} A valid handle owned by this device.
          */
-        [[nodiscard]] virtual SamplerHandle CreateSampler(const SamplerDesc &desc) = 0;
+        [[nodiscard]] virtual std::expected<SamplerHandle, DeviceError> CreateSampler(const SamplerDesc &desc) = 0;
 
         /**
          * {brief} Destroys a sampler created by this device.
@@ -203,7 +294,8 @@ export namespace rhi
          * {pre} SupportsComputeTimestamps() is true.
          * {returns} An invalid handle when `count` is zero.
          */
-        [[nodiscard]] virtual TimestampQueryPoolHandle CreateTimestampQueryPool(uint32_t count) = 0;
+        [[nodiscard]] virtual std::expected<TimestampQueryPoolHandle, DeviceError>
+        CreateTimestampQueryPool(uint32_t count) = 0;
 
         /**
          * {brief} Releases a timestamp query pool.
@@ -236,13 +328,15 @@ export namespace rhi
          * {brief} Creates a graphics pipeline compatible with the formats in `desc`.
          * {note} The shader bytecode views in `desc` need only remain valid for this call.
          */
-        [[nodiscard]] virtual PipelineHandle CreateGraphicsPipeline(const GraphicsPipelineDesc &desc) = 0;
+        [[nodiscard]] virtual std::expected<PipelineHandle, DeviceError>
+        CreateGraphicsPipeline(const GraphicsPipelineDesc &desc) = 0;
 
         /**
          * {brief} Creates a compute pipeline from the compiled shader in `desc`.
          * {note} The shader bytecode view in `desc` need only remain valid for this call.
          */
-        [[nodiscard]] virtual PipelineHandle CreateComputePipeline(const ComputePipelineDesc &desc) = 0;
+        [[nodiscard]] virtual std::expected<PipelineHandle, DeviceError>
+        CreateComputePipeline(const ComputePipelineDesc &desc) = 0;
 
         /**
          * {brief} Destroys a graphics or compute pipeline created by this device.
@@ -275,7 +369,7 @@ export namespace rhi
          * using the returned handle for tracing.
          * {pre} SupportsRayTracing() is true.
          */
-        [[nodiscard]] virtual AccelerationStructureHandle
+        [[nodiscard]] virtual std::expected<AccelerationStructureHandle, DeviceError>
         CreateAccelerationStructure(const AccelerationStructureDesc &desc) = 0;
 
         /**
@@ -300,8 +394,8 @@ export namespace rhi
          * {param debugName} Optional name shown by validation and GPU debugging tools.
          * {returns} Exclusive ownership of a command list initially ready for Begin().
          */
-        [[nodiscard]] virtual std::unique_ptr<ICommandList> CreateCommandList(QueueType queue = QueueType::Graphics,
-                                                                              std::string_view debugName = {}) = 0;
+        [[nodiscard]] virtual std::expected<std::unique_ptr<ICommandList>, DeviceError>
+        CreateCommandList(QueueType queue = QueueType::Graphics, std::string_view debugName = {}) = 0;
 
         // ---- Debug capture scopes ----
 
@@ -341,12 +435,30 @@ export namespace rhi
         /**
          * {brief} Copies CPU bytes into a destination buffer and waits for completion.
          * {param dst} Destination buffer created with BufferUsage::TransferDst.
-         * {param data} Source bytes that remain valid for the duration of the call.
-         * {param size} Number of bytes to copy.
+         * {param data} Source bytes that remain valid for the duration of the call; all of them are copied.
          * {param dstOffset} Byte offset in the destination buffer.
          * {note} Use recorded copies from a reusable staging buffer for batches or frequent updates.
          */
-        virtual void UploadBuffer(BufferHandle dst, const void *data, uint64_t size, uint64_t dstOffset = 0) = 0;
+        virtual void UploadBuffer(BufferHandle dst, std::span<const std::byte> data, uint64_t dstOffset = 0) = 0;
+
+        /**
+         * {brief} Copies the elements of a contiguous range of trivially copyable values into a buffer.
+         * {param dst} Destination buffer created with BufferUsage::TransferDst.
+         * {param data} Array, vector, span, or other contiguous range whose object representation is copied.
+         * {param dstOffset} Byte offset in the destination buffer.
+         *
+         * ```cpp
+         * const std::array<float, 9> vertices{...};
+         * device->UploadBuffer(vertexBuffer, vertices);
+         * ```
+         */
+        template <std::ranges::contiguous_range Range>
+        requires std::ranges::sized_range<Range> && std::is_trivially_copyable_v<std::ranges::range_value_t<Range>> &&
+                 (!std::convertible_to<Range, std::span<const std::byte>>)
+        void UploadBuffer(BufferHandle dst, Range &&data, uint64_t dstOffset = 0)
+        {
+            UploadBuffer(dst, std::as_bytes(std::span{std::ranges::data(data), std::ranges::size(data)}), dstOffset);
+        }
 
         /**
          * {brief} Copies one CPU image region into a texture and waits for completion.
@@ -355,10 +467,28 @@ export namespace rhi
          * {param rowPitch} Byte distance between adjacent rows in `data`.
          * {param slicePitch} Byte distance between adjacent depth slices in `data`.
          * {param region} Destination mip, layer, offset, and extent.
+         * {pre} `data` holds at least as many bytes as the region reads through `rowPitch` and `slicePitch`.
          * {note} Use CopyBufferToTexture() with shared staging storage for multiple uploads.
          */
-        virtual void UploadTexture(TextureHandle dst, const void *data, uint64_t rowPitch, uint64_t slicePitch,
-                                   const TextureCopyRegion &region) = 0;
+        virtual void UploadTexture(TextureHandle dst, std::span<const std::byte> data, uint64_t rowPitch,
+                                   uint64_t slicePitch, const TextureCopyRegion &region) = 0;
+
+        /**
+         * {brief} Copies one image region held in a contiguous range of trivially copyable texels.
+         * {param data} Array, vector, span, or other contiguous range whose object representation is copied.
+         * {param rowPitch} Byte distance between adjacent rows in `data`.
+         * {param slicePitch} Byte distance between adjacent depth slices in `data`.
+         * {param region} Destination mip, layer, offset, and extent.
+         */
+        template <std::ranges::contiguous_range Range>
+        requires std::ranges::sized_range<Range> && std::is_trivially_copyable_v<std::ranges::range_value_t<Range>> &&
+                 (!std::convertible_to<Range, std::span<const std::byte>>)
+        void UploadTexture(TextureHandle dst, Range &&data, uint64_t rowPitch, uint64_t slicePitch,
+                           const TextureCopyRegion &region)
+        {
+            UploadTexture(dst, std::as_bytes(std::span{std::ranges::data(data), std::ranges::size(data)}), rowPitch,
+                          slicePitch, region);
+        }
     };
 
     /**
@@ -370,7 +500,7 @@ export namespace rhi
      * ```cpp
      * SharedDevice device = rhi::AcquireSharedDevice(desc);
      * {
-     *     auto lockedDevice = device->Synchronize();
+     *     auto lockedDevice{device->Synchronize()};
      *     lockedDevice->WaitIdle();
      * }
      * ```
@@ -383,22 +513,22 @@ export namespace rhi
         {
           public:
             /** {brief} Locks `mutex` and exposes `device` until this object is destroyed. */
-            StrictLockPtr(IDevice &device, std::mutex &mutex) : _device{&device}, _lock{mutex} {}
+            StrictLockPtr(IDevice &device, std::mutex &mutex) : _device{device}, _lock{mutex} {}
 
             /** {brief} Returns the locked device. */
             [[nodiscard]] IDevice &operator*() const noexcept
             {
-                return *_device;
+                return _device;
             }
             /** {brief} Provides member access to the locked device. */
             [[nodiscard]] IDevice *operator->() const noexcept
             {
-                return _device;
+                return &_device;
             }
 
           private:
-            IDevice                     *_device;
-            std::unique_lock<std::mutex> _lock;
+            IDevice                     &_device;
+            std::unique_lock<std::mutex> _lock{};
         };
 
         /** {brief} Takes ownership of `device` and records the descriptor used to create it. */
@@ -423,16 +553,16 @@ export namespace rhi
         }
 
       private:
-        std::unique_ptr<IDevice> _device;
-        std::mutex               _mutex;
-        DeviceDesc               _desc;
+        std::unique_ptr<IDevice> _device{};
+        std::mutex               _mutex{};
+        DeviceDesc               _desc{};
     };
 
     /** {brief} Shared ownership of the process-wide synchronized device. */
     using SharedDevice = std::shared_ptr<SynchronizedDevice>;
 
     /** {brief} Backend factory accepted by the backend-neutral AcquireSharedDevice() helper. */
-    using DeviceFactory = std::unique_ptr<IDevice> (*)(const DeviceDesc &);
+    using DeviceFactory = std::expected<std::unique_ptr<IDevice>, DeviceError> (*)(const DeviceDesc &);
 
     /**
      * {brief} Acquires the process-wide device, creating it through `factory` on first use.
@@ -441,10 +571,11 @@ export namespace rhi
      * request matching validation settings.
      * {returns} Shared ownership of the synchronized device.
      */
-    [[nodiscard]] inline SharedDevice AcquireSharedDevice(const DeviceDesc &desc, DeviceFactory factory)
+    [[nodiscard]] inline std::expected<SharedDevice, DeviceError> AcquireSharedDevice(const DeviceDesc &desc,
+                                                                                      DeviceFactory     factory)
     {
-        static std::mutex                        mutex;
-        static std::weak_ptr<SynchronizedDevice> weakDevice;
+        static std::mutex                        mutex{};
+        static std::weak_ptr<SynchronizedDevice> weakDevice{};
 
         const std::scoped_lock lock{mutex};
 
@@ -453,12 +584,19 @@ export namespace rhi
             if (device->Desc().EnableValidation != desc.EnableValidation ||
                 device->Desc().EnableGpuValidation != desc.EnableGpuValidation)
             {
-                throw std::runtime_error("[LightRHI] shared device already exists with different validation settings");
+                // Two parts of one process asking for different validation settings cannot both be
+                // served by one device, and neither could act on a null: the settings have to agree.
+                FailContract("a shared device already exists with different validation settings");
             }
             return device;
         }
 
-        auto device{std::make_shared<SynchronizedDevice>(factory(desc), desc)};
+        auto created{factory(desc)};
+        if (!created)
+        {
+            return std::unexpected{created.error()};
+        }
+        auto device{std::make_shared<SynchronizedDevice>(std::move(*created), desc)};
         weakDevice = device;
         return device;
     }

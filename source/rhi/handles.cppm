@@ -1,3 +1,7 @@
+/**
+ * {file} handles.cppm
+ * {brief} Defines opaque value handles for GPU resources and submissions.
+ */
 module;
 #include <cstdint>
 
@@ -5,11 +9,46 @@ export module rhi:handles;
 
 export namespace rhi
 {
+    // Every handle below is one public `uint32_t Index`, and the check below would have it made
+    // private behind an accessor. It is refused here, once, for all of them.
+    //
+    // A struct keeps its public data members to stay an *aggregate*, which is what allows
+    //
+    //     return BufferHandle{.Index = idx};
+    //
+    // the form each backend uses to mint a handle - 11 sites across the two of them. A private
+    // data member makes the type a non-aggregate and every one of those stops compiling.
+    //
+    // There is also nothing for an accessor to protect. The only rule a handle has is "is this
+    // slot real", and `Valid()` already answers it; the index is meaningless outside the device
+    // that issued it, which the member's own comment says. Hiding it would buy ceremony, not
+    // an invariant.
+    // NOLINTBEGIN(misc-non-private-member-variables-in-classes,cppcoreguidelines-non-private-member-variables-in-classes)
 
     /** {brief} Sentinel stored by default-constructed opaque resource handles. */
     inline constexpr uint32_t kInvalidIndex{~0U};
 
     // ---- Resource handles ----
+
+    /**
+     * {brief} Opaque handle to a heap of device memory owned by an IDevice.
+     *
+     * A memory heap hands out bytes; the bindless heap reported by IBindlessHeap hands out
+     * shader-visible descriptor slots. Both are pools the caller draws from, so both are heaps,
+     * and the qualifier is the whole difference.
+     */
+    struct MemoryHeapHandle
+    {
+        uint32_t Index{kInvalidIndex}; ///< Opaque device-owned slot; do not manufacture indices.
+
+        /** {brief} Reports whether this handle names a memory heap. */
+        [[nodiscard]] constexpr bool Valid() const noexcept
+        {
+            return Index != kInvalidIndex;
+        }
+        /** {brief} Compares heap identity. */
+        [[nodiscard]] constexpr bool operator==(const MemoryHeapHandle &) const noexcept = default;
+    };
 
     /** {brief} Opaque handle to a buffer owned by an IDevice. */
     struct BufferHandle
@@ -37,6 +76,26 @@ export namespace rhi
         }
         /** {brief} Compares opaque handle identity. */
         [[nodiscard]] constexpr bool operator==(const TextureHandle &) const noexcept = default;
+    };
+
+    /**
+     * {brief} Opaque handle to an external texture provider registered with an IDevice.
+     *
+     * Presenting names its provider the way drawing names a buffer or a texture: by an opaque slot
+     * the device resolves. A recorded present therefore carries a value, not a pointer the backend
+     * has to know the real type of.
+     */
+    struct ExternalTextureProviderHandle
+    {
+        uint32_t Index{kInvalidIndex}; ///< Opaque device-owned slot; do not manufacture indices.
+
+        /** {brief} Reports whether this value names an external texture provider slot. */
+        [[nodiscard]] constexpr bool Valid() const noexcept
+        {
+            return Index != kInvalidIndex;
+        }
+        /** {brief} Compares opaque handle identity. */
+        [[nodiscard]] constexpr bool operator==(const ExternalTextureProviderHandle &) const noexcept = default;
     };
 
     /** {brief} Opaque handle to a sampler owned by an IDevice. */
@@ -142,4 +201,5 @@ export namespace rhi
         [[nodiscard]] constexpr bool operator==(const FenceHandle &) const noexcept = default;
     };
 
+    // NOLINTEND(misc-non-private-member-variables-in-classes,cppcoreguidelines-non-private-member-variables-in-classes)
 } // namespace rhi

@@ -1,10 +1,19 @@
+/**
+ * {file} commandList.cppm
+ * {brief} Defines commands recorded for later GPU submission. Device ownership is defined elsewhere.
+ */
 module;
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
+#include <type_traits>
 
 export module rhi:commandList;
 import :types;
 import :handles;
+import :externalTextures;
 import :descriptors;
 import :pipeline;
 import :sync;
@@ -22,7 +31,7 @@ export namespace rhi
      * recorded or reused while an earlier submission of it is still running.
      *
      * ```cpp
-     * auto cmd = device->CreateCommandList(QueueType::Compute, "simulation");
+     * auto cmd{device->CreateCommandList(QueueType::Compute, "simulation")};
      * cmd->Begin();
      * cmd->SetPipeline(simulationPipeline);
      * cmd->SetPushConstants(SimulationConstants{});
@@ -51,6 +60,20 @@ export namespace rhi
          * {pre} Begin() was called and all rendering and debug groups have been ended.
          */
         virtual void End() = 0;
+
+        /**
+         * {brief} Shows the named provider's current texture once this submission has drawn it.
+         *
+         * Recorded like any other work, so a frame needs no second submission path. The provider is
+         * named by handle for the same reason a buffer or texture is: the device resolves it, and
+         * recording carries a value rather than an object.
+         * {param target} An external texture provider of this device, from its Handle().
+         * {pre} A texture was taken from that target for this frame, not yet shown, and
+         * transitioned to ResourceState::Present by the work recorded before this.
+         * {note} The submission's fence completing proves the GPU finished the commands, not that
+         * the display has shown them. Do not measure presentation latency from it.
+         */
+        virtual void Present(ExternalTextureProviderHandle target) = 0;
 
         /**
          * {brief} Enqueues a state transition for a texture subresource range.
@@ -135,12 +158,11 @@ export namespace rhi
 
         /**
          * {brief} Updates bytes in the current pipeline's push-constant block.
-         * {param data} Source bytes copied during this call.
-         * {param size} Number of bytes to update.
+         * {param data} Source bytes copied during this call; its size is the number of bytes updated.
          * {param offset} Destination byte offset within the block.
-         * {pre} A pipeline is bound and `offset + size` does not exceed its declared range.
+         * {pre} A pipeline is bound and `offset + data.size()` does not exceed its declared range.
          */
-        virtual void SetPushConstants(const void *data, uint32_t size, uint32_t offset = 0) = 0;
+        virtual void SetPushConstants(std::span<const std::byte> data, uint32_t offset = 0) = 0;
 
         /**
          * {brief} Updates push constants from one trivially copyable value.
@@ -161,9 +183,13 @@ export namespace rhi
          * });
          * ```
          */
-        template <typename T> void SetPushConstants(const T &data, uint32_t offset = 0)
+        template <typename T>
+        requires std::is_trivially_copyable_v<T> && (!std::convertible_to<const T &, std::span<const std::byte>>)
+        void SetPushConstants(const T &data, uint32_t offset = 0)
         {
-            SetPushConstants(&data, static_cast<uint32_t>(sizeof(T)), offset);
+            // A span is itself trivially copyable, so the constraint keeps one from being uploaded
+            // as its own pointer and size instead of the bytes it names.
+            SetPushConstants(std::as_bytes(std::span{&data, 1}), offset);
         }
 
         // ---- Index buffer ----

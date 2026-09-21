@@ -1,3 +1,7 @@
+/**
+ * {file} types.cppm
+ * {brief} Defines backend-neutral GPU value types, flags, and errors.
+ */
 module;
 #include <cstdint>
 #include <utility> // std::to_underlying
@@ -15,6 +19,9 @@ export namespace rhi
      * Names encode channel order, bits per channel, numeric interpretation, and
      * optional sRGB transfer. Use Undefined only where an optional format is allowed.
      */
+    // Part of this library's published interface: the width is visible in every struct that
+    // carries one, so narrowing it would change layouts a consumer has already compiled against.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class Format : uint32_t
     {
         Undefined = 0,
@@ -112,23 +119,26 @@ export namespace rhi
      * {brief} Describes the kind of GPU access immediately before or after an explicit transition.
      * {note} Callers track states and record ICommandList::Transition() when access changes.
      */
+    // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
+    // has today, so shrinking it to fit the current set would cap the type.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class ResourceState : uint32_t
     {
         Undefined                  = 0,           ///< Contents and previous access need not be preserved.
-        VertexBuffer               = 1 << 0,      ///< Read as vertex input.
-        IndexBuffer                = 1 << 1,      ///< Read as index input.
-        ConstantBuffer             = 1 << 2,      ///< Read as constant or uniform data.
-        ShaderRead                 = 1 << 3,      ///< Read-only shader access or texture sampling.
-        UnorderedAccess            = 1 << 4,      ///< Shader read/write access.
-        RenderTarget               = 1 << 5,      ///< Color-attachment write access.
-        DepthRead                  = 1 << 6,      ///< Read-only depth/stencil attachment access.
-        DepthWrite                 = 1 << 7,      ///< Writable depth/stencil attachment access.
-        TransferSrc                = 1 << 8,      ///< Source of a copy or blit operation.
-        TransferDst                = 1 << 9,      ///< Destination of a copy, blit, clear, or fill operation.
-        Present                    = 1 << 10,     ///< Ready for presentation by a presentation owner.
-        IndirectArgument           = 1 << 11,     ///< Read as draw or dispatch arguments.
-        AccelerationStructureWrite = 1 << 12,     ///< Written by an acceleration-structure build.
-        AccelerationStructureRead  = 1 << 13,     ///< Traversed by a shader ray query or TLAS build.
+        VertexBuffer               = 1U << 0U,      ///< Read as vertex input.
+        IndexBuffer                = 1U << 1U,      ///< Read as index input.
+        ConstantBuffer             = 1U << 2U,      ///< Read as constant or uniform data.
+        ShaderRead                 = 1U << 3U,      ///< Read-only shader access or texture sampling.
+        UnorderedAccess            = 1U << 4U,      ///< Shader read/write access.
+        RenderTarget               = 1U << 5U,      ///< Color-attachment write access.
+        DepthRead                  = 1U << 6U,      ///< Read-only depth/stencil attachment access.
+        DepthWrite                 = 1U << 7U,      ///< Writable depth/stencil attachment access.
+        TransferSrc                = 1U << 8U,      ///< Source of a copy or blit operation.
+        TransferDst                = 1U << 9U,      ///< Destination of a copy, blit, clear, or fill operation.
+        Present                    = 1U << 10U,     ///< Ready for presentation by a presentation owner.
+        IndirectArgument           = 1U << 11U,     ///< Read as draw or dispatch arguments.
+        AccelerationStructureWrite = 1U << 12U,     ///< Written by an acceleration-structure build.
+        AccelerationStructureRead  = 1U << 13U,     ///< Traversed by a shader ray query or TLAS build.
         CopySrc                    = TransferSrc, ///< Alias for TransferSrc.
         CopyDst                    = TransferDst, ///< Alias for TransferDst.
     };
@@ -152,17 +162,20 @@ export namespace rhi
     // ---- Buffer usage ----
 
     /** {brief} Declares every operation a buffer may participate in during its lifetime. */
+    // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
+    // has today, so shrinking it to fit the current set would cap the type.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class BufferUsage : uint32_t
     {
         None          = 0,      ///< No GPU operation is declared.
-        Vertex        = 1 << 0, ///< May be bound as vertex input.
-        Index         = 1 << 1, ///< May be bound as index input.
-        Constant      = 1 << 2, ///< May be read as constant or uniform data.
-        Storage       = 1 << 3, ///< May be read or written as shader storage.
-        IndirectArgs  = 1 << 4, ///< May provide draw or dispatch arguments.
-        TransferSrc   = 1 << 5, ///< May be the source of copy operations.
-        TransferDst   = 1 << 6, ///< May be the destination of copy or fill operations.
-        DeviceAddress = 1 << 7, ///< May expose a shader-visible address through BufferAddress().
+        Vertex        = 1U << 0U, ///< May be bound as vertex input.
+        Index         = 1U << 1U, ///< May be bound as index input.
+        Constant      = 1U << 2U, ///< May be read as constant or uniform data.
+        Storage       = 1U << 3U, ///< May be read or written as shader storage.
+        IndirectArgs  = 1U << 4U, ///< May provide draw or dispatch arguments.
+        TransferSrc   = 1U << 5U, ///< May be the source of copy operations.
+        TransferDst   = 1U << 6U, ///< May be the destination of copy or fill operations.
+        DeviceAddress = 1U << 7U, ///< May expose a shader-visible address through BufferAddress().
     };
 
     /** {brief} Combines buffer-usage flags for a descriptor. */
@@ -184,15 +197,22 @@ export namespace rhi
     // ---- Texture usage ----
 
     /** {brief} Declares every operation a texture may participate in during its lifetime. */
+    // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
+    // has today, so shrinking it to fit the current set would cap the type.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class TextureUsage : uint32_t
     {
-        None         = 0,      ///< No GPU operation is declared.
-        Sampled      = 1 << 0, ///< May be sampled or read by shaders.
-        Storage      = 1 << 1, ///< May be read or written as shader storage.
-        RenderTarget = 1 << 2, ///< May be used as a color attachment.
-        DepthStencil = 1 << 3, ///< May be used as a depth/stencil attachment.
-        TransferSrc  = 1 << 4, ///< May be the source of copy operations.
-        TransferDst  = 1 << 5, ///< May be the destination of copy, upload, or clear operations.
+        None    = 0,      ///< No GPU operation is declared.
+        Sampled = 1U << 0U, ///< May be sampled or read by shaders.
+        // Declares the intent on the resource, which every backend honours. Reaching a texture as
+        // writable storage from a shader has no path in this API yet: shaders address buffers by
+        // GPU address and textures as sampled bindless handles, so a compute kernel that produces
+        // pixels writes them to a buffer. Do not read this flag as a promise of a write path.
+        Storage      = 1U << 1U, ///< May be read or written as shader storage.
+        RenderTarget = 1U << 2U, ///< May be used as a color attachment.
+        DepthStencil = 1U << 3U, ///< May be used as a depth/stencil attachment.
+        TransferSrc  = 1U << 4U, ///< May be the source of copy operations.
+        TransferDst  = 1U << 5U, ///< May be the destination of copy, upload, or clear operations.
     };
 
     /** {brief} Combines texture-usage flags for a descriptor. */
@@ -363,12 +383,15 @@ export namespace rhi
     // ---- Shader stages and artifacts ----
 
     /** {brief} Identifies shader stages for artifact metadata and visibility. */
+    // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
+    // has today, so shrinking it to fit the current set would cap the type.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class ShaderStage : uint32_t
     {
         None     = 0,
-        Vertex   = 1 << 0,
-        Fragment = 1 << 1,
-        Compute  = 1 << 2,
+        Vertex   = 1U << 0U,
+        Fragment = 1U << 1U,
+        Compute  = 1U << 2U,
         All      = Vertex | Fragment | Compute,
     };
 

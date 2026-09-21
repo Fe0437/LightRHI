@@ -1,4 +1,7 @@
-// metal_device.cpp — MetalDevice implementation.
+/**
+ * {file} metal_device.cpp
+ * {brief} Implements Metal device and resource lifecycles. Command recording is implemented elsewhere.
+ */
 // Pure C++ / metal-cpp — no Objective-C or .mm required.
 //
 // Targets Metal 4 exclusively (MTL4CommandQueue/MTL4Compiler/MTL4ArgumentTable/
@@ -21,9 +24,13 @@ module;
 #include <QuartzCore/QuartzCore.hpp>
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <dispatch/dispatch.h>
+#include <expected>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -45,12 +52,53 @@ import rhi;
 
 namespace rhi
 {
-    std::unique_ptr<IDevice> CreateDevice(const DeviceDesc &desc)
+    std::expected<std::unique_ptr<IDevice>, DeviceError> CreateDevice(const DeviceDesc &desc)
     {
-        return std::make_unique<metal::MetalDevice>(desc);
+        return metal::MetalDevice::Create(desc).transform([](std::unique_ptr<metal::MetalDevice> device)
+                                                          { return std::unique_ptr<IDevice>{std::move(device)}; });
     }
 
-    SharedDevice AcquireSharedDevice(const DeviceDesc &desc)
+    ExternalTextureOwnerContext ExternalTextureOwnerContextOf(IDevice & /*device*/)
+    {
+        // Nothing has to be handed over first: a CAMetalLayer belongs to the window already.
+        return {};
+    }
+
+    std::expected<std::unique_ptr<IExternalTextureProvider>, DeviceError>
+    CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner, Format requestedFormat)
+    {
+        // The one cast, written where the type is known: this build is the Metal one, so the
+        // platform object a caller can have obtained is a CAMetalLayer and nothing else.
+        auto *nativeLayer{static_cast<CA::MetalLayer *>(owner.Value)};
+        if (nativeLayer == nullptr)
+        {
+            ReportRefusal("a Metal external texture provider needs a CAMetalLayer");
+            return std::unexpected{DeviceError::InvalidArgument};
+        }
+
+        auto        &metalDevice{static_cast<metal::MetalDevice &>(device)};
+        auto         layer{NS::RetainPtr(nativeLayer)};
+        const Format format{requestedFormat == Format::Undefined ? Format::BGRA8Unorm : requestedFormat};
+
+        // The layer stays the application's: this sets only what it must in order to draw into it,
+        // never its size.
+        layer->setDevice(&metalDevice.MtlDevice());
+        layer->setPixelFormat(metal::MetalDevice::ExternalTexturePixelFormat(format));
+        // A surface texture is a texture like any other, so it has to accept every use a texture
+        // accepts. A drawable is a colour attachment and nothing else until this is cleared, which
+        // would refuse a copy into it - the cost is that Core Animation keeps the pixels readable
+        // rather than discarding them after a frame.
+        layer->setFramebufferOnly(false);
+        // Metal 4 makes drawable textures reachable through the layer's own residency set.
+        if (auto *layerResidency{layer->residencySet()})
+        {
+            metalDevice.Mtl4Queue().addResidencySet(layerResidency);
+        }
+
+        return std::make_unique<metal::MetalPresentingTextureProvider>(metalDevice, std::move(layer), format);
+    }
+
+    std::expected<SharedDevice, DeviceError> AcquireSharedDevice(const DeviceDesc &desc)
     {
         return rhi::AcquireSharedDevice(desc, &CreateDevice);
     }
@@ -133,13 +181,13 @@ namespace rhi::metal
     {
         return _heap;
     }
-    MTL::Device *MetalDevice::MtlDevice() const noexcept
+    MTL::Device &MetalDevice::MtlDevice() const noexcept
     {
-        return _device.get();
+        return *_device.get();
     }
-    MTL4::CommandQueue *MetalDevice::Mtl4Queue() const noexcept
+    MTL4::CommandQueue &MetalDevice::Mtl4Queue() const noexcept
     {
-        return _queue.get();
+        return *_queue.get();
     }
 
     bool MetalDevice::DebugCaptureEnabled() const noexcept
@@ -148,41 +196,75 @@ namespace rhi::metal
     }
     MetalBuffer &MetalDevice::Buffer(BufferHandle h)
     {
-        return _buffers.get(h.Index);
+        assert(h.Valid());
+        MetalBuffer &buffer{_buffers.get(h.Index)};
+        assert(buffer.buffer);
+        return buffer;
     }
     MetalTexture &MetalDevice::Texture(TextureHandle h)
     {
-        return _textures.get(h.Index);
+        assert(h.Valid());
+        MetalTexture &texture{_textures.get(h.Index)};
+        assert(texture.texture);
+        return texture;
     }
     MetalSampler &MetalDevice::Sampler(SamplerHandle h)
     {
-        return _samplers.get(h.Index);
+        assert(h.Valid());
+        MetalSampler &sampler{_samplers.get(h.Index)};
+        assert(sampler.state);
+        return sampler;
     }
     MetalTimestampQueryPool &MetalDevice::TimestampQueryPool(TimestampQueryPoolHandle h)
     {
-        return _timestampQueryPools.get(h.Index);
+        assert(h.Valid());
+        MetalTimestampQueryPool &pool{_timestampQueryPools.get(h.Index)};
+        assert(pool.heap);
+        return pool;
     }
     MetalPipeline &MetalDevice::Pipeline(PipelineHandle h)
     {
-        return _pipelines.get(h.Index);
+        assert(h.Valid());
+        MetalPipeline &pipeline{_pipelines.get(h.Index)};
+        assert(pipeline.renderPso || pipeline.computePso);
+        return pipeline;
     }
     MetalAccelerationStructure &MetalDevice::AccelStruct(AccelerationStructureHandle h)
     {
-        return _accelStructs.get(h.Index);
+        assert(h.Valid());
+        MetalAccelerationStructure &accelerationStructure{_accelStructs.get(h.Index)};
+        assert(accelerationStructure.as);
+        return accelerationStructure;
     }
     FenceHandle MetalDevice::NextFence() noexcept
     {
-        return FenceHandle{++_timelineValue};
+        return FenceHandle{.Id = ++_timelineValue};
     }
-    MTL::SharedEvent *MetalDevice::TimelineEvent() const noexcept
+    MTL::SharedEvent &MetalDevice::TimelineEvent() const noexcept
     {
-        return _timelineEvent.get();
+        return *_timelineEvent.get();
     }
-    MetalCommandResources MetalDevice::AcquireCommandResources()
+    bool MetalDevice::DeviceLost() const noexcept
+    {
+        return _deviceLost;
+    }
+
+    MTL::PixelFormat MetalDevice::ExternalTexturePixelFormat(Format f) noexcept
+    {
+        return _toPixFmt(f);
+    }
+
+    std::expected<TextureHandle, DeviceError> MetalDevice::AdoptExternalTexture(NS::SharedPtr<MTL::Texture> tex,
+                                                                               const TextureDesc          &desc)
+    {
+        return _adoptTexture(std::move(tex), desc, MemoryHeapHandle{}, 0, /*borrowed=*/true);
+    }
+
+    std::expected<MetalCommandResources, DeviceError> MetalDevice::AcquireCommandResources()
     {
         {
             const uint64_t   completedFence{_timelineEvent->signaledValue()};
-            std::scoped_lock lock{_commandResourcePoolMutex};
+            const std::scoped_lock lock{_commandResourcePoolMutex};
             for (std::size_t i{0}; i < _commandResourcePool.size(); ++i)
             {
                 const auto fence{_commandResourcePool[i].CompletionFence};
@@ -199,43 +281,45 @@ namespace rhi::metal
             }
         }
 
-        MetalCommandResources resources{
-            .Allocator     = NS::TransferPtr(_device->newCommandAllocator()),
-            .CommandBuffer = NS::TransferPtr(_device->newCommandBuffer()),
+        auto allocator{
+            adoptCreated(_device->newCommandAllocator(), "MTLDevice::newCommandAllocator refused the allocator")};
+        if (!allocator)
+        {
+            return std::unexpected{allocator.error()};
+        }
+        auto commandBuffer{adoptCreated(_device->newCommandBuffer(), "MTLDevice::newCommandBuffer refused the buffer")};
+        if (!commandBuffer)
+        {
+            return std::unexpected{commandBuffer.error()};
+        }
+        return MetalCommandResources{
+            .Allocator     = std::move(*allocator),
+            .CommandBuffer = std::move(*commandBuffer),
         };
-        if (!resources.Allocator)
-        {
-            throw std::runtime_error("[LightRHI] MTLDevice::newCommandAllocator failed");
-        }
-        if (!resources.CommandBuffer)
-        {
-            throw std::runtime_error("[LightRHI] MTLDevice::newCommandBuffer failed");
-        }
-        return resources;
     }
     void MetalDevice::RecycleCommandResources(MetalCommandResources &&resources)
     {
-        std::scoped_lock lock{_commandResourcePoolMutex};
+        const std::scoped_lock lock{_commandResourcePoolMutex};
         _commandResourcePool.push_back(std::move(resources));
     }
-    MTL::CommandQueue *MetalDevice::LegacyQueue() const noexcept
+    MTL::CommandQueue &MetalDevice::LegacyQueue() const noexcept
     {
-        return _legacyQueue.get();
+        return *_legacyQueue.get();
     }
 
     // ============================================================================
     // MetalDevice — residency helpers
     // ============================================================================
 
-    void MetalDevice::_addResident(MTL::Allocation *res)
+    void MetalDevice::_addResident(MTL::Allocation &res)
     {
-        _residencySet->addAllocation(res);
+        _residencySet->addAllocation(&res);
         _residencySet->commit();
     }
 
-    void MetalDevice::_removeResident(MTL::Allocation *res)
+    void MetalDevice::_removeResident(MTL::Allocation &res)
     {
-        _residencySet->removeAllocation(res);
+        _residencySet->removeAllocation(&res);
         _residencySet->commit();
     }
 
@@ -243,72 +327,104 @@ namespace rhi::metal
     // MetalDevice — constructor / destructor
     // ============================================================================
 
-    MetalDevice::MetalDevice(const DeviceDesc &desc)
+    std::expected<MetalDevice::RequiredObjects, DeviceError> MetalDevice::_createRequiredObjects(const DeviceDesc &desc)
     {
-        _debugCaptureEnabled  = desc.EnableValidation;
-        _gpuValidationEnabled = desc.EnableGpuValidation;
-        _device               = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
-        if (!_device)
+        // Every refusal here means this system cannot provide a device, whatever Metal's reason.
+        constexpr DeviceError kNoDevice{DeviceError::NoDevice};
+
+        auto device{
+            adoptCreated(MTL::CreateSystemDefaultDevice(), "no Metal device on this system", nullptr, kNoDevice)};
+        if (!device)
         {
-            throw std::runtime_error("[LightRHI] No Metal device found");
+            return std::unexpected{device.error()};
         }
 
-        if (_debugCaptureEnabled)
+        NS::Error *queueError{nullptr};
+        auto      *queue{
+            [&]
+            {
+                if (!desc.EnableValidation)
+                {
+                    return (*device)->newMTL4CommandQueue();
+                }
+                auto queueDesc{NS::TransferPtr(MTL4::CommandQueueDescriptor::alloc()->init())};
+                queueDesc->setLabel(NS::String::string("HdRestir / LightRHI compute queue", NS::UTF8StringEncoding));
+                return (*device)->newMTL4CommandQueue(queueDesc.get(), &queueError);
+            }()};
+        auto adoptedQueue{
+            adoptCreated(queue, "MTLDevice::newMTL4CommandQueue refused the queue", queueError, kNoDevice)};
+        if (!adoptedQueue)
         {
-            auto queueDesc{NS::TransferPtr(MTL4::CommandQueueDescriptor::alloc()->init())};
-            queueDesc->setLabel(NS::String::string("HdRestir / LightRHI compute queue", NS::UTF8StringEncoding));
-            NS::Error *queueError{nullptr};
-            _queue = NS::TransferPtr(_device->newMTL4CommandQueue(queueDesc.get(), &queueError));
-        }
-        else
-        {
-            _queue = NS::TransferPtr(_device->newMTL4CommandQueue());
-        }
-        if (!_queue)
-        {
-            throw std::runtime_error("[LightRHI] MTLDevice::newMTL4CommandQueue failed");
+            return std::unexpected{adoptedQueue.error()};
         }
 
         // Classic queue used only for the acceleration-structure build
         // exception — see LegacyQueue()'s doc comment in metal_internal.h.
-        _legacyQueue = NS::TransferPtr(_device->newCommandQueue());
-        if (!_legacyQueue)
+        auto legacyQueue{adoptCreated((*device)->newCommandQueue(),
+                                      "MTLDevice::newCommandQueue refused the acceleration-structure queue", nullptr,
+                                      kNoDevice)};
+        if (!legacyQueue)
         {
-            throw std::runtime_error("[LightRHI] MTLDevice::newCommandQueue (legacy AS queue) failed");
+            return std::unexpected{legacyQueue.error()};
         }
-        if (_debugCaptureEnabled)
+        if (desc.EnableValidation)
         {
-            _legacyQueue->setLabel(
-                NS::String::string("HdRestir / acceleration structure build queue", NS::UTF8StringEncoding));
+            (*legacyQueue)
+                ->setLabel(NS::String::string("HdRestir / acceleration structure build queue", NS::UTF8StringEncoding));
         }
 
+        auto       compilerDesc{NS::TransferPtr(MTL4::CompilerDescriptor::alloc()->init())};
+        NS::Error *compilerError{nullptr};
+        auto       compiler{adoptCreated((*device)->newCompiler(compilerDesc.get(), &compilerError),
+                                         "MTL4::Device::newCompiler refused the compiler", compilerError, kNoDevice)};
+        if (!compiler)
         {
-            auto       compilerDesc{NS::TransferPtr(MTL4::CompilerDescriptor::alloc()->init())};
-            NS::Error *err{nullptr};
-            _compiler = NS::TransferPtr(_device->newCompiler(compilerDesc.get(), &err));
-            if (!_compiler)
-            {
-                const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-                throw std::runtime_error(std::string{"[LightRHI] MTL4::Device::newCompiler failed: "} + msg);
-            }
+            return std::unexpected{compiler.error()};
         }
 
         auto       residencyDesc{NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init())};
-        NS::Error *err{nullptr};
-        _residencySet = NS::TransferPtr(_device->newResidencySet(residencyDesc.get(), &err));
-        if (!_residencySet)
+        NS::Error *residencyError{nullptr};
+        auto       residencySet{adoptCreated((*device)->newResidencySet(residencyDesc.get(), &residencyError),
+                                             "MTLDevice::newResidencySet refused the set", residencyError, kNoDevice)};
+        if (!residencySet)
         {
-            const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-            throw std::runtime_error(std::string{"[LightRHI] MTLDevice::newResidencySet failed: "} + msg);
+            return std::unexpected{residencySet.error()};
         }
+
+        auto timelineEvent{adoptCreated((*device)->newSharedEvent(),
+                                        "MTLDevice::newSharedEvent refused the timeline event", nullptr, kNoDevice)};
+        if (!timelineEvent)
+        {
+            return std::unexpected{timelineEvent.error()};
+        }
+
+        return RequiredObjects{
+            .device        = std::move(*device),
+            .queue         = std::move(*adoptedQueue),
+            .legacyQueue   = std::move(*legacyQueue),
+            .compiler      = std::move(*compiler),
+            .residencySet  = std::move(*residencySet),
+            .timelineEvent = std::move(*timelineEvent),
+        };
+    }
+
+    std::expected<std::unique_ptr<MetalDevice>, DeviceError> MetalDevice::Create(const DeviceDesc &desc)
+    {
+        return _createRequiredObjects(desc).transform(
+            [&](RequiredObjects objects)
+            { return std::make_unique<MetalDevice>(ConstructionToken{}, std::move(objects), desc); });
+    }
+
+    MetalDevice::MetalDevice(ConstructionToken, RequiredObjects &&objects, const DeviceDesc &desc)
+        : _device{std::move(objects.device)}, _queue{std::move(objects.queue)},
+          _legacyQueue{std::move(objects.legacyQueue)}, _compiler{std::move(objects.compiler)},
+          _residencySet{std::move(objects.residencySet)}, _timelineEvent{std::move(objects.timelineEvent)},
+          _raytracingSupported(_device->supportsRaytracing()), _debugCaptureEnabled{desc.EnableValidation},
+          _gpuValidationEnabled{desc.EnableGpuValidation}, _videoMemoryBytes(_device->recommendedMaxWorkingSetSize())
+    {
         _queue->addResidencySet(_residencySet.get());
 
-        _adapterName      = std::string{_device->name()->utf8String()};
-        _videoMemoryBytes = _device->recommendedMaxWorkingSetSize();
-
-        _timelineEvent = NS::TransferPtr(_device->newSharedEvent());
-
-        _raytracingSupported = _device->supportsRaytracing();
+        _adapterName         = std::string{_device->name()->utf8String()};
 
         // GPU/shader validation can also be forced process-wide through
         // Xcode's scheme flags / the Metal environment; EnableGpuValidation
@@ -326,13 +442,19 @@ namespace rhi::metal
 
     MTL::CaptureScope *MetalDevice::SubmissionCaptureScope(std::string_view name)
     {
+        if (!_debugCaptureEnabled)
+        {
+            // Capture scopes exist for Xcode's capture UI. With capture metadata off, every
+            // submission would otherwise still take the mutex and hash its label for nothing.
+            return nullptr;
+        }
         const std::string           key{name.empty() ? std::string_view{"LightRHI submission"} : name};
-        std::lock_guard<std::mutex> lock{_captureScopeMutex};
+        const std::scoped_lock lock{_captureScopeMutex};
         auto [it, inserted]{_submissionCaptureScopes.try_emplace(key)};
         if (inserted)
         {
-            auto *manager = MTL::CaptureManager::sharedCaptureManager();
-            it->second    = NS::TransferPtr(manager->newCaptureScope(_queue.get()));
+            auto *manager{MTL::CaptureManager::sharedCaptureManager()};
+            it->second = NS::TransferPtr(manager->newCaptureScope(_queue.get()));
             if (it->second)
             {
                 it->second->setLabel(NS::String::string(key.c_str(), NS::UTF8StringEncoding));
@@ -358,10 +480,10 @@ namespace rhi::metal
         // coherent frame, which is a plausible cause of both replay crashes
         // and the capture hanging (Xcode waiting on a scope-end signal from
         // a scope that's been reused since).
-        NS::SharedPtr<MTL::CaptureScope> scope;
+        NS::SharedPtr<MTL::CaptureScope> scope{};
         {
-            std::lock_guard<std::mutex> lock{_captureScopeMutex};
-            auto                       *manager = MTL::CaptureManager::sharedCaptureManager();
+            const std::scoped_lock lock{_captureScopeMutex};
+            auto                       *manager{MTL::CaptureManager::sharedCaptureManager()};
             // Capture only LightRHI's MTL4 queue. A device-wide scope also
             // records unrelated presentation work from the host process
             // (for example usdview's Metal-backed OpenGL renderer), which
@@ -392,7 +514,7 @@ namespace rhi::metal
             _activeCaptureScope->endScope();
             _activeCaptureScope = nullptr;
         }
-        std::lock_guard<std::mutex> lock{_captureScopeMutex};
+        const std::scoped_lock lock{_captureScopeMutex};
         _frameCaptureScope.reset();
     }
 
@@ -413,37 +535,285 @@ namespace rhi::metal
     }
 
     // ============================================================================
-    // Buffer
+    // MetalPresentingTextureProvider
+    //
+    // The layer is the application's and it sizes it; this only draws into it. A drawable and the
+    // texture naming it live between NextTexture() and the present that shows them, so a null
+    // drawable means no frame is being held.
     // ============================================================================
 
-    BufferHandle MetalDevice::CreateBuffer(const BufferDesc &desc)
+    MetalPresentingTextureProvider::MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer,
+                                           Format format) noexcept
+        : _device{device}, _layer{std::move(layer)}, _format{format}, _handle{device.RegisterExternalTextureProvider(*this)}
     {
-        auto *buf = _device->newBuffer(desc.Size, _toOptions(desc.MemoryType));
-        if (!buf)
+    }
+
+    MetalPresentingTextureProvider::~MetalPresentingTextureProvider()
+    {
+        // Unregistered first: a present recorded against this handle must not resolve to a target
+        // that is already giving its frame back.
+        _device.UnregisterExternalTextureProvider(_handle);
+        // A frame taken and never shown still owns a texture slot and a drawable.
+        if (_texture.Valid())
         {
-            throw std::runtime_error("[LightRHI] MTLDevice::newBuffer failed");
+            _device.DestroyTexture(_texture);
+        }
+    }
+
+    Format MetalPresentingTextureProvider::TextureFormat() const noexcept
+    {
+        return _format;
+    }
+
+    ExternalTextureProviderHandle MetalPresentingTextureProvider::Handle() const noexcept
+    {
+        return _handle;
+    }
+
+    ExternalTextureProviderHandle MetalDevice::RegisterExternalTextureProvider(IFramePresenter &target)
+    {
+        const uint32_t index{_externalTextureProviders.alloc()};
+        if (index == kInvalidIndex)
+        {
+            ReportRefusal("this device already holds as many external texture providers as it can");
+            return {};
+        }
+        _externalTextureProviders.get(index) = &target;
+        return ExternalTextureProviderHandle{.Index = index};
+    }
+
+    void MetalDevice::UnregisterExternalTextureProvider(ExternalTextureProviderHandle handle) noexcept
+    {
+        if (handle.Valid())
+        {
+            _externalTextureProviders.free(handle.Index);
+        }
+    }
+
+    IFramePresenter *MetalDevice::ResolveExternalTextureProvider(ExternalTextureProviderHandle handle) const noexcept
+    {
+        return handle.Valid() ? _externalTextureProviders.get(handle.Index) : nullptr;
+    }
+
+    Extent2D MetalPresentingTextureProvider::_layerExtent() const noexcept
+    {
+        const CGSize size{_layer->drawableSize()};
+        return Extent2D{.Width = static_cast<uint32_t>(size.width), .Height = static_cast<uint32_t>(size.height)};
+    }
+
+    std::expected<TextureHandle, ExternalTextureError> MetalPresentingTextureProvider::NextTexture()
+    {
+        if (_drawable)
+        {
+            // Taking a second frame before the first is shown strands the first one's drawable and
+            // its texture slot, and there is no use for it: a frame is taken, drawn and shown.
+            FailContract("taking a frame from a surface that is already holding one");
+        }
+        if (_device.DeviceLost())
+        {
+            return std::unexpected{ExternalTextureError::Lost};
+        }
+
+        const Extent2D extent{_layerExtent()};
+        if (extent.Width == 0 || extent.Height == 0)
+        {
+            return std::unexpected{ExternalTextureError::Unavailable}; // nothing to draw into without area
+        }
+
+        auto *drawable{_layer->nextDrawable()};
+        if (drawable == nullptr)
+        {
+            // Every image is still being shown, or the window is occluded. The frame is skipped.
+            return std::unexpected{ExternalTextureError::Unavailable};
+        }
+        _drawable = NS::RetainPtr(drawable);
+        _device.Mtl4Queue().wait(drawable);
+
+        const TextureDesc desc{
+            .Format = _format,
+            .Extent = {.Width = extent.Width, .Height = extent.Height, .Depth = 1},
+            .Usage  = TextureUsage::RenderTarget,
+        };
+        auto adopted{_device.AdoptExternalTexture(NS::RetainPtr(drawable->texture()), desc)};
+        if (!adopted)
+        {
+            // The slot pool is full, so the frame cannot be named; the drawable is released rather
+            // than presented half-used.
+            _drawable.reset();
+            return std::unexpected{ExternalTextureError::Unavailable};
+        }
+        _texture = *adopted;
+        return _texture;
+    }
+
+    void MetalPresentingTextureProvider::PresentHeldFrame()
+    {
+        if (!_drawable)
+        {
+            FailContract("presenting a surface that is holding no frame");
+        }
+        // Metal 4 orders presentation on the queue: the drawable was waited for when it was taken
+        // and is signalled after the work that drew it, so present() shows a finished frame.
+        _device.Mtl4Queue().signalDrawable(_drawable.get());
+        _drawable->present();
+
+        // The texture named the drawable for this frame only. Releasing the slot here is what makes
+        // the handle's documented lifetime true.
+        _device.DestroyTexture(_texture);
+        _texture = TextureHandle{};
+        _drawable.reset();
+    }
+
+    // ============================================================================
+    // Memory
+    //
+    // A memory heap is one MTLHeap of type placement. Metal leaves a placement heap untracked for
+    // hazards, which matches LightRHI: callers already record explicit transitions and barriers.
+    //
+    // The heap joins the queue residency set once, here, and its placed textures do not join it
+    // individually — that is the point of the heap. Membership at heap granularity is what keeps
+    // allocating many small textures from committing the residency set once per texture.
+    // ============================================================================
+
+    std::expected<MemoryHeapHandle, DeviceError> MetalDevice::CreateMemoryHeap(const MemoryHeapDesc &desc)
+    {
+        auto hd{NS::TransferPtr(MTL::HeapDescriptor::alloc()->init())};
+        hd->setType(MTL::HeapTypePlacement);
+        hd->setStorageMode(_toStorageMode(desc.MemoryType));
+        hd->setSize(desc.Size);
+
+        auto heap{adoptCreated(_device->newHeap(hd.get()), "MTLDevice::newHeap refused the memory heap")};
+        if (!heap)
+        {
+            return std::unexpected{heap.error()};
         }
 
         if (!desc.DebugName.empty())
         {
-            buf->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            (*heap)->setLabel(MakeLabel(desc.DebugName));
         }
 
-        uint32_t idx{_buffers.alloc()};
-        _buffers.get(idx) = MetalBuffer{NS::TransferPtr(buf), desc.Size, desc.Usage};
+        const uint32_t idx{_memoryHeaps.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many memory heaps as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
+        // Resident only once it has a slot, so a refused heap never stays in the residency set.
+        _addResident(*heap->get());
+        _memoryHeaps.get(idx) =
+            MetalMemoryHeap{.heap = std::move(*heap), .size = desc.Size, .memory = desc.MemoryType, .liveRanges = {}};
+        return MemoryHeapHandle{.Index = idx};
+    }
 
-        _addResident(buf);
+    void MetalDevice::DestroyMemoryHeap(MemoryHeapHandle h)
+    {
+        if (!h.Valid())
+        {
+            return;
+        }
+        _removeResident(*_memoryHeaps.get(h.Index).heap.get());
+        _memoryHeaps.free(h.Index);
+    }
+
+    std::expected<PlacementRequirements, PlacementError>
+    MetalDevice::TexturePlacementRequirements(const TextureDesc &desc, MemoryType memory) const
+    {
+        // Apple silicon gives every storage mode the same unified memory, so the fastest texture
+        // layout is available in a CPU-visible heap too and there is no second-best path to take.
+        auto                    mtd{_makeTextureDescriptor(desc, _toStorageMode(memory))};
+        const MTL::SizeAndAlign sizeAlign{_device->heapTextureSizeAndAlign(mtd.get())};
+        if (sizeAlign.size == 0 || sizeAlign.align == 0)
+        {
+            return std::unexpected{PlacementError::CreationFailed};
+        }
+        return PlacementRequirements{.Size = sizeAlign.size, .Alignment = sizeAlign.align};
+    }
+
+    // ============================================================================
+    // Buffer
+    // ============================================================================
+
+    std::expected<BufferHandle, DeviceError> MetalDevice::_adoptBuffer(NS::SharedPtr<MTL::Buffer> buf,
+                                                                       const BufferDesc &desc, MemoryHeapHandle heap,
+                                                                       uint64_t offset)
+    {
+        if (!desc.DebugName.empty())
+        {
+            buf->setLabel(MakeLabel(desc.DebugName));
+        }
+
+        const uint64_t address{buf->gpuAddress()};
+        const uint32_t idx{_buffers.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many buffers as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
+        // A placed buffer is reachable through its heap's residency, already committed once.
+        if (!heap.Valid())
+        {
+            _addResident(*buf.get());
+        }
         _heap.RegisterBuffer();
+        _buffers.get(idx) = MetalBuffer{
+            .buffer = std::move(buf), .size = desc.Size, .usage = desc.Usage, .heap = heap, .offset = offset};
 
         // Track base GPU address -> slot so acceleration-structure geometry
         // (addressed by GpuAddress/BDA) can be resolved back to an MTL::Buffer*
         // + offset — see _bufferAndOffsetFromAddress.
         {
-            std::scoped_lock lk{_bufferAddrMutex};
-            _bufferAddrToIndex[buf->gpuAddress()] = idx;
+            const std::scoped_lock lk{_bufferAddrMutex};
+            _bufferAddrToIndex[address] = idx;
         }
 
-        return BufferHandle{idx};
+        return BufferHandle{.Index = idx};
+    }
+
+    std::expected<BufferHandle, DeviceError> MetalDevice::CreateBuffer(const BufferDesc &desc)
+    {
+        return adoptCreated(_device->newBuffer(desc.Size, _toOptions(desc.MemoryType)),
+                            "MTLDevice::newBuffer refused the allocation")
+            .and_then([&](NS::SharedPtr<MTL::Buffer> buf)
+                      { return _adoptBuffer(std::move(buf), desc, MemoryHeapHandle{}, 0); });
+    }
+
+    std::expected<PlacementRequirements, PlacementError>
+    MetalDevice::BufferPlacementRequirements(const BufferDesc &desc) const
+    {
+        const MTL::SizeAndAlign sizeAlign{_device->heapBufferSizeAndAlign(desc.Size, _toOptions(desc.MemoryType))};
+        if (sizeAlign.size == 0 || sizeAlign.align == 0)
+        {
+            return std::unexpected{PlacementError::CreationFailed};
+        }
+        return PlacementRequirements{.Size = sizeAlign.size, .Alignment = sizeAlign.align};
+    }
+
+    std::expected<BufferHandle, PlacementError> MetalDevice::CreateBuffer(const BufferDesc    &desc,
+                                                                          const HeapPlacement &placement)
+    {
+        const MTL::SizeAndAlign sizeAlign{_device->heapBufferSizeAndAlign(desc.Size, _toOptions(desc.MemoryType))};
+
+        auto reserved{_reservePlacement(placement, desc.MemoryType, sizeAlign.size, sizeAlign.align)};
+        if (!reserved)
+        {
+            return std::unexpected(reserved.error());
+        }
+
+        auto buf{
+            NS::TransferPtr(reserved->get().heap->newBuffer(desc.Size, _toOptions(desc.MemoryType), placement.Offset))};
+        if (!buf)
+        {
+            reserved->get().liveRanges.erase(placement.Offset);
+            return std::unexpected(PlacementError::CreationFailed);
+        }
+        auto adopted{_adoptBuffer(std::move(buf), desc, placement.Heap, placement.Offset)};
+        if (!adopted)
+        {
+            reserved->get().liveRanges.erase(placement.Offset);
+            return std::unexpected{PlacementError::CreationFailed};
+        }
+        return *adopted;
     }
 
     void MetalDevice::DestroyBuffer(BufferHandle h)
@@ -452,11 +822,19 @@ namespace rhi::metal
         {
             return;
         }
+        auto &record{_buffers.get(h.Index)};
         {
-            std::scoped_lock lk{_bufferAddrMutex};
-            _bufferAddrToIndex.erase(_buffers.get(h.Index).buffer->gpuAddress());
+            const std::scoped_lock lk{_bufferAddrMutex};
+            _bufferAddrToIndex.erase(record.buffer->gpuAddress());
         }
-        _removeResident(_buffers.get(h.Index).buffer.get());
+        if (record.heap.Valid())
+        {
+            _memoryHeaps.get(record.heap.Index).liveRanges.erase(record.offset);
+        }
+        else
+        {
+            _removeResident(*record.buffer.get());
+        }
         _heap.UnregisterBuffer();
         _buffers.free(h.Index);
     }
@@ -467,7 +845,7 @@ namespace rhi::metal
         {
             return {};
         }
-        return GpuAddress{_buffers.get(h.Index).buffer->gpuAddress()};
+        return GpuAddress{.Address = _buffers.get(h.Index).buffer->gpuAddress()};
     }
 
     BufferInfo MetalDevice::GetBufferInfo(BufferHandle h) const
@@ -476,8 +854,27 @@ namespace rhi::metal
         {
             return {};
         }
-        const auto &b = _buffers.get(h.Index);
-        return BufferInfo{.Size = b.size, .Usage = b.usage, .DeviceAddress = GpuAddress{b.buffer->gpuAddress()}};
+        const auto &b{_buffers.get(h.Index)};
+        return BufferInfo{
+            .Size = b.size, .Usage = b.usage, .DeviceAddress = GpuAddress{.Address = b.buffer->gpuAddress()}};
+    }
+
+    TextureInfo MetalDevice::GetTextureInfo(TextureHandle h) const
+    {
+        if (!h.Valid())
+        {
+            return {};
+        }
+        const TextureDesc &desc{_textures.get(h.Index).desc};
+        return TextureInfo{
+            .Extent      = desc.Extent,
+            .Format      = desc.Format,
+            .Usage       = desc.Usage,
+            .Dimension   = desc.Dimension,
+            .MipLevels   = desc.MipLevels,
+            .ArrayLayers = desc.ArrayLayers,
+            .SampleCount = desc.SampleCount,
+        };
     }
 
     MappedBuffer MetalDevice::MapBuffer(BufferHandle h)
@@ -486,8 +883,8 @@ namespace rhi::metal
         {
             return {};
         }
-        auto &b = _buffers.get(h.Index);
-        return MappedBuffer{b.buffer->contents(), b.size};
+        auto &b{_buffers.get(h.Index)};
+        return MappedBuffer{.Data = b.buffer->contents(), .Size = b.size};
     }
 
     void MetalDevice::UnmapBuffer(BufferHandle h)
@@ -496,7 +893,7 @@ namespace rhi::metal
         {
             return;
         }
-        auto &b = _buffers.get(h.Index);
+        auto &b{_buffers.get(h.Index)};
         if (b.buffer->storageMode() == MTL::StorageModeManaged)
         {
             b.buffer->didModifyRange(NS::Range::Make(0, b.size));
@@ -507,7 +904,8 @@ namespace rhi::metal
     // Texture
     // ============================================================================
 
-    TextureHandle MetalDevice::CreateTexture(const TextureDesc &desc)
+    NS::SharedPtr<MTL::TextureDescriptor> MetalDevice::_makeTextureDescriptor(const TextureDesc &desc,
+                                                                              MTL::StorageMode   storage) const
     {
         auto mtd{NS::TransferPtr(MTL::TextureDescriptor::alloc()->init())};
         mtd->setTextureType(_toTexType(desc.Dimension));
@@ -519,24 +917,118 @@ namespace rhi::metal
         mtd->setArrayLength(desc.ArrayLayers);
         mtd->setSampleCount(desc.SampleCount);
         mtd->setUsage(_toTexUsage(desc.Usage));
-        mtd->setStorageMode(MTL::StorageModePrivate);
+        mtd->setStorageMode(storage);
+        return mtd;
+    }
 
-        auto tex{NS::TransferPtr(_device->newTexture(mtd.get()))};
-        if (!tex)
-        {
-            throw std::runtime_error("[LightRHI] MTLDevice::newTexture failed");
-        }
-
+    std::expected<TextureHandle, DeviceError> MetalDevice::_adoptTexture(NS::SharedPtr<MTL::Texture> tex,
+                                                                         const TextureDesc &desc, MemoryHeapHandle heap,
+                                                                         uint64_t offset, bool borrowed)
+    {
         if (!desc.DebugName.empty())
         {
-            tex->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            tex->setLabel(MakeLabel(desc.DebugName));
         }
 
-        uint32_t idx{_textures.alloc()};
-        _addResident(tex.get());
+        const uint32_t idx{_textures.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many textures as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
+        // A placed texture is reachable through its heap's residency, already committed once, and a
+        // borrowed drawable texture through the layer's own residency set.
+        if (!heap.Valid() && !borrowed)
+        {
+            _addResident(*tex.get());
+        }
         _heap.RegisterTexture();
-        _textures.get(idx) = MetalTexture{std::move(tex), desc};
-        return TextureHandle{idx};
+        _textures.get(idx) =
+            MetalTexture{.texture = std::move(tex), .desc = desc, .heap = heap, .offset = offset, .borrowed = borrowed};
+        return TextureHandle{.Index = idx};
+    }
+
+    std::expected<TextureHandle, DeviceError> MetalDevice::CreateTexture(const TextureDesc &desc)
+    {
+        return adoptCreated(_device->newTexture(_makeTextureDescriptor(desc, MTL::StorageModePrivate).get()),
+                            "MTLDevice::newTexture refused the allocation")
+            .and_then([&](NS::SharedPtr<MTL::Texture> tex)
+                      { return _adoptTexture(std::move(tex), desc, MemoryHeapHandle{}, 0); });
+    }
+
+    std::expected<std::reference_wrapper<MetalMemoryHeap>, PlacementError>
+    MetalDevice::_reservePlacement(const HeapPlacement &placement, MemoryType memory, uint64_t size, uint64_t alignment)
+    {
+        if (!placement.Heap.Valid())
+        {
+            return std::unexpected(PlacementError::InvalidHeap);
+        }
+        auto &memoryHeap{_memoryHeaps.get(placement.Heap.Index)};
+        if (!memoryHeap.heap)
+        {
+            return std::unexpected(PlacementError::InvalidHeap);
+        }
+        if (memoryHeap.memory != memory)
+        {
+            return std::unexpected(PlacementError::IncompatibleMemory);
+        }
+        if (alignment == 0 || placement.Offset % alignment != 0)
+        {
+            return std::unexpected(PlacementError::MisalignedOffset);
+        }
+        const uint64_t end{placement.Offset + size};
+        if (end > memoryHeap.size || end < placement.Offset)
+        {
+            return std::unexpected(PlacementError::OutOfRange);
+        }
+
+        // Refuse a range that a live placement already covers. `upper_bound` names the first
+        // placement starting after this one, so only its predecessor and itself can overlap.
+        const auto next{memoryHeap.liveRanges.upper_bound(placement.Offset)};
+        if (next != memoryHeap.liveRanges.end() && next->first < end)
+        {
+            return std::unexpected(PlacementError::Overlapping);
+        }
+        if (next != memoryHeap.liveRanges.begin() && std::prev(next)->second > placement.Offset)
+        {
+            return std::unexpected(PlacementError::Overlapping);
+        }
+
+        memoryHeap.liveRanges.emplace(placement.Offset, end);
+        return std::ref(memoryHeap);
+    }
+
+    std::expected<TextureHandle, PlacementError> MetalDevice::CreateTexture(const TextureDesc   &desc,
+                                                                            const HeapPlacement &placement)
+    {
+        // Storage follows the heap: a CPU-visible heap holds CPU-visible textures, which Apple
+        // silicon supports directly, so there is nothing to emulate. The requirement therefore
+        // depends on the heap the texture is going into.
+        const bool       knownHeap{placement.Heap.Valid() && _memoryHeaps.get(placement.Heap.Index).heap};
+        const MemoryType memory{knownHeap ? _memoryHeaps.get(placement.Heap.Index).memory : MemoryType::GpuOnly};
+
+        auto                    mtd{_makeTextureDescriptor(desc, _toStorageMode(memory))};
+        const MTL::SizeAndAlign sizeAlign{_device->heapTextureSizeAndAlign(mtd.get())};
+
+        auto reserved{_reservePlacement(placement, memory, sizeAlign.size, sizeAlign.align)};
+        if (!reserved)
+        {
+            return std::unexpected(reserved.error());
+        }
+
+        auto tex{NS::TransferPtr(reserved->get().heap->newTexture(mtd.get(), placement.Offset))};
+        if (!tex)
+        {
+            reserved->get().liveRanges.erase(placement.Offset);
+            return std::unexpected(PlacementError::CreationFailed);
+        }
+        auto adopted{_adoptTexture(std::move(tex), desc, placement.Heap, placement.Offset)};
+        if (!adopted)
+        {
+            reserved->get().liveRanges.erase(placement.Offset);
+            return std::unexpected{PlacementError::CreationFailed};
+        }
+        return *adopted;
     }
 
     void MetalDevice::DestroyTexture(TextureHandle h)
@@ -545,7 +1037,15 @@ namespace rhi::metal
         {
             return;
         }
-        _removeResident(_textures.get(h.Index).texture.get());
+        auto &tex{_textures.get(h.Index)};
+        if (tex.heap.Valid())
+        {
+            _memoryHeaps.get(tex.heap.Index).liveRanges.erase(tex.offset);
+        }
+        else if (!tex.borrowed)
+        {
+            _removeResident(*tex.texture.get());
+        }
         _heap.UnregisterTexture();
         _textures.free(h.Index);
     }
@@ -561,14 +1061,14 @@ namespace rhi::metal
         {
             return {};
         }
-        return GpuAddress{_textures.get(h.Index).texture->gpuResourceID()._impl};
+        return GpuAddress{.Address = _textures.get(h.Index).texture->gpuResourceID()._impl};
     }
 
     // ============================================================================
     // Sampler
     // ============================================================================
 
-    SamplerHandle MetalDevice::CreateSampler(const SamplerDesc &desc)
+    std::expected<SamplerHandle, DeviceError> MetalDevice::CreateSampler(const SamplerDesc &desc)
     {
         auto sd{NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init())};
         sd->setMinFilter(_toMinMag(desc.MinFilter));
@@ -585,21 +1085,26 @@ namespace rhi::metal
 
         if (!desc.DebugName.empty())
         {
-            sd->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            sd->setLabel(MakeLabel(desc.DebugName));
         }
 
-        auto smp{NS::TransferPtr(_device->newSamplerState(sd.get()))};
+        auto smp{adoptCreated(_device->newSamplerState(sd.get()), "MTLDevice::newSamplerState refused the sampler")};
         if (!smp)
         {
-            throw std::runtime_error("[LightRHI] MTLDevice::newSamplerState failed");
+            return std::unexpected{smp.error()};
         }
 
-        uint32_t idx{_samplers.alloc()};
-        _samplers.get(idx) = MetalSampler{std::move(smp)};
+        const uint32_t idx{_samplers.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many samplers as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
+        _samplers.get(idx) = MetalSampler{.state = std::move(*smp)};
         _heap.RegisterSampler();
         // MTL::SamplerState is not a MTL::Resource/Allocation — no residency
         // tracking needed (unchanged from classic Metal).
-        return SamplerHandle{idx};
+        return SamplerHandle{.Index = idx};
     }
 
     void MetalDevice::DestroySampler(SamplerHandle h)
@@ -625,7 +1130,7 @@ namespace rhi::metal
         {
             return {};
         }
-        return GpuAddress{h.Index};
+        return GpuAddress{.Address = h.Index};
     }
 
     // ============================================================================
@@ -634,16 +1139,16 @@ namespace rhi::metal
 
     bool MetalDevice::SupportsComputeTimestamps() const noexcept
     {
-        return _device && _device->queryTimestampFrequency() > 0;
+        return _device->queryTimestampFrequency() > 0;
     }
 
     double MetalDevice::TimestampPeriodNanoseconds() const noexcept
     {
-        const uint64_t frequency{_device ? _device->queryTimestampFrequency() : 0};
+        const uint64_t frequency{_device->queryTimestampFrequency()};
         return frequency > 0 ? 1.0e9 / static_cast<double>(frequency) : 0.0;
     }
 
-    TimestampQueryPoolHandle MetalDevice::CreateTimestampQueryPool(uint32_t count)
+    std::expected<TimestampQueryPoolHandle, DeviceError> MetalDevice::CreateTimestampQueryPool(uint32_t count)
     {
         if (count == 0)
         {
@@ -657,13 +1162,17 @@ namespace rhi::metal
         auto       heap{NS::TransferPtr(_device->newCounterHeap(descriptor.get(), &error))};
         if (!heap)
         {
-            const char *message{error ? error->localizedDescription()->utf8String() : "unknown"};
-            throw std::runtime_error(std::string{"[LightRHI] MTLDevice::newCounterHeap failed: "} + message);
+            FailContract("MTLDevice::newCounterHeap failed: " + errorText(error));
         }
 
         const uint32_t index{_timestampQueryPools.alloc()};
+        if (index == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many timestamp query pools as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
         _timestampQueryPools.get(index) = MetalTimestampQueryPool{.heap = std::move(heap), .count = count};
-        return TimestampQueryPoolHandle{index};
+        return TimestampQueryPoolHandle{.Index = index};
     }
 
     void MetalDevice::DestroyTimestampQueryPool(TimestampQueryPoolHandle pool)
@@ -693,10 +1202,10 @@ namespace rhi::metal
         }
         auto &record{_timestampQueryPools.get(pool.Index)};
         assert(first <= record.count && results.size() <= record.count - first);
-        NS::Data *data{record.heap->resolveCounterRange(NS::Range{first, results.size()})};
+        NS::Data const *data{record.heap->resolveCounterRange(NS::Range{first, results.size()})};
         if (!data || data->length() < results.size_bytes())
         {
-            throw std::runtime_error("[LightRHI] MTL4 timestamp counter resolve failed");
+            FailContract("MTL4 timestamp counter resolve failed");
         }
         std::memcpy(results.data(), data->bytes(), results.size_bytes());
     }
@@ -705,26 +1214,21 @@ namespace rhi::metal
     // Ray tracing
     // ============================================================================
 
-    MTL::Buffer *MetalDevice::_bufferAndOffsetFromAddress(GpuAddress addr, uint64_t &outOffset) const
+    MTL::Buffer &MetalDevice::_bufferAtAddress(GpuAddress addr, std::string_view role) const
     {
-        outOffset = 0;
-        if (!addr.Valid())
-        {
-            return nullptr;
-        }
         // Exact-key lookup: AccelerationStructureDesc always addresses
         // vertex/index data by a buffer's own base address (device.cppm's
         // BlasFromTriangleBuffer() takes IDevice::BufferAddress()'s result
         // directly, never an offset sub-range), so there is no "closest base
         // below addr" case to resolve — O(1) instead of scanning every buffer.
-        std::scoped_lock lk{_bufferAddrMutex};
-        auto             it{_bufferAddrToIndex.find(addr.Address)};
+        // The geometry therefore always starts at offset zero in that buffer.
+        const std::scoped_lock lk{_bufferAddrMutex};
+        const auto       it{addr.Valid() ? _bufferAddrToIndex.find(addr.Address) : _bufferAddrToIndex.end()};
         if (it == _bufferAddrToIndex.end())
         {
-            return nullptr;
+            FailContract(std::string{role} + " does not resolve to a live LightRHI buffer");
         }
-        outOffset = 0;
-        return _buffers.get(it->second).buffer.get();
+        return *_buffers.get(it->second).buffer.get();
     }
 
     NS::SharedPtr<MTL::AccelerationStructureDescriptor>
@@ -733,17 +1237,10 @@ namespace rhi::metal
     {
         if (desc.Type == AccelerationStructureType::BottomLevel)
         {
-            uint64_t     vtxOffset{0};
-            MTL::Buffer *vtxBuf{_bufferAndOffsetFromAddress(desc.VertexBufferAddress, vtxOffset)};
-            if (!vtxBuf)
-            {
-                throw std::runtime_error("[LightRHI] BlasFromTriangleBuffer: VertexBufferAddress does not resolve "
-                                         "to a live LightRHI buffer");
-            }
-
-            auto tri = NS::TransferPtr(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init());
-            tri->setVertexBuffer(vtxBuf);
-            tri->setVertexBufferOffset(vtxOffset);
+            auto tri{NS::TransferPtr(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init())};
+            tri->setVertexBuffer(
+                &_bufferAtAddress(desc.VertexBufferAddress, "BlasFromTriangleBuffer: VertexBufferAddress"));
+            tri->setVertexBufferOffset(0);
             tri->setVertexStride(desc.VertexStride);
             tri->setVertexFormat(MTL::AttributeFormatFloat3);
             tri->setTriangleCount(desc.IndexBufferAddress.Valid() ? desc.IndexCount / 3 : desc.VertexCount / 3);
@@ -751,22 +1248,16 @@ namespace rhi::metal
 
             if (desc.IndexBufferAddress.Valid())
             {
-                uint64_t     idxOffset{0};
-                MTL::Buffer *idxBuf{_bufferAndOffsetFromAddress(desc.IndexBufferAddress, idxOffset)};
-                if (!idxBuf)
-                {
-                    throw std::runtime_error(
-                        "[LightRHI] BlasFromTriangleBuffer: IndexBufferAddress does not resolve to a live buffer");
-                }
-                tri->setIndexBuffer(idxBuf);
-                tri->setIndexBufferOffset(idxOffset);
+                tri->setIndexBuffer(
+                    &_bufferAtAddress(desc.IndexBufferAddress, "BlasFromTriangleBuffer: IndexBufferAddress"));
+                tri->setIndexBufferOffset(0);
                 tri->setIndexType(desc.IndexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32);
             }
 
-            NS::Object *geomArr[]{tri.get()};
-            auto        geoms = NS::RetainPtr(NS::Array::array(geomArr, 1));
+            NS::Object const *geomArr[]{tri.get()};
+            auto        geoms{NS::RetainPtr(NS::Array::array(geomArr, 1))};
 
-            auto pd = NS::TransferPtr(MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init());
+            auto pd{NS::TransferPtr(MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init())};
             pd->setGeometryDescriptors(geoms.get());
             pd->setUsage(desc.PreferFastTrace ? MTL::AccelerationStructureUsageNone
                                               : MTL::AccelerationStructureUsagePreferFastBuild);
@@ -792,20 +1283,25 @@ namespace rhi::metal
         // VkAccelerationStructureInstanceKHR::instanceCustomIndex.
         const uint64_t instanceBufBytes{sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) *
                                         desc.Instances.size()};
-        auto           instanceBuf = NS::TransferPtr(
-            _device->newBuffer(std::max<uint64_t>(instanceBufBytes, 1), MTL::ResourceStorageModeShared));
-        auto *dst = static_cast<MTL::AccelerationStructureUserIDInstanceDescriptor *>(instanceBuf->contents());
-        std::vector<NS::Object *> blasObjs(desc.Instances.size());
-        for (size_t i = 0; i < desc.Instances.size(); ++i)
+        auto           instanceBuf{NS::TransferPtr(
+            _device->newBuffer(std::max<uint64_t>(instanceBufBytes, 1), MTL::ResourceStorageModeShared))};
+        if (!instanceBuf)
         {
-            const auto &inst = desc.Instances[i];
+            // Neither a size query nor a build has a way to report this, and both need the instances.
+            FailContract("MTLDevice::newBuffer refused the TLAS instance descriptors");
+        }
+        auto *dst{static_cast<MTL::AccelerationStructureUserIDInstanceDescriptor *>(instanceBuf->contents())};
+        std::vector<NS::Object *> blasObjs(desc.Instances.size());
+        for (size_t i{0}; i < desc.Instances.size(); ++i)
+        {
+            const auto &inst{desc.Instances[i]};
             if (!inst.Blas.Valid())
             {
-                throw std::runtime_error("[LightRHI] TlasFromInstances: AccelerationStructureInstance.Blas is not "
-                                         "a valid handle");
+                FailContract(std::string{"TlasFromInstances: AccelerationStructureInstance.Blas is not "} +
+                             "a valid handle");
             }
 
-            MTL::PackedFloat4x3 xform{
+            const MTL::PackedFloat4x3 xform{
                 MTL::PackedFloat3{inst.Transform[0][0], inst.Transform[1][0], inst.Transform[2][0]},
                 MTL::PackedFloat3{inst.Transform[0][1], inst.Transform[1][1], inst.Transform[2][1]},
                 MTL::PackedFloat3{inst.Transform[0][2], inst.Transform[1][2], inst.Transform[2][2]},
@@ -822,9 +1318,9 @@ namespace rhi::metal
             };
         }
 
-        auto blasArr = NS::RetainPtr(NS::Array::array(blasObjs.data(), blasObjs.size()));
+        auto blasArr{NS::RetainPtr(NS::Array::array(blasObjs.data(), blasObjs.size()))};
 
-        auto id = NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init());
+        auto id{NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init())};
         id->setInstanceCount(desc.Instances.size());
         id->setInstanceDescriptorBuffer(instanceBuf.get());
         id->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
@@ -847,13 +1343,13 @@ namespace rhi::metal
     {
         if (!_raytracingSupported)
         {
-            throw std::runtime_error("[LightRHI] QueryAccelerationStructureBuildSizes: device does not support ray "
-                                     "tracing (MTLDevice::supportsRaytracing() == false)");
+            FailContract(std::string{"QueryAccelerationStructureBuildSizes: device does not support ray "} +
+                         "tracing (MTLDevice::supportsRaytracing() == false)");
         }
 
-        std::vector<NS::SharedPtr<NS::Object>> keepAlive;
+        std::vector<NS::SharedPtr<NS::Object>> keepAlive{};
         auto descriptor{const_cast<MetalDevice *>(this)->MakeAccelerationStructureDescriptor(desc, keepAlive)};
-        MTL::AccelerationStructureSizes sizes{_device->accelerationStructureSizes(descriptor.get())};
+        const MTL::AccelerationStructureSizes sizes{_device->accelerationStructureSizes(descriptor.get())};
         return AccelerationStructureBuildSizes{
             .AccelerationStructureSize = sizes.accelerationStructureSize,
             .BuildScratchSize          = sizes.buildScratchBufferSize,
@@ -861,30 +1357,37 @@ namespace rhi::metal
         };
     }
 
-    AccelerationStructureHandle MetalDevice::CreateAccelerationStructure(const AccelerationStructureDesc &desc)
+    std::expected<AccelerationStructureHandle, DeviceError>
+    MetalDevice::CreateAccelerationStructure(const AccelerationStructureDesc &desc)
     {
         if (!_raytracingSupported)
         {
-            throw std::runtime_error("[LightRHI] CreateAccelerationStructure: device does not support ray tracing "
-                                     "(MTLDevice::supportsRaytracing() == false)");
+            FailContract(std::string{"CreateAccelerationStructure: device does not support ray tracing "} +
+                         "(MTLDevice::supportsRaytracing() == false)");
         }
 
-        auto  sizes{QueryAccelerationStructureBuildSizes(desc)};
-        auto *as = _device->newAccelerationStructure(sizes.AccelerationStructureSize);
+        auto sizes{QueryAccelerationStructureBuildSizes(desc)};
+        auto as{adoptCreated(_device->newAccelerationStructure(sizes.AccelerationStructureSize),
+                             "MTLDevice::newAccelerationStructure refused the allocation")};
         if (!as)
         {
-            throw std::runtime_error("[LightRHI] MTLDevice::newAccelerationStructure failed");
+            return std::unexpected{as.error()};
         }
         if (!desc.DebugName.empty())
         {
-            as->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            (*as)->setLabel(MakeLabel(desc.DebugName));
         }
 
-        uint32_t idx{_accelStructs.alloc()};
-        _accelStructs.get(idx) =
-            MetalAccelerationStructure{NS::TransferPtr(as), desc.Type, sizes.AccelerationStructureSize};
-        _addResident(as);
-        return AccelerationStructureHandle{idx};
+        const uint32_t idx{_accelStructs.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many acceleration structures as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
+        _addResident(*as->get());
+        _accelStructs.get(idx) = MetalAccelerationStructure{
+            .as = std::move(*as), .type = desc.Type, .size = sizes.AccelerationStructureSize};
+        return AccelerationStructureHandle{.Index = idx};
     }
 
     void MetalDevice::DestroyAccelerationStructure(AccelerationStructureHandle h)
@@ -893,7 +1396,7 @@ namespace rhi::metal
         {
             return;
         }
-        _removeResident(_accelStructs.get(h.Index).as.get());
+        _removeResident(*_accelStructs.get(h.Index).as.get());
         _accelStructs.free(h.Index);
     }
 
@@ -910,44 +1413,43 @@ namespace rhi::metal
         {
             return {};
         }
-        return GpuAddress{_accelStructs.get(h.Index).as->gpuResourceID()._impl};
+        return GpuAddress{.Address = _accelStructs.get(h.Index).as->gpuResourceID()._impl};
     }
 
     // ============================================================================
     // Shader loading helper
     // ============================================================================
 
-    MTL::Library *MetalDevice::_loadLibrary(const ShaderDesc &sd)
+    NS::SharedPtr<MTL::Library> MetalDevice::_loadLibrary(const ShaderDesc &sd)
     {
         // Dispatch on which bytecode alternative is active.
         // std::visit with an if-constexpr generic lambda — no RTTI required.
         NS::Error *err{nullptr};
 
         return std::visit(
-            [&](auto &&src) -> MTL::Library *
+            [&](auto &&src) -> NS::SharedPtr<MTL::Library>
             {
                 using T = std::decay_t<decltype(src)>;
 
                 if constexpr (std::is_same_v<T, std::monostate>)
                 {
-                    throw std::runtime_error("[LightRHI] _loadLibrary: ShaderDesc has no bytecode (monostate)");
+                    FailContract("_loadLibrary: ShaderDesc has no bytecode (monostate)");
                 }
                 else if constexpr (std::is_same_v<T, SpirvBytecode>)
                 {
-                    throw std::runtime_error("[LightRHI] _loadLibrary: Metal backend received SPIR-V ShaderDesc");
+                    FailContract("_loadLibrary: Metal backend received SPIR-V ShaderDesc");
                 }
                 else if constexpr (std::is_same_v<T, MetalLibBytecode>)
                 {
                     // Pre-compiled .metallib bytes — fastest path (shipping builds).
                     dispatch_data_t dd{dispatch_data_create(src.Bytes.data(), src.Bytes.size(), nullptr,
                                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT)};
-                    auto           *lib = _device->newLibrary(dd, &err);
+                    auto            lib{NS::TransferPtr(_device->newLibrary(dd, &err))};
                     // dispatch_data_create returns a +1 reference; balance it.
                     dispatch_release(dd);
                     if (!lib)
                     {
-                        const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-                        throw std::runtime_error(std::string{"[LightRHI] MTL metallib load: "} + msg);
+                        FailContract("MTL metallib load: " + errorText(err));
                     }
                     return lib;
                 }
@@ -964,11 +1466,10 @@ namespace rhi::metal
                         const_cast<char *>(src.Source.data()), src.Source.size(), NS::UTF8StringEncoding, false))};
                     auto opts{NS::TransferPtr(MTL::CompileOptions::alloc()->init())};
                     opts->setLanguageVersion(MTL::LanguageVersion3_0);
-                    auto *lib = _device->newLibrary(str.get(), opts.get(), &err);
+                    auto lib{NS::TransferPtr(_device->newLibrary(str.get(), opts.get(), &err))};
                     if (!lib)
                     {
-                        const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-                        throw std::runtime_error(std::string{"[LightRHI] MTL shader compile: "} + msg);
+                        FailContract("MTL shader compile: " + errorText(err));
                     }
                     return lib;
                 }
@@ -980,7 +1481,7 @@ namespace rhi::metal
     // Graphics pipeline
     // ============================================================================
 
-    void MetalDevice::_configurePipelineForDebugging(MTL4::PipelineDescriptor *descriptor) const
+    void MetalDevice::_configurePipelineForDebugging(MTL4::PipelineDescriptor &descriptor) const
     {
         if (!_debugCaptureEnabled && !_gpuValidationEnabled)
         {
@@ -1006,20 +1507,20 @@ namespace rhi::metal
         // Cocoa setter convention — same as every other setFoo(descriptor)
         // call in this file), so options is safe to release once this scope
         // ends.
-        descriptor->setOptions(options.get());
+        descriptor.setOptions(options.get());
     }
 
-    PipelineHandle MetalDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc &desc)
+    std::expected<PipelineHandle, DeviceError> MetalDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc &desc)
     {
         auto pd{NS::TransferPtr(MTL4::RenderPipelineDescriptor::alloc()->init())};
-        _configurePipelineForDebugging(pd.get());
+        _configurePipelineForDebugging(*pd.get());
 
         // Vertex shader — skip if not provided (monostate = "no shader")
         if (!std::holds_alternative<std::monostate>(desc.VertexShader.Bytecode))
         {
-            auto  vsLib  = NS::TransferPtr(_loadLibrary(desc.VertexShader));
-            auto *name   = NS::String::string(desc.VertexShader.EntryPoint.data(), NS::UTF8StringEncoding);
-            auto  vsDesc = NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init());
+            auto  vsLib{_loadLibrary(desc.VertexShader)};
+            auto *name{MakeLabel(desc.VertexShader.EntryPoint)};
+            auto  vsDesc{NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init())};
             vsDesc->setLibrary(vsLib.get());
             vsDesc->setName(name);
             pd->setVertexFunctionDescriptor(vsDesc.get());
@@ -1028,9 +1529,9 @@ namespace rhi::metal
         // Fragment shader — skip if not provided (monostate = "no shader")
         if (!std::holds_alternative<std::monostate>(desc.FragmentShader.Bytecode))
         {
-            auto  fsLib  = NS::TransferPtr(_loadLibrary(desc.FragmentShader));
-            auto *name   = NS::String::string(desc.FragmentShader.EntryPoint.data(), NS::UTF8StringEncoding);
-            auto  fsDesc = NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init());
+            auto  fsLib{_loadLibrary(desc.FragmentShader)};
+            auto *name{MakeLabel(desc.FragmentShader.EntryPoint)};
+            auto  fsDesc{NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init())};
             fsDesc->setLibrary(fsLib.get());
             fsDesc->setName(name);
             pd->setFragmentFunctionDescriptor(fsDesc.get());
@@ -1040,13 +1541,13 @@ namespace rhi::metal
         pd->setInputPrimitiveTopology(_toTopology(desc.Topology));
 
         // Color attachments
-        for (size_t i = 0; i < desc.ColorFormats.size(); ++i)
+        for (size_t i{0}; i < desc.ColorFormats.size(); ++i)
         {
-            auto *ca = pd->colorAttachments()->object(static_cast<NS::UInteger>(i));
+            auto *ca{pd->colorAttachments()->object(static_cast<NS::UInteger>(i))};
             ca->setPixelFormat(_toPixFmt(desc.ColorFormats[i]));
             if (i < desc.ColorBlend.size() && desc.ColorBlend[i].Enable)
             {
-                const auto &bs = desc.ColorBlend[i];
+                const auto &bs{desc.ColorBlend[i]};
                 ca->setBlendingState(MTL4::BlendStateEnabled);
                 ca->setSourceRGBBlendFactor(_toBlendF(bs.SrcColor));
                 ca->setDestinationRGBBlendFactor(_toBlendF(bs.DstColor));
@@ -1066,7 +1567,7 @@ namespace rhi::metal
 
         if (!desc.DebugName.empty())
         {
-            pd->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            pd->setLabel(MakeLabel(desc.DebugName));
         }
 
         NS::Error *err{nullptr};
@@ -1074,18 +1575,20 @@ namespace rhi::metal
 
         if (!pso)
         {
-            const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-            throw std::runtime_error(std::string{"[LightRHI] RenderPipelineState: "} + msg);
+            FailContract("RenderPipelineState: " + errorText(err));
         }
 
-        // Depth-stencil state
-        NS::SharedPtr<MTL::DepthStencilState> dss;
+        // Depth-stencil state. SetPipeline() skips a missing one, so a refusal here leaves the
+        // encoder's default depth state rather than failing the pipeline.
+        NS::SharedPtr<MTL::DepthStencilState> dss{
+            NS::TransferPtr(_device->newDepthStencilState(_makeDepthStencilDesc(desc.DepthStencil).get()))};
+
+        const uint32_t idx{_pipelines.alloc()};
+        if (idx == kInvalidIndex)
         {
-            auto dsd{NS::TransferPtr(_makeDepthStencilDesc(desc.DepthStencil, _device.get()))};
-            dss = NS::TransferPtr(_device->newDepthStencilState(dsd.get()));
+            ReportRefusal("the device is holding as many pipelines as it can");
+            return std::unexpected{DeviceError::Exhausted};
         }
-
-        uint32_t idx{_pipelines.alloc()};
         _pipelines.get(idx) = MetalPipeline{
             .renderPso         = std::move(pso),
             .computePso        = {},
@@ -1098,53 +1601,57 @@ namespace rhi::metal
             .depthBiasSlope    = desc.Rasterizer.DepthBiasSlope,
             .isCompute         = false,
         };
-        return PipelineHandle{idx};
+        return PipelineHandle{.Index = idx};
     }
 
     // ============================================================================
     // Compute pipeline
     // ============================================================================
 
-    PipelineHandle MetalDevice::CreateComputePipeline(const ComputePipelineDesc &desc)
+    std::expected<PipelineHandle, DeviceError> MetalDevice::CreateComputePipeline(const ComputePipelineDesc &desc)
     {
-        auto  lib  = NS::TransferPtr(_loadLibrary(desc.Shader));
-        auto *name = NS::String::string(desc.Shader.EntryPoint.data(), NS::UTF8StringEncoding);
-
-        auto fnDesc{NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init())};
+        auto  lib{_loadLibrary(desc.Shader)};
+        auto *name{MakeLabel(desc.Shader.EntryPoint)};
+        auto  fnDesc{NS::TransferPtr(MTL4::LibraryFunctionDescriptor::alloc()->init())};
         fnDesc->setLibrary(lib.get());
         fnDesc->setName(name);
 
         auto pipelineDesc{NS::TransferPtr(MTL4::ComputePipelineDescriptor::alloc()->init())};
         pipelineDesc->setComputeFunctionDescriptor(fnDesc.get());
-        _configurePipelineForDebugging(pipelineDesc.get());
+        _configurePipelineForDebugging(*pipelineDesc.get());
         if (!desc.DebugName.empty())
         {
-            pipelineDesc->setLabel(NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding));
+            pipelineDesc->setLabel(MakeLabel(desc.DebugName));
         }
 
         // Resource binding needs no pipeline reflection. Bindless resources
         // travel as native addresses/resource IDs in root data; explicitly
         // slotted resources use the command list's MTL4 argument table.
         NS::Error *err{nullptr};
-        auto       pso = NS::TransferPtr(
-            _compiler->newComputePipelineState(pipelineDesc.get(), /*compilerTaskOptions*/ nullptr, &err));
+        auto       pso{NS::TransferPtr(
+            _compiler->newComputePipelineState(pipelineDesc.get(), /*compilerTaskOptions*/ nullptr, &err))};
 
         if (!pso)
         {
-            const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-            throw std::runtime_error(std::string{"[LightRHI] ComputePipelineState: "} + msg);
+            FailContract("ComputePipelineState: " + errorText(err));
         }
 
         // Each axis defaults independently: an explicit non-zero component
         // from the caller wins, a zero component (including the ComputePipelineDesc
         // default of {0,0,0}) falls back to 1 — except X, which falls back to
         // the shader's own [[max_total_threads_per_threadgroup]] annotation.
-        uint32_t tgX{desc.ThreadGroupSize.Width != 0 ? desc.ThreadGroupSize.Width
-                                                     : static_cast<uint32_t>(pso->maxTotalThreadsPerThreadgroup())};
-        uint32_t tgY{desc.ThreadGroupSize.Height != 0 ? desc.ThreadGroupSize.Height : 1};
-        uint32_t tgZ{desc.ThreadGroupSize.Depth != 0 ? desc.ThreadGroupSize.Depth : 1};
+        const uint32_t tgX{desc.ThreadGroupSize.Width != 0
+                               ? desc.ThreadGroupSize.Width
+                               : static_cast<uint32_t>(pso->maxTotalThreadsPerThreadgroup())};
+        const uint32_t tgY{desc.ThreadGroupSize.Height != 0 ? desc.ThreadGroupSize.Height : 1};
+        const uint32_t tgZ{desc.ThreadGroupSize.Depth != 0 ? desc.ThreadGroupSize.Depth : 1};
 
-        uint32_t idx{_pipelines.alloc()};
+        const uint32_t idx{_pipelines.alloc()};
+        if (idx == kInvalidIndex)
+        {
+            ReportRefusal("the device is holding as many pipelines as it can");
+            return std::unexpected{DeviceError::Exhausted};
+        }
         _pipelines.get(idx) = MetalPipeline{
             .renderPso         = {},
             .computePso        = std::move(pso),
@@ -1154,7 +1661,7 @@ namespace rhi::metal
             .threadGroupSizeY  = tgY,
             .threadGroupSizeZ  = tgZ,
         };
-        return PipelineHandle{idx};
+        return PipelineHandle{.Index = idx};
     }
 
     void MetalDevice::DestroyPipeline(PipelineHandle h)
@@ -1204,7 +1711,7 @@ namespace rhi::metal
         cmdBuffer->beginCommandBuffer(allocator.get());
         cmdBuffer->endCommandBuffer();
 
-        MTL4::CommandBuffer *buffers[1]{cmdBuffer.get()};
+        MTL4::CommandBuffer const *buffers[1]{cmdBuffer.get()};
         _queue->commit(buffers, 1);
 
         const uint64_t value{++_timelineValue};
@@ -1216,17 +1723,18 @@ namespace rhi::metal
     // Upload helpers
     // ============================================================================
 
-    void MetalDevice::UploadBuffer(BufferHandle dst, const void *data, uint64_t size, uint64_t dstOffset)
+    void MetalDevice::UploadBuffer(BufferHandle dst, std::span<const std::byte> data, uint64_t dstOffset)
     {
-        if (!dst.Valid() || !data || !size)
+        if (!dst.Valid() || data.empty())
         {
             return;
         }
-        auto  autoreleasePool{NS::TransferPtr(NS::AutoreleasePool::alloc()->init())};
-        auto &b = _buffers.get(dst.Index);
+        const uint64_t size{data.size_bytes()};
+        auto           autoreleasePool{NS::TransferPtr(NS::AutoreleasePool::alloc()->init())};
+        auto          &b{_buffers.get(dst.Index)};
         if (b.buffer->storageMode() == MTL::StorageModeShared)
         {
-            std::memcpy(static_cast<uint8_t *>(b.buffer->contents()) + dstOffset, data, size);
+            std::memcpy(static_cast<uint8_t *>(b.buffer->contents()) + dstOffset, data.data(), size);
             return;
         }
         // Private storage — staging-buffer copy. MTL4 has no separate blit
@@ -1242,13 +1750,13 @@ namespace rhi::metal
         auto staging{NS::TransferPtr(_device->newBuffer(size, MTL::ResourceStorageModeShared))};
         if (!staging)
         {
-            throw std::runtime_error("[LightRHI] UploadBuffer staging allocation failed");
+            FailContract("UploadBuffer staging allocation failed");
         }
-        std::memcpy(staging->contents(), data, size);
+        std::memcpy(staging->contents(), data.data(), size);
         // MTL4 resources must be resident explicitly. Unlike buffers created
         // through CreateBuffer(), this short-lived staging allocation is not
         // otherwise part of the device's persistent residency set.
-        _addResident(staging.get());
+        _addResident(*staging.get());
         auto allocator{NS::TransferPtr(_device->newCommandAllocator())};
         auto cmdBuffer{NS::TransferPtr(_device->newCommandBuffer())};
 
@@ -1258,35 +1766,40 @@ namespace rhi::metal
         {
             cmdBuffer->setLabel(NS::String::string("HdRestir / LightRHI UploadBuffer", NS::UTF8StringEncoding));
         }
-        auto *enc = cmdBuffer->computeCommandEncoder();
+        auto *enc{cmdBuffer->computeCommandEncoder()};
         enc->copyFromBuffer(staging.get(), 0, b.buffer.get(), dstOffset, size);
         enc->endEncoding();
         cmdBuffer->endCommandBuffer();
 
-        MTL4::CommandBuffer *buffers[1]{cmdBuffer.get()};
+        MTL4::CommandBuffer const *buffers[1]{cmdBuffer.get()};
         _queue->commit(buffers, 1);
         const uint64_t value{++_timelineValue};
         _queue->signalEvent(_timelineEvent.get(), value);
         _timelineEvent->waitUntilSignaledValue(value, UINT64_MAX);
-        _removeResident(staging.get());
+        _removeResident(*staging.get());
     }
 
-    void MetalDevice::UploadTexture(TextureHandle dst, const void *data, uint64_t rowPitch, uint64_t slicePitch,
-                                    const TextureCopyRegion &region)
+    void MetalDevice::UploadTexture(TextureHandle dst, std::span<const std::byte> data, uint64_t rowPitch,
+                                    uint64_t slicePitch, const TextureCopyRegion &region)
     {
-        if (!dst.Valid() || !data)
+        if (!dst.Valid() || data.empty())
         {
             return;
         }
-        auto     autoreleasePool{NS::TransferPtr(NS::AutoreleasePool::alloc()->init())};
-        uint64_t totalSize{slicePitch > 0 ? slicePitch : rowPitch * region.Extent.Height};
-        auto     staging{NS::TransferPtr(_device->newBuffer(totalSize, MTL::ResourceStorageModeShared))};
+        const uint64_t totalSize{slicePitch > 0 ? slicePitch : rowPitch * region.Extent.Height};
+        if (data.size_bytes() < totalSize)
+        {
+            FailContract("UploadTexture: the source holds " + std::to_string(data.size_bytes()) +
+                         " bytes but the region reads " + std::to_string(totalSize));
+        }
+        auto autoreleasePool{NS::TransferPtr(NS::AutoreleasePool::alloc()->init())};
+        auto staging{NS::TransferPtr(_device->newBuffer(totalSize, MTL::ResourceStorageModeShared))};
         if (!staging)
         {
-            throw std::runtime_error("[LightRHI] UploadTexture staging allocation failed");
+            FailContract("UploadTexture staging allocation failed");
         }
-        std::memcpy(staging->contents(), data, totalSize);
-        _addResident(staging.get());
+        std::memcpy(staging->contents(), data.data(), totalSize);
+        _addResident(*staging.get());
         auto &t{_textures.get(dst.Index)};
 
         auto allocator{NS::TransferPtr(_device->newCommandAllocator())};
@@ -1298,7 +1811,7 @@ namespace rhi::metal
         {
             cmdBuffer->setLabel(NS::String::string("HdRestir / LightRHI UploadTexture", NS::UTF8StringEncoding));
         }
-        auto *enc = cmdBuffer->computeCommandEncoder();
+        auto *enc{cmdBuffer->computeCommandEncoder()};
         enc->copyFromBuffer(staging.get(), 0, rowPitch, slicePitch,
                             MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth),
                             t.texture.get(), region.ArrayLayer, region.MipLevel,
@@ -1308,12 +1821,12 @@ namespace rhi::metal
         enc->endEncoding();
         cmdBuffer->endCommandBuffer();
 
-        MTL4::CommandBuffer *buffers[1]{cmdBuffer.get()};
+        MTL4::CommandBuffer const *buffers[1]{cmdBuffer.get()};
         _queue->commit(buffers, 1);
         const uint64_t value{++_timelineValue};
         _queue->signalEvent(_timelineEvent.get(), value);
         _timelineEvent->waitUntilSignaledValue(value, UINT64_MAX);
-        _removeResident(staging.get());
+        _removeResident(*staging.get());
     }
 
     // ============================================================================
@@ -1332,6 +1845,19 @@ namespace rhi::metal
                 return MTL::ResourceStorageModeShared;
         }
         return MTL::ResourceStorageModePrivate;
+    }
+
+    MTL::StorageMode MetalDevice::_toStorageMode(MemoryType m) noexcept
+    {
+        switch (m)
+        {
+            case MemoryType::GpuOnly:
+                return MTL::StorageModePrivate;
+            case MemoryType::CpuToGpu:
+            case MemoryType::GpuToCpu:
+                return MTL::StorageModeShared;
+        }
+        return MTL::StorageModePrivate;
     }
 
     MTL::TextureType MetalDevice::_toTexType(TextureDimension d) noexcept
@@ -1578,9 +2104,9 @@ namespace rhi::metal
         return MTL::CullModeNone;
     }
 
-    MTL::DepthStencilDescriptor *MetalDevice::_makeDepthStencilDesc(const DepthStencilState &ds, MTL::Device *)
+    NS::SharedPtr<MTL::DepthStencilDescriptor> MetalDevice::_makeDepthStencilDesc(const DepthStencilState &ds)
     {
-        auto *dsd = MTL::DepthStencilDescriptor::alloc()->init();
+        auto dsd{NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init())};
         dsd->setDepthWriteEnabled(ds.DepthWrite);
         dsd->setDepthCompareFunction(ds.DepthTest ? _toCompare(ds.DepthOp) : MTL::CompareFunctionAlways);
         return dsd;

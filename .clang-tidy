@@ -16,6 +16,8 @@ Checks: >-
   performance-*,
   portability-*,
   readability-*,
+  -misc-include-cleaner,
+  -readability-redundant-member-init,
   -bugprone-easily-swappable-parameters,
   -cppcoreguidelines-avoid-magic-numbers,
   -hicpp-use-auto,

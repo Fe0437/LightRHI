@@ -19,19 +19,19 @@ export namespace rhi
     /** {brief} Non-owning view of SPIR-V words supplied to pipeline creation. */
     struct SpirvBytecode
     {
-        std::span<const uint32_t> Words; ///< Complete SPIR-V module, aligned as 32-bit words.
+        std::span<const uint32_t> Words{}; ///< Complete SPIR-V module, aligned as 32-bit words.
     };
 
     /** {brief} Non-owning view of a precompiled Metal library supplied to pipeline creation. */
     struct MetalLibBytecode
     {
-        std::span<const uint8_t> Bytes; ///< Complete `.metallib` file contents.
+        std::span<const uint8_t> Bytes{}; ///< Complete `.metallib` file contents.
     };
 
     /** {brief} Non-owning view of Metal Shading Language source supplied to pipeline creation. */
     struct MslSource
     {
-        std::string_view Source; ///< Complete source text containing the requested entry point.
+        std::string_view Source{}; ///< Complete source text containing the requested entry point.
     };
 
     /**
@@ -52,7 +52,7 @@ export namespace rhi
      */
     struct ShaderDesc
     {
-        ShaderBytecode   Bytecode;           ///< Compiled artifact accepted by the active backend.
+        ShaderBytecode   Bytecode{};         ///< Compiled artifact accepted by the active backend.
         std::string_view EntryPoint{"main"}; ///< Function name to use from the artifact.
     };
 
@@ -71,7 +71,7 @@ export namespace rhi
     };
 
     /** {brief} Recoverable validation errors returned by ToShaderDesc(). */
-    enum class ShaderArtifactError
+    enum class ShaderArtifactError : std::uint8_t
     {
         SpirvSizeNotWordAligned, ///< SPIR-V data size is not a multiple of one 32-bit word.
     };
@@ -82,15 +82,15 @@ export namespace rhi
      * {note} The returned descriptor does not own the artifact bytes.
      *
      * ```cpp
-     * const auto shader = ToShaderDesc(artifact);
+     * const auto shader{ToShaderDesc(artifact)};
      * if (!shader)
      * {
      *     return shader.error();
      * }
-     * const PipelineHandle pipeline = device->CreateComputePipeline({
+     * const PipelineHandle pipeline{device->CreateComputePipeline({
      *     .Shader = *shader,
      *     .ThreadGroupSize = {.Width = 8, .Height = 8, .Depth = 1},
-     * });
+     * })};
      * ```
      */
     [[nodiscard]] inline std::expected<ShaderDesc, ShaderArtifactError> ToShaderDesc(const ShaderArtifactView &artifact)
@@ -218,8 +218,8 @@ export namespace rhi
      */
     struct GraphicsPipelineDesc
     {
-        ShaderDesc VertexShader;   ///< Required vertex-stage entry point.
-        ShaderDesc FragmentShader; ///< Fragment-stage entry point; omit bytecode for depth-only use.
+        ShaderDesc VertexShader{};   ///< Required vertex-stage entry point.
+        ShaderDesc FragmentShader{}; ///< Fragment-stage entry point; omit bytecode for depth-only use.
 
         PrimitiveTopology Topology{PrimitiveTopology::TriangleList}; ///< Primitive assembly topology.
         RasterizerState   Rasterizer{};                              ///< Rasterization behavior.
@@ -241,7 +241,7 @@ export namespace rhi
     /** {brief} Completely describes a compute pipeline. */
     struct ComputePipelineDesc
     {
-        ShaderDesc Shader;                 ///< Required compute-stage entry point.
+        ShaderDesc Shader{};               ///< Required compute-stage entry point.
         uint32_t   PushConstantBytes{128}; ///< Bytes available to SetPushConstants().
 
         /**
@@ -258,8 +258,8 @@ export namespace rhi
     /** {brief} Describes one color attachment used by BeginRendering(). */
     struct ColorAttachment
     {
-        TextureHandle Texture;                 ///< Render target for this attachment slot.
-        TextureHandle ResolveTexture;          ///< Optional single-sample resolve target.
+        TextureHandle Texture{};               ///< Render target for this attachment slot.
+        TextureHandle ResolveTexture{};        ///< Optional single-sample resolve target.
         LoadOp        LoadOp{LoadOp::Clear};   ///< Treatment of existing attachment contents.
         StoreOp       StoreOp{StoreOp::Store}; ///< Treatment of rendered contents at EndRendering().
         ClearColor    ClearValue{};            ///< Value used when LoadOp is Clear.
@@ -268,7 +268,7 @@ export namespace rhi
     /** {brief} Describes the optional depth/stencil attachment used by BeginRendering(). */
     struct DepthAttachment
     {
-        TextureHandle     Texture;                    ///< Depth texture; invalid disables the attachment.
+        TextureHandle     Texture{};                  ///< Depth texture; invalid disables the attachment.
         LoadOp            LoadOp{LoadOp::Clear};      ///< Treatment of existing depth/stencil contents.
         StoreOp           StoreOp{StoreOp::DontCare}; ///< Treatment of contents at EndRendering().
         ClearDepthStencil ClearValue{};               ///< Value used when LoadOp is Clear.
@@ -277,7 +277,7 @@ export namespace rhi
     /** {brief} Selects attachments and bounds for one dynamic rendering region. */
     struct RenderingDesc
     {
-        std::vector<ColorAttachment> Color;         ///< Ordered color attachments, matching pipeline formats.
+        std::vector<ColorAttachment> Color{};       ///< Ordered color attachments, matching pipeline formats.
         DepthAttachment              Depth{};       ///< Optional depth attachment.
         Extent2D                     RenderArea{};  ///< Width and height affected by rendering.
         uint32_t                     LayerCount{1}; ///< Number of array layers rendered.

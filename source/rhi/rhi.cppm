@@ -12,10 +12,12 @@
 export module rhi;
 
 // Re-export all partitions
+export import :diagnostics;
 export import :types;
 export import :handles;
 export import :sync;
 export import :descriptors;
+export import :externalTextures;
 export import :pipeline;
 export import :resources;
 export import :bindless;

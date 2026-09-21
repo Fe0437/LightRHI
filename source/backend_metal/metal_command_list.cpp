@@ -1,4 +1,7 @@
-// metal_command_list.cpp — MetalCommandList + MetalDevice::CreateCommandList / Submit
+/**
+ * {file} metal_command_list.cpp
+ * {brief} Records and submits Metal command lists. Device resource creation is implemented elsewhere.
+ */
 //
 // Targets Metal 4 exclusively — see docs/API_GUIDELINES.md and metal_internal.h's
 // header comment. MTL4::ComputeCommandEncoder has no setBytes/setBuffer/
@@ -26,15 +29,21 @@ module;
 #include <Metal/Metal.hpp>
 #include <QuartzCore/QuartzCore.hpp>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -82,6 +91,12 @@ namespace rhi::metal
 
     class MetalCommandList final : public ICommandList
     {
+        /** Restricts construction to Create(), while still letting it use std::make_unique. */
+        struct ConstructionToken
+        {
+            explicit ConstructionToken() = default;
+        };
+
       public:
         // Push constants and texture/sampler binding both go through this
         // command list's own MTL4::ArgumentTable — see this file's header
@@ -90,46 +105,67 @@ namespace rhi::metal
         static constexpr NS::UInteger kPushConstantSlot{30};
         static constexpr NS::UInteger kMaxTextureBinds{32};
         static constexpr NS::UInteger kMaxSamplerBinds{16};
-        static constexpr uint64_t     kPushConstantScratchSize{256};
 
-        MetalCommandList(MetalDevice *device, MetalCommandResources &&resources, QueueType queueType,
-                         std::string_view debugName)
-            : _device{device}, _allocator{std::move(resources.Allocator)}, _cmd{std::move(resources.CommandBuffer)},
-              _debugName{debugName}, _queueType{queueType}
+        static constexpr uint64_t kPushConstantSliceSize{256};
+        static constexpr uint64_t kPushConstantSlicesPerBlock{64};
+        static constexpr uint64_t kPushConstantBlockSize{kPushConstantSliceSize * kPushConstantSlicesPerBlock};
+
+        /**
+         * Creates a command list ready to record, or reports why the device cannot provide one.
+         * Everything recording needs exists before the list does, so no recording call checks for it.
+         */
+        [[nodiscard]] static std::expected<std::unique_ptr<MetalCommandList>, DeviceError>
+        Create(MetalDevice &device, QueueType queueType, std::string_view debugName)
         {
-            if (!_debugName.empty())
+            auto resources{device.AcquireCommandResources()};
+            if (!resources)
             {
-                _cmd->setLabel(NS::String::string(_debugName.c_str(), NS::UTF8StringEncoding));
+                return std::unexpected{resources.error()};
             }
-
-            // Push-constant scratch buffer — created through the public
-            // IDevice API so it's automatically added to the device's
-            // persistent MTL::ResidencySet (MetalDevice::CreateBuffer already
-            // calls _addResident).
-            _pushConstantBuf = _device->CreateBuffer(BufferDesc{
-                .Size = kPushConstantScratchSize, .Usage = BufferUsage::Storage, .MemoryType = MemoryType::CpuToGpu});
 
             auto tableDesc{NS::TransferPtr(MTL4::ArgumentTableDescriptor::alloc()->init())};
             tableDesc->setMaxBufferBindCount(kPushConstantSlot + 1);
             tableDesc->setMaxTextureBindCount(kMaxTextureBinds);
             tableDesc->setMaxSamplerStateBindCount(kMaxSamplerBinds);
-            if (_device->DebugCaptureEnabled())
+            if (device.DebugCaptureEnabled())
             {
                 tableDesc->setInitializeBindings(true);
-                if (!_debugName.empty())
+                if (!debugName.empty())
                 {
-                    const std::string label{_debugName + " / debug resource table"};
+                    const std::string label{std::string{debugName} + " / debug resource table"};
                     tableDesc->setLabel(NS::String::string(label.c_str(), NS::UTF8StringEncoding));
                 }
             }
             NS::Error *err{nullptr};
-            _argTable = NS::TransferPtr(_device->MtlDevice()->newArgumentTable(tableDesc.get(), &err));
-            if (!_argTable)
+            auto       argTable{adoptCreated(device.MtlDevice().newArgumentTable(tableDesc.get(), &err),
+                                             "MTLDevice::newArgumentTable refused the table", err)};
+            if (!argTable)
             {
-                const char *msg{err ? err->localizedDescription()->utf8String() : "unknown"};
-                throw std::runtime_error(std::string{"[LightRHI] MTLDevice::newArgumentTable failed: "} + msg);
+                return std::unexpected{argTable.error()};
             }
 
+            // Created last, so a refusal above has no buffer to give back.
+            auto firstBlock{_createPushConstantBlock(device)};
+            if (!firstBlock)
+            {
+                return std::unexpected{firstBlock.error()};
+            }
+
+            return std::make_unique<MetalCommandList>(ConstructionToken{}, device, std::move(*resources),
+                                                      std::move(*argTable), *firstBlock, queueType, debugName);
+        }
+
+        MetalCommandList(ConstructionToken, MetalDevice &device, MetalCommandResources &&resources,
+                         NS::SharedPtr<MTL4::ArgumentTable> argTable, BufferHandle firstPushConstantBlock,
+                         QueueType queueType, std::string_view debugName)
+            : _device{device}, _allocator{std::move(resources.Allocator)}, _cmd{std::move(resources.CommandBuffer)},
+              _argTable{std::move(argTable)}, _pushConstantBlocks{firstPushConstantBlock}, _debugName{debugName},
+              _queueType{queueType}
+        {
+            if (!_debugName.empty())
+            {
+                _cmd->setLabel(NS::String::string(_debugName.c_str(), NS::UTF8StringEncoding));
+            }
             _allocator->reset();
             _cmd->beginCommandBuffer(_allocator.get());
         }
@@ -138,8 +174,11 @@ namespace rhi::metal
         {
             _endActiveEncoder();
             _endCommandBuffer();
-            _device->DestroyBuffer(_pushConstantBuf);
-            _device->RecycleCommandResources(MetalCommandResources{
+            for (const BufferHandle block : _pushConstantBlocks)
+            {
+                _device.DestroyBuffer(block);
+            }
+            _device.RecycleCommandResources(MetalCommandResources{
                 .Allocator       = std::move(_allocator),
                 .CommandBuffer   = std::move(_cmd),
                 .CompletionFence = _completionFence,
@@ -157,6 +196,21 @@ namespace rhi::metal
             _endCommandBuffer();
         }
 
+        void Present(ExternalTextureProviderHandle target) override
+        {
+            // Recorded, not performed: Metal 4 shows a drawable by signalling it on the queue after
+            // the work that drew it, so the present happens where the commit does. The handle is
+            // kept rather than an object, and resolved through the device at commit.
+            _presentTarget = target;
+        }
+
+        /** The target a recorded present named, cleared as it is taken. */
+        [[nodiscard]] IFramePresenter *takeRecordedPresentTarget() noexcept
+        {
+            return _device.ResolveExternalTextureProvider(
+                std::exchange(_presentTarget, ExternalTextureProviderHandle{}));
+        }
+
         // ---- Barriers ----
         //
         // Coarse, conservative barriers (StageAll <-> StageAll) — matching the
@@ -166,60 +220,31 @@ namespace rhi::metal
 
         void Transition(const TextureBarrier &b) override
         {
-            if (_encoderType == EncoderType::Render &&
-                (HasState(b.After, ResourceState::ShaderRead) || HasState(b.After, ResourceState::UnorderedAccess)))
-            {
-                _renderEncoder->barrierAfterStages(MTL::StageFragment, MTL::StageVertex, MTL4::VisibilityOptionDevice);
-            }
+            _enqueueBarrier(b.Before, b.After);
         }
 
-        void Transition(const BufferBarrier &) override
+        void Transition(const BufferBarrier &b) override
         {
-            if (_encoderType == EncoderType::Compute)
-            {
-                _computeEncoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch,
-                                                           MTL4::VisibilityOptionDevice);
-            }
+            _enqueueBarrier(b.Before, b.After);
         }
 
-        void Transition(const MemoryBarrier &) override
+        void Transition(const MemoryBarrier &b) override
         {
-            if (_encoderType == EncoderType::Compute)
-            {
-                // barrierAfterEncoderStages, not barrierAfterStages: only the
-                // former orders one dispatch against the next *within* a
-                // compute encoder. With barrierAfterStages the second dispatch
-                // read the first one's buffer writes as they stood before it
-                // ran — measured, not inferred: HdRestir's accumulation writes
-                // a per-pixel luminance history and reduces it in the next
-                // dispatch, and the reduction saw the previous frame's history
-                // while dividing by this frame's sample count.
-                //
-                // A global memory barrier must be at least as strong as the
-                // BufferBarrier below, so it uses the same mechanism with the
-                // widest stage scope.
-                _computeEncoder->barrierAfterEncoderStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
-            }
+            // A global memory barrier must be at least as strong as any resource one, so it takes
+            // the widest scope regardless of the states named.
+            _enqueueBarrier(b.Before, b.After, MTL::StageAll, MTL::StageAll);
         }
 
-        void Transition(const AccelerationStructureBarrier &) override
+        void Transition(const AccelerationStructureBarrier &b) override
         {
-            // Metal has no separate AS resource-barrier scope; StageAll also
-            // covers acceleration structures for purposes of read-after-write
-            // ordering between encoders (e.g. BLAS build -> TLAS build).
-            //
-            // Uses barrierAfterEncoderStages for the same reason as the memory
-            // barrier above: within one compute encoder, barrierAfterStages
-            // does not order a dispatch against the next, so a TLAS build
-            // could read BLASes the preceding build had not finished writing.
-            if (_encoderType == EncoderType::Compute)
-            {
-                _computeEncoder->barrierAfterEncoderStages(MTL::StageAll, MTL::StageAll, MTL4::VisibilityOptionDevice);
-            }
+            // Metal has no separate acceleration-structure barrier scope; StageAll also covers
+            // them for read-after-write ordering between builds (BLAS build -> TLAS build).
+            _enqueueBarrier(b.Before, b.After, MTL::StageAll, MTL::StageAll);
         }
 
         void FlushBarriers() override
-        { /* deferred queue not needed on Metal */
+        {
+            _recordPendingBarrier();
         }
 
         // ---- Dynamic rendering ----
@@ -230,57 +255,64 @@ namespace rhi::metal
 
             auto rpd{NS::TransferPtr(MTL4::RenderPassDescriptor::alloc()->init())};
 
-            for (NS::UInteger i = 0; i < static_cast<NS::UInteger>(desc.Color.size()); ++i)
+            for (NS::UInteger i{0}; i < static_cast<NS::UInteger>(desc.Color.size()); ++i)
             {
-                const auto &ca  = desc.Color[i];
-                auto       *att = rpd->colorAttachments()->object(i);
-                att->setTexture(_lookupTexture(ca.Texture));
+                const auto &ca{desc.Color[i]};
+                auto       *att{rpd->colorAttachments()->object(i)};
+                att->setTexture(&_lookupTexture(ca.Texture));
                 att->setLoadAction(_toLoadAction(ca.LoadOp));
                 att->setStoreAction(_toStoreAction(ca.StoreOp));
                 att->setClearColor(MTL::ClearColor::Make((double)ca.ClearValue.R, (double)ca.ClearValue.G,
                                                          (double)ca.ClearValue.B, (double)ca.ClearValue.A));
                 if (ca.ResolveTexture.Valid())
                 {
-                    att->setResolveTexture(_lookupTexture(ca.ResolveTexture));
+                    att->setResolveTexture(&_lookupTexture(ca.ResolveTexture));
                     att->setStoreAction(MTL::StoreActionMultisampleResolve);
                 }
             }
 
             if (desc.Depth.Texture.Valid())
             {
-                auto *d = rpd->depthAttachment();
-                d->setTexture(_lookupTexture(desc.Depth.Texture));
+                auto *d{rpd->depthAttachment()};
+                d->setTexture(&_lookupTexture(desc.Depth.Texture));
                 d->setLoadAction(_toLoadAction(desc.Depth.LoadOp));
                 d->setStoreAction(_toStoreAction(desc.Depth.StoreOp));
                 d->setClearDepth((double)desc.Depth.ClearValue.Depth);
             }
 
-            _renderEncoder = NS::RetainPtr(_cmd->renderCommandEncoder(rpd.get()));
-            _encoderType   = EncoderType::Render;
-
-            _renderEncoder->setArgumentTable(_argTable.get(), MTL::RenderStageVertex | MTL::RenderStageFragment);
+            const auto &render{_encoder.emplace<RenderEncoder>(NS::RetainPtr(_cmd->renderCommandEncoder(rpd.get())))};
+            // A barrier flushed outside a pass belongs to the first work that could see
+            // what it orders, which is this pass.
+            _recordPendingBarrier();
+            render->setArgumentTable(_argTable.get(), MTL::RenderStageVertex | MTL::RenderStageFragment);
         }
 
         void EndRendering() override
         {
-            if (_renderEncoder)
+            if (std::holds_alternative<RenderEncoder>(_encoder))
             {
-                _renderEncoder->endEncoding();
-                _renderEncoder.reset();
-                _encoderType = EncoderType::None;
+                _endActiveEncoder();
             }
         }
 
         void SetViewport(const Viewport &vp) override
         {
-            _renderEncoder->setViewport(MTL::Viewport{(double)vp.X, (double)vp.Y, (double)vp.Width, (double)vp.Height,
-                                                      (double)vp.MinDepth, (double)vp.MaxDepth});
+            _renderEncoder("SetViewport")
+                .setViewport(MTL::Viewport{.originX = (double)vp.X,
+                                           .originY = (double)vp.Y,
+                                           .width   = (double)vp.Width,
+                                           .height  = (double)vp.Height,
+                                           .znear   = (double)vp.MinDepth,
+                                           .zfar    = (double)vp.MaxDepth});
         }
 
         void SetScissor(const Scissor &s) override
         {
-            _renderEncoder->setScissorRect(
-                MTL::ScissorRect{static_cast<NS::UInteger>(s.X), static_cast<NS::UInteger>(s.Y), s.Width, s.Height});
+            _renderEncoder("SetScissor")
+                .setScissorRect(MTL::ScissorRect{.x      = static_cast<NS::UInteger>(s.X),
+                                                 .y      = static_cast<NS::UInteger>(s.Y),
+                                                 .width  = s.Width,
+                                                 .height = s.Height});
         }
 
         // ---- Pipeline ----
@@ -291,34 +323,33 @@ namespace rhi::metal
             {
                 return;
             }
-            auto &p = _device->Pipeline(handle);
-
+            auto &p{_device.Pipeline(handle)};
             if (p.isCompute)
             {
-                _ensureComputeEncoder();
-                if (auto *label = p.computePso->label())
+                auto &compute{_computeEncoder()};
+                if (auto *label{p.computePso->label()})
                 {
-                    _computeEncoder->setLabel(label);
+                    compute.setLabel(label);
                 }
-                _computeEncoder->setComputePipelineState(p.computePso.get());
+                compute.setComputePipelineState(p.computePso.get());
                 _tgX = p.threadGroupSizeX;
                 _tgY = p.threadGroupSizeY;
                 _tgZ = p.threadGroupSizeZ;
             }
             else
             {
-                assert(_encoderType == EncoderType::Render && "SetPipeline(graphics) called outside BeginRendering()");
-                _renderEncoder->setRenderPipelineState(p.renderPso.get());
+                auto &render{_renderEncoder("SetPipeline(graphics)")};
+                render.setRenderPipelineState(p.renderPso.get());
                 if (p.depthStencilState)
                 {
-                    _renderEncoder->setDepthStencilState(p.depthStencilState.get());
+                    render.setDepthStencilState(p.depthStencilState.get());
                 }
-                _renderEncoder->setFrontFacingWinding(p.winding);
-                _renderEncoder->setCullMode(p.cullMode);
-                _renderEncoder->setTriangleFillMode(p.fillMode);
-                if (p.depthBiasConstant != 0.f || p.depthBiasSlope != 0.f)
+                render.setFrontFacingWinding(p.winding);
+                render.setCullMode(p.cullMode);
+                render.setTriangleFillMode(p.fillMode);
+                if (p.depthBiasConstant != 0.F || p.depthBiasSlope != 0.F)
                 {
-                    _renderEncoder->setDepthBias(p.depthBiasConstant, p.depthBiasSlope, 0.f);
+                    render.setDepthBias(p.depthBiasConstant, p.depthBiasSlope, 0.F);
                 }
             }
         }
@@ -331,7 +362,7 @@ namespace rhi::metal
             {
                 return;
             }
-            _argTable->setTexture(_device->Texture(texture).texture->gpuResourceID(), index);
+            _argTable->setTexture(_device.Texture(texture).texture->gpuResourceID(), index);
         }
 
         void BindSampler(SamplerHandle sampler, uint32_t index) override
@@ -340,16 +371,52 @@ namespace rhi::metal
             {
                 return;
             }
-            _argTable->setSamplerState(_device->Sampler(sampler).state->gpuResourceID(), index);
+            _argTable->setSamplerState(_device.Sampler(sampler).state->gpuResourceID(), index);
         }
 
         // ---- Push constants ----
 
-        void SetPushConstants(const void *data, uint32_t size, uint32_t offset) override
+        void SetPushConstants(std::span<const std::byte> data, uint32_t offset) override
         {
-            auto mapped = _device->MapBuffer(_pushConstantBuf);
-            std::memcpy(static_cast<uint8_t *>(mapped.Data) + offset, data, size);
-            _argTable->setAddress(_device->BufferAddress(_pushConstantBuf).Address, kPushConstantSlot);
+            if (data.size_bytes() + offset > kPushConstantSliceSize)
+            {
+                FailContract("push constants exceed the per-command scratch slice");
+            }
+            if (_pushConstantCursor == kPushConstantBlockSize)
+            {
+                auto block{_createPushConstantBlock(_device)};
+                if (!block)
+                {
+                    // Reported where it was refused. The update is dropped rather than written past
+                    // the end of the full block.
+                    return;
+                }
+                _pushConstantBlocks.push_back(*block);
+                _pushConstantCursor = 0;
+            }
+
+            const std::span<std::byte> slice{_device.MapBuffer(_pushConstantBlocks.back())
+                                                 .Bytes()
+                                                 .subspan(_pushConstantCursor, kPushConstantSliceSize)};
+            // A caller may update part of the root data and expect the rest to stand, so a new
+            // slice starts as a copy of the one in force before it.
+            if (_pushConstantCursor > 0)
+            {
+                std::memcpy(slice.data(), slice.data() - kPushConstantSliceSize, kPushConstantSliceSize);
+            }
+            else if (_pushConstantBlocks.size() > 1)
+            {
+                const std::span<std::byte> previous{
+                    _device.MapBuffer(_pushConstantBlocks[_pushConstantBlocks.size() - 2])
+                        .Bytes()
+                        .last(kPushConstantSliceSize)};
+                std::memcpy(slice.data(), previous.data(), kPushConstantSliceSize);
+            }
+            std::memcpy(slice.data() + offset, data.data(), data.size_bytes());
+
+            _argTable->setAddress(_device.BufferAddress(_pushConstantBlocks.back()).Address + _pushConstantCursor,
+                                  kPushConstantSlot);
+            _pushConstantCursor += kPushConstantSliceSize;
         }
 
         // ---- Index buffer ----
@@ -365,42 +432,46 @@ namespace rhi::metal
 
         void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) override
         {
-            _renderEncoder->drawPrimitives(_primitiveType, firstVertex, vertexCount, instanceCount, firstInstance);
+            _renderEncoder("Draw").drawPrimitives(_primitiveType, firstVertex, vertexCount, instanceCount,
+                                                  firstInstance);
         }
 
         void DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset,
                          uint32_t firstInstance) override
         {
-            uint32_t        stride{_indexType == IndexType::Uint16 ? 2u : 4u};
-            auto            idxType = _indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32;
-            const auto      indexStart{_indexOffset + static_cast<uint64_t>(firstIndex) * stride};
-            MTL::GPUAddress addr{_device->BufferAddress(_indexBuffer).Address + indexStart};
-            auto            len{static_cast<NS::UInteger>(_device->GetBufferInfo(_indexBuffer).Size - indexStart)};
-            _renderEncoder->drawIndexedPrimitives(_primitiveType, indexCount, idxType, addr, len, instanceCount,
-                                                  vertexOffset, static_cast<NS::UInteger>(firstInstance));
+            const uint32_t stride{_indexType == IndexType::Uint16 ? 2U : 4U};
+            auto           idxType{_indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32};
+            const auto     indexStart{_indexOffset + static_cast<uint64_t>(firstIndex) * stride};
+            const MTL::GPUAddress addr{_device.BufferAddress(_indexBuffer).Address + indexStart};
+            auto                  len{static_cast<NS::UInteger>(_device.GetBufferInfo(_indexBuffer).Size - indexStart)};
+            _renderEncoder("DrawIndexed")
+                .drawIndexedPrimitives(_primitiveType, indexCount, idxType, addr, len, instanceCount, vertexOffset,
+                                       static_cast<NS::UInteger>(firstInstance));
         }
 
         void DrawIndirect(BufferHandle argsBuffer, uint64_t argsOffset, uint32_t drawCount,
                           uint32_t /*stride*/) override
         {
-            const auto base{_device->BufferAddress(argsBuffer).Address};
-            for (uint32_t i = 0; i < drawCount; ++i)
+            const auto base{_device.BufferAddress(argsBuffer).Address};
+            auto      &render{_renderEncoder("DrawIndirect")};
+            for (uint32_t i{0}; i < drawCount; ++i)
             {
-                _renderEncoder->drawPrimitives(_primitiveType, base + argsOffset + i * sizeof(DrawIndirectArgs));
+                render.drawPrimitives(_primitiveType, base + argsOffset + i * sizeof(DrawIndirectArgs));
             }
         }
 
         void DrawIndexedIndirect(BufferHandle argsBuffer, uint64_t argsOffset, uint32_t drawCount,
                                  uint32_t /*stride*/) override
         {
-            auto            idxType = _indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32;
-            MTL::GPUAddress idxAddr{_device->BufferAddress(_indexBuffer).Address + _indexOffset};
-            auto            idxLen{static_cast<NS::UInteger>(_device->GetBufferInfo(_indexBuffer).Size - _indexOffset)};
-            const auto      argBase{_device->BufferAddress(argsBuffer).Address};
-            for (uint32_t i = 0; i < drawCount; ++i)
+            auto idxType{_indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32};
+            const MTL::GPUAddress idxAddr{_device.BufferAddress(_indexBuffer).Address + _indexOffset};
+            auto       idxLen{static_cast<NS::UInteger>(_device.GetBufferInfo(_indexBuffer).Size - _indexOffset)};
+            const auto argBase{_device.BufferAddress(argsBuffer).Address};
+            auto      &render{_renderEncoder("DrawIndexedIndirect")};
+            for (uint32_t i{0}; i < drawCount; ++i)
             {
-                _renderEncoder->drawIndexedPrimitives(_primitiveType, idxType, idxAddr, idxLen,
-                                                      argBase + argsOffset + i * sizeof(DrawIndexedIndirectArgs));
+                render.drawIndexedPrimitives(_primitiveType, idxType, idxAddr, idxLen,
+                                             argBase + argsOffset + i * sizeof(DrawIndexedIndirectArgs));
             }
         }
 
@@ -414,15 +485,13 @@ namespace rhi::metal
 
         void Dispatch(uint32_t x, uint32_t y, uint32_t z) override
         {
-            _ensureComputeEncoder();
-            _computeEncoder->dispatchThreadgroups(MTL::Size::Make(x, y, z), MTL::Size::Make(_tgX, _tgY, _tgZ));
+            _computeEncoder().dispatchThreadgroups(MTL::Size::Make(x, y, z), MTL::Size::Make(_tgX, _tgY, _tgZ));
         }
 
         void DispatchIndirect(BufferHandle argsBuffer, uint64_t argsOffset) override
         {
-            _ensureComputeEncoder();
-            MTL::GPUAddress addr{_device->BufferAddress(argsBuffer).Address + argsOffset};
-            _computeEncoder->dispatchThreadgroups(addr, MTL::Size::Make(_tgX, _tgY, _tgZ));
+            const MTL::GPUAddress addr{_device.BufferAddress(argsBuffer).Address + argsOffset};
+            _computeEncoder().dispatchThreadgroups(addr, MTL::Size::Make(_tgX, _tgY, _tgZ));
         }
 
         // ---- Ray tracing ----
@@ -441,27 +510,27 @@ namespace rhi::metal
             // and its auxiliary objects (e.g. a TLAS instance descriptor
             // buffer written host-side) only need to stay alive until that
             // wait returns, not until this command list's own Submit().
-            std::vector<NS::SharedPtr<NS::Object>> keepAlive;
-            auto descriptor{_device->MakeAccelerationStructureDescriptor(desc, keepAlive)};
+            std::vector<NS::SharedPtr<NS::Object>> keepAlive{};
+            auto descriptor{_device.MakeAccelerationStructureDescriptor(desc, keepAlive)};
 
-            auto *legacyCmd = _device->LegacyQueue()->commandBuffer();
-            auto *enc       = legacyCmd->accelerationStructureCommandEncoder();
+            auto *legacyCmd{_device.LegacyQueue().commandBuffer()};
+            auto *enc{legacyCmd->accelerationStructureCommandEncoder()};
             if (!desc.DebugName.empty())
             {
-                auto *label = NS::String::string(desc.DebugName.data(), NS::UTF8StringEncoding);
+                auto *label{MakeLabel(desc.DebugName)};
                 legacyCmd->setLabel(label);
                 enc->setLabel(label);
             }
-            enc->buildAccelerationStructure(_device->AccelStruct(handle).as.get(), descriptor.get(),
-                                            _lookupBuffer(scratchBuffer), scratchOffset);
+            enc->buildAccelerationStructure(_device.AccelStruct(handle).as.get(), descriptor.get(),
+                                            &_lookupBuffer(scratchBuffer), scratchOffset);
             enc->endEncoding();
 
             // Suspended around the synchronous cross-queue wait below — see
             // SuspendActiveCaptureScope's doc comment in metal_internal.h.
-            _device->SuspendActiveCaptureScope();
+            _device.SuspendActiveCaptureScope();
             legacyCmd->commit();
             legacyCmd->waitUntilCompleted();
-            _device->ResumeActiveCaptureScope();
+            _device.ResumeActiveCaptureScope();
         }
 
         // ---- Copy ----
@@ -472,17 +541,15 @@ namespace rhi::metal
 
         void CopyBuffer(BufferHandle src, BufferHandle dst, const BufferCopyRegion &region) override
         {
-            _ensureComputeEncoder();
-            _computeEncoder->copyFromBuffer(_lookupBuffer(src), region.SrcOffset, _lookupBuffer(dst), region.DstOffset,
-                                            region.Size);
+            _computeEncoder().copyFromBuffer(&_lookupBuffer(src), region.SrcOffset, &_lookupBuffer(dst),
+                                             region.DstOffset, region.Size);
         }
 
         void CopyTexture(TextureHandle src, TextureHandle dst, const TextureCopyRegion &region) override
         {
-            _ensureComputeEncoder();
-            _computeEncoder->copyFromTexture(
-                _lookupTexture(src), region.ArrayLayer, region.MipLevel, MTL::Origin::Make(0, 0, 0),
-                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), _lookupTexture(dst),
+            _computeEncoder().copyFromTexture(
+                &_lookupTexture(src), region.ArrayLayer, region.MipLevel, MTL::Origin::Make(0, 0, 0),
+                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), &_lookupTexture(dst),
                 region.ArrayLayer, region.MipLevel,
                 MTL::Origin::Make(static_cast<NS::UInteger>(region.DstOffset.X),
                                   static_cast<NS::UInteger>(region.DstOffset.Y),
@@ -492,14 +559,13 @@ namespace rhi::metal
         void CopyBufferToTexture(BufferHandle src, uint64_t srcOffset, TextureHandle dst,
                                  const TextureCopyRegion &region) override
         {
-            _ensureComputeEncoder();
-            auto    &t = _device->Texture(dst);
-            uint64_t bpp{bytesPerPixel(t.desc.Format)};
-            uint64_t rowP{bpp * region.Extent.Width};
-            uint64_t sliceP{rowP * region.Extent.Height};
-            _computeEncoder->copyFromBuffer(
-                _lookupBuffer(src), srcOffset, rowP, sliceP,
-                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), _lookupTexture(dst),
+            auto          &t{_device.Texture(dst)};
+            const uint64_t bpp{bytesPerPixel(t.desc.Format)};
+            const uint64_t rowP{bpp * region.Extent.Width};
+            const uint64_t sliceP{rowP * region.Extent.Height};
+            _computeEncoder().copyFromBuffer(
+                &_lookupBuffer(src), srcOffset, rowP, sliceP,
+                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), &_lookupTexture(dst),
                 region.ArrayLayer, region.MipLevel,
                 MTL::Origin::Make(static_cast<NS::UInteger>(region.DstOffset.X),
                                   static_cast<NS::UInteger>(region.DstOffset.Y),
@@ -509,17 +575,16 @@ namespace rhi::metal
         void CopyTextureToBuffer(TextureHandle src, const TextureCopyRegion &region, BufferHandle dst,
                                  uint64_t dstOffset) override
         {
-            _ensureComputeEncoder();
-            auto    &t = _device->Texture(src);
-            uint64_t bpp{bytesPerPixel(t.desc.Format)};
-            uint64_t rowP{bpp * region.Extent.Width};
-            uint64_t sliceP{rowP * region.Extent.Height};
-            _computeEncoder->copyFromTexture(
-                _lookupTexture(src), region.ArrayLayer, region.MipLevel,
+            auto          &t{_device.Texture(src)};
+            const uint64_t bpp{bytesPerPixel(t.desc.Format)};
+            const uint64_t rowP{bpp * region.Extent.Width};
+            const uint64_t sliceP{rowP * region.Extent.Height};
+            _computeEncoder().copyFromTexture(
+                &_lookupTexture(src), region.ArrayLayer, region.MipLevel,
                 MTL::Origin::Make(static_cast<NS::UInteger>(region.DstOffset.X),
                                   static_cast<NS::UInteger>(region.DstOffset.Y),
                                   static_cast<NS::UInteger>(region.DstOffset.Z)),
-                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), _lookupBuffer(dst),
+                MTL::Size::Make(region.Extent.Width, region.Extent.Height, region.Extent.Depth), &_lookupBuffer(dst),
                 dstOffset, rowP, sliceP);
         }
 
@@ -527,65 +592,51 @@ namespace rhi::metal
         {
             // Metal has no standalone clear — use a transient render pass with loadAction=clear.
             _endActiveEncoder();
-            auto *tex = _lookupTexture(handle);
-            if (!tex)
-            {
-                return;
-            }
             auto  rpd{NS::TransferPtr(MTL4::RenderPassDescriptor::alloc()->init())};
-            auto *att = rpd->colorAttachments()->object(0);
-            att->setTexture(tex);
+            auto *att{rpd->colorAttachments()->object(0)};
+            att->setTexture(&_lookupTexture(handle));
             att->setLoadAction(MTL::LoadActionClear);
             att->setStoreAction(MTL::StoreActionStore);
             att->setClearColor(
                 MTL::ClearColor::Make((double)color.R, (double)color.G, (double)color.B, (double)color.A));
-            auto *enc = _cmd->renderCommandEncoder(rpd.get());
+            auto *enc{_cmd->renderCommandEncoder(rpd.get())};
             enc->endEncoding();
-            _encoderType = EncoderType::None;
         }
 
         void ClearDepthTexture(TextureHandle handle, const ClearDepthStencil &clear,
                                const SubresourceRange & /*range*/) override
         {
             _endActiveEncoder();
-            auto *tex = _lookupTexture(handle);
-            if (!tex)
-            {
-                return;
-            }
             auto  rpd{NS::TransferPtr(MTL4::RenderPassDescriptor::alloc()->init())};
-            auto *d = rpd->depthAttachment();
-            d->setTexture(tex);
+            auto *d{rpd->depthAttachment()};
+            d->setTexture(&_lookupTexture(handle));
             d->setLoadAction(MTL::LoadActionClear);
             d->setStoreAction(MTL::StoreActionStore);
             d->setClearDepth((double)clear.Depth);
-            auto *enc = _cmd->renderCommandEncoder(rpd.get());
+            auto *enc{_cmd->renderCommandEncoder(rpd.get())};
             enc->endEncoding();
-            _encoderType = EncoderType::None;
         }
 
         void FillBuffer(BufferHandle buf, uint64_t offset, uint64_t size, uint32_t value) override
         {
-            _ensureComputeEncoder();
             // fillBuffer fills with a single byte value. For multi-byte
             // fill, a compute kernel is needed; we use the low byte for now.
-            _computeEncoder->fillBuffer(_lookupBuffer(buf), NS::Range::Make(offset, size),
-                                        static_cast<uint8_t>(value & 0xFF));
+            _computeEncoder().fillBuffer(&_lookupBuffer(buf), NS::Range::Make(offset, size),
+                                         static_cast<uint8_t>(value & 0xFF));
         }
 
         void WriteComputeTimestamp(TimestampQueryPoolHandle pool, uint32_t index) override
         {
-            const auto &record{_device->TimestampQueryPool(pool)};
+            const auto &record{_device.TimestampQueryPool(pool)};
             assert(index < record.count);
-            _ensureComputeEncoder();
-            _computeEncoder->writeTimestamp(MTL4::TimestampGranularityPrecise, record.heap.get(), index);
+            _computeEncoder().writeTimestamp(MTL4::TimestampGranularityPrecise, record.heap.get(), index);
         }
 
         // ---- Debug ----
 
         void BeginDebugGroup(std::string_view name, float, float, float) override
         {
-            auto *ns = NS::String::string(name.data(), NS::UTF8StringEncoding);
+            auto *ns{MakeLabel(name)};
             _pushDebugGroup(ns);
         }
 
@@ -596,14 +647,10 @@ namespace rhi::metal
 
         void InsertDebugLabel(std::string_view label) override
         {
-            auto *ns = NS::String::string(label.data(), NS::UTF8StringEncoding);
-            if (_renderEncoder)
+            auto *ns{MakeLabel(label)};
+            if (auto *encoder{_activeEncoder()})
             {
-                _renderEncoder->insertDebugSignpost(ns);
-            }
-            if (_computeEncoder)
-            {
-                _computeEncoder->insertDebugSignpost(ns);
+                encoder->insertDebugSignpost(ns);
             }
         }
 
@@ -614,7 +661,7 @@ namespace rhi::metal
                 return;
             }
             _checkDebugBufferSlot(unusedBindingSlot);
-            _argTable->setAddress(_device->BufferAddress(buffer).Address, unusedBindingSlot);
+            _argTable->setAddress(_device.BufferAddress(buffer).Address, unusedBindingSlot);
         }
 
         void DebugExposeAccelerationStructure(AccelerationStructureHandle accelerationStructure,
@@ -625,7 +672,7 @@ namespace rhi::metal
                 return;
             }
             _checkDebugBufferSlot(unusedBindingSlot);
-            _argTable->setResource(_device->AccelStruct(accelerationStructure).as->gpuResourceID(), unusedBindingSlot);
+            _argTable->setResource(_device.AccelStruct(accelerationStructure).as->gpuResourceID(), unusedBindingSlot);
         }
 
         void DebugExposeTexture(TextureHandle texture, uint32_t unusedBindingSlot) override
@@ -636,11 +683,10 @@ namespace rhi::metal
             }
             if (unusedBindingSlot >= kMaxTextureBinds)
             {
-                throw std::runtime_error("[LightRHI] DebugExposeTexture: binding slot " +
-                                         std::to_string(unusedBindingSlot) + " is out of range (max " +
-                                         std::to_string(kMaxTextureBinds) + ")");
+                FailContract("DebugExposeTexture: binding slot " + std::to_string(unusedBindingSlot) +
+                             " is out of range (max " + std::to_string(kMaxTextureBinds) + ")");
             }
-            _argTable->setTexture(_device->Texture(texture).texture->gpuResourceID(), unusedBindingSlot);
+            _argTable->setTexture(_device.Texture(texture).texture->gpuResourceID(), unusedBindingSlot);
         }
 
         // ---- Internal accessor for MetalDevice::Submit ----
@@ -660,25 +706,55 @@ namespace rhi::metal
         }
 
       private:
-        enum class EncoderType
+        // Used only by this class, which is what the leading underscore has always meant.
+        /**
+         * Creates one block of root-data scratch. It goes through the public IDevice API so it joins
+         * the device's persistent MTL::ResidencySet, which MetalDevice::CreateBuffer already does.
+         */
+        [[nodiscard]] static std::expected<BufferHandle, DeviceError> _createPushConstantBlock(MetalDevice &device)
         {
-            None,
-            Render,
-            Compute,
-        };
+            auto block{device.CreateBuffer(BufferDesc{
+                .Size = kPushConstantBlockSize, .Usage = BufferUsage::Storage, .MemoryType = MemoryType::CpuToGpu})};
+            if (!block)
+            {
+                ReportRefusal("the device refused the root-data scratch for a command list");
+            }
+            return block;
+        }
+        using RenderEncoder  = NS::SharedPtr<MTL4::RenderCommandEncoder>;
+        using ComputeEncoder = NS::SharedPtr<MTL4::ComputeCommandEncoder>;
 
-        MetalDevice                               *_device{nullptr};
-        NS::SharedPtr<MTL4::CommandAllocator>      _allocator;
-        NS::SharedPtr<MTL4::CommandBuffer>         _cmd;
-        NS::SharedPtr<MTL4::RenderCommandEncoder>  _renderEncoder;
-        NS::SharedPtr<MTL4::ComputeCommandEncoder> _computeEncoder;
-        NS::SharedPtr<MTL4::ArgumentTable>         _argTable;
-        BufferHandle                               _pushConstantBuf{};
-        std::string                                _debugName;
-        FenceHandle                                _completionFence;
-        bool                                       _cmdEnded{false};
-        EncoderType                                _encoderType{EncoderType::None};
-        [[maybe_unused]] QueueType                 _queueType{QueueType::Graphics};
+        MetalDevice                          &_device;
+        NS::SharedPtr<MTL4::CommandAllocator> _allocator{};
+        NS::SharedPtr<MTL4::CommandBuffer>    _cmd{};
+        NS::SharedPtr<MTL4::ArgumentTable>    _argTable{};
+        // Metal allows one active encoder per command buffer, so there is exactly one of these states.
+        std::variant<std::monostate, RenderEncoder, ComputeEncoder> _encoder{};
+        std::vector<BufferHandle>                                   _pushConstantBlocks{}; // never empty
+        uint64_t                                                    _pushConstantCursor{0};
+        std::string                                                 _debugName{};
+        FenceHandle                                                 _completionFence{};
+        /// The surface a recorded Present() named, shown by the submission that carries this list.
+        ExternalTextureProviderHandle _presentTarget{};
+        bool                          _cmdEnded{false};
+        [[maybe_unused]] QueueType    _queueType{QueueType::Graphics};
+
+        // ---- Deferred barriers ----
+        //
+        // Transition() records what has to be ordered and FlushBarriers() writes it down, which is
+        // what this library's ICommandList promises. Metal's barriers are stage-scoped rather than
+        // resource-scoped, so what accumulates is the union of the stages that must finish and the
+        // stages that must wait, not one entry per resource.
+        //
+        // A flush can land outside an active pass - between a render pass and a copy, say, which
+        // is exactly where a readback needs ordering. Metal has nowhere to write a barrier then, so
+        // it stays pending and is recorded by the next encoder that opens. That encoder is the
+        // first thing that could observe the work being ordered, so recording it there is both
+        // sufficient and the earliest it can be done.
+        MTL::Stages _pendingAfterStages{};  ///< Stages that must complete before the barrier.
+        MTL::Stages _pendingBeforeStages{}; ///< Stages that must wait for it.
+        bool        _barrierPending{false};
+        bool        _pendingBarrierConsumesPriorPass{false};
 
         MTL::PrimitiveType _primitiveType{MTL::PrimitiveTypeTriangle};
         NS::UInteger       _tgX{64}, _tgY{1}, _tgZ{1};
@@ -689,19 +765,145 @@ namespace rhi::metal
 
         // ---- Encoder management ----
 
+        /** The encoder for the active render or compute pass, or null outside a pass. */
+        [[nodiscard]] MTL4::CommandEncoder *_activeEncoder() const noexcept
+        {
+            if (const auto *render{std::get_if<RenderEncoder>(&_encoder)})
+            {
+                return render->get();
+            }
+            if (const auto *compute{std::get_if<ComputeEncoder>(&_encoder)})
+            {
+                return compute->get();
+            }
+            return nullptr;
+        }
+
+        /** The Metal stages that read or write a resource in `state`. */
+        [[nodiscard]] static MTL::Stages _stagesFor(ResourceState state) noexcept
+        {
+            NS::UInteger stages{0};
+            if (HasState(state, ResourceState::RenderTarget) || HasState(state, ResourceState::DepthWrite) ||
+                HasState(state, ResourceState::DepthRead) || HasState(state, ResourceState::Present))
+            {
+                stages |= MTL::StageFragment | MTL::StageVertex;
+            }
+            if (HasState(state, ResourceState::ShaderRead) || HasState(state, ResourceState::UnorderedAccess) ||
+                HasState(state, ResourceState::ConstantBuffer) || HasState(state, ResourceState::VertexBuffer) ||
+                HasState(state, ResourceState::IndexBuffer) || HasState(state, ResourceState::IndirectArgument))
+            {
+                stages |= MTL::StageDispatch | MTL::StageFragment | MTL::StageVertex;
+            }
+            // MTL4 records copies on the unified compute encoder but executes them in its blit
+            // stage. Do not also block independent dispatch work.
+            if (HasState(state, ResourceState::TransferSrc) || HasState(state, ResourceState::TransferDst) ||
+                HasState(state, ResourceState::CopySrc) || HasState(state, ResourceState::CopyDst))
+            {
+                stages |= MTL::StageBlit;
+            }
+            if (HasState(state, ResourceState::AccelerationStructureRead) ||
+                HasState(state, ResourceState::AccelerationStructureWrite))
+            {
+                stages |= MTL::StageAccelerationStructure | MTL::StageDispatch;
+            }
+            // Undefined, or a state this backend does not distinguish: order against everything
+            // rather than silently against nothing.
+            return stages == 0 ? MTL::StageAll : static_cast<MTL::Stages>(stages);
+        }
+
+        /** Records that `before` must finish before `after` may begin. */
+        void _enqueueBarrier(ResourceState before, ResourceState after, MTL::Stages afterOverride = {},
+                             MTL::Stages beforeOverride = {})
+        {
+            const NS::UInteger produced{afterOverride != 0 ? afterOverride : _stagesFor(before)};
+            const NS::UInteger consumed{beforeOverride != 0 ? beforeOverride : _stagesFor(after)};
+            _pendingAfterStages              = static_cast<MTL::Stages>(_pendingAfterStages | produced);
+            _pendingBeforeStages             = static_cast<MTL::Stages>(_pendingBeforeStages | consumed);
+            _barrierPending                  = true;
+            _pendingBarrierConsumesPriorPass = _activeEncoder() == nullptr;
+        }
+
+        /**
+         * Writes any pending barrier into the active pass.
+         *
+         * Does nothing outside a pass: the barrier stays pending and is written into the next
+         * active pass, which is the first place it could matter.
+         */
+        void _recordPendingBarrier()
+        {
+            if (!_barrierPending)
+            {
+                return;
+            }
+            auto *encoder{_activeEncoder()};
+            if (encoder == nullptr)
+            {
+                return; // outside a pass; the next active pass will record it
+            }
+            if (_pendingBarrierConsumesPriorPass)
+            {
+                // A transition recorded between passes belongs at the consumer. This orders prior
+                // passes without blocking unrelated stages in the producing pass.
+                encoder->barrierAfterQueueStages(_pendingAfterStages, _pendingBeforeStages,
+                                                 MTL4::VisibilityOptionDevice);
+            }
+            else
+            {
+                // Use the smallest scope for a dependency within one pass. Metal only accepts
+                // stages that the current encoder can execute for an intra-pass barrier.
+                const MTL::Stages supportedStages{std::holds_alternative<RenderEncoder>(_encoder)
+                                                      ? static_cast<MTL::Stages>(MTL::StageVertex | MTL::StageFragment)
+                                                      : static_cast<MTL::Stages>(MTL::StageDispatch | MTL::StageBlit |
+                                                                                 MTL::StageAccelerationStructure)};
+                const auto        intraAfter{static_cast<MTL::Stages>(_pendingAfterStages & supportedStages)};
+                const auto        intraBefore{static_cast<MTL::Stages>(_pendingBeforeStages & supportedStages)};
+                if (intraAfter != 0 && intraBefore != 0)
+                {
+                    encoder->barrierAfterEncoderStages(intraAfter, intraBefore, MTL4::VisibilityOptionDevice);
+                }
+                else
+                {
+                    // The consumer stage cannot run in this pass, so this is a dependency on a
+                    // later pass even though the caller flushed before ending the current one.
+                    encoder->barrierAfterStages(_pendingAfterStages, _pendingBeforeStages,
+                                                MTL4::VisibilityOptionDevice);
+                }
+            }
+            _pendingAfterStages              = {};
+            _pendingBeforeStages             = {};
+            _barrierPending                  = false;
+            _pendingBarrierConsumesPriorPass = false;
+        }
+
         void _endActiveEncoder()
         {
-            if (_renderEncoder)
+            if (auto *encoder{_activeEncoder()})
             {
-                _renderEncoder->endEncoding();
-                _renderEncoder.reset();
+                if (_barrierPending && !_pendingBarrierConsumesPriorPass)
+                {
+                    // No command in this pass consumed the queued transition. It therefore names
+                    // a dependency on a later pass, for which Metal's producer barrier is exact.
+                    encoder->barrierAfterStages(_pendingAfterStages, _pendingBeforeStages,
+                                                MTL4::VisibilityOptionDevice);
+                    _pendingAfterStages  = {};
+                    _pendingBeforeStages = {};
+                    _barrierPending      = false;
+                }
+                encoder->endEncoding();
             }
-            if (_computeEncoder)
+            _encoder = std::monostate{};
+        }
+
+        /** The open render encoder. Recording `call` outside BeginRendering() breaks the contract. */
+        [[nodiscard]] MTL4::RenderCommandEncoder &_renderEncoder(std::string_view call)
+        {
+            auto *render{std::get_if<RenderEncoder>(&_encoder)};
+            if (render == nullptr)
             {
-                _computeEncoder->endEncoding();
-                _computeEncoder.reset();
+                FailContract(std::string{call} + " was recorded outside BeginRendering()");
             }
-            _encoderType = EncoderType::None;
+            _recordPendingBarrier();
+            return *render->get();
         }
 
         void _endCommandBuffer()
@@ -713,36 +915,44 @@ namespace rhi::metal
             }
         }
 
-        void _ensureComputeEncoder()
+        /** The open compute encoder, ending any render encoder to open one when needed. */
+        [[nodiscard]] MTL4::ComputeCommandEncoder &_computeEncoder()
         {
-            if (_encoderType == EncoderType::Compute)
+            if (auto *compute{std::get_if<ComputeEncoder>(&_encoder)})
             {
-                return;
+                _recordPendingBarrier();
+                return *compute->get();
             }
             _endActiveEncoder();
-            _computeEncoder = NS::RetainPtr(_cmd->computeCommandEncoder());
-            _encoderType    = EncoderType::Compute;
-            _computeEncoder->setArgumentTable(_argTable.get());
+            const auto &compute{_encoder.emplace<ComputeEncoder>(NS::RetainPtr(_cmd->computeCommandEncoder()))};
+            compute->setArgumentTable(_argTable.get());
+            // A barrier flushed outside a pass belongs to the first work that could see
+            // what it orders, which is this encoder.
+            _recordPendingBarrier();
+            return *compute.get();
         }
 
         // ---- Resource lookups ----
 
-        [[nodiscard]] MTL::Buffer *_lookupBuffer(BufferHandle h) const noexcept
+        // A command that names a resource needs one: recording it against an invalid handle is a
+        // caller mistake, stopped here rather than recorded as a command that touches nothing.
+
+        [[nodiscard]] MTL::Buffer &_lookupBuffer(BufferHandle h) const
         {
             if (!h.Valid())
             {
-                return nullptr;
+                FailContract("a command was recorded against an invalid buffer handle");
             }
-            return _device->Buffer(h).buffer.get();
+            return *_device.Buffer(h).buffer.get();
         }
 
-        [[nodiscard]] MTL::Texture *_lookupTexture(TextureHandle h) const noexcept
+        [[nodiscard]] MTL::Texture &_lookupTexture(TextureHandle h) const
         {
             if (!h.Valid())
             {
-                return nullptr;
+                FailContract("a command was recorded against an invalid texture handle");
             }
-            return _device->Texture(h).texture.get();
+            return *_device.Texture(h).texture.get();
         }
 
         // ---- Debug helpers ----
@@ -757,21 +967,16 @@ namespace rhi::metal
         {
             if (slot >= kPushConstantSlot)
             {
-                throw std::runtime_error("[LightRHI] Debug resource slot " + std::to_string(slot) +
-                                         " overlaps or exceeds the push-constant slot (" +
-                                         std::to_string(kPushConstantSlot) + ")");
+                FailContract("Debug resource slot " + std::to_string(slot) +
+                             " overlaps or exceeds the push-constant slot (" + std::to_string(kPushConstantSlot) + ")");
             }
         }
 
         void _pushDebugGroup(NS::String *name)
         {
-            if (_renderEncoder)
+            if (auto *encoder{_activeEncoder()})
             {
-                _renderEncoder->pushDebugGroup(name);
-            }
-            else if (_computeEncoder)
-            {
-                _computeEncoder->pushDebugGroup(name);
+                encoder->pushDebugGroup(name);
             }
             else
             {
@@ -781,13 +986,9 @@ namespace rhi::metal
 
         void _popDebugGroup()
         {
-            if (_renderEncoder)
+            if (auto *encoder{_activeEncoder()})
             {
-                _renderEncoder->popDebugGroup();
-            }
-            else if (_computeEncoder)
-            {
-                _computeEncoder->popDebugGroup();
+                encoder->popDebugGroup();
             }
             else
             {
@@ -828,25 +1029,35 @@ namespace rhi::metal
     // MetalDevice methods that reference MetalCommandList
     // ============================================================================
 
-    std::unique_ptr<ICommandList> MetalDevice::CreateCommandList(QueueType q, std::string_view name)
+    std::expected<std::unique_ptr<ICommandList>, DeviceError> MetalDevice::CreateCommandList(QueueType        q,
+                                                                                             std::string_view name)
     {
-        auto resources{AcquireCommandResources()};
-        return std::make_unique<MetalCommandList>(this, std::move(resources), q, name);
+        return MetalCommandList::Create(*this, q, name)
+            .transform([](std::unique_ptr<MetalCommandList> commands)
+                       { return std::unique_ptr<ICommandList>{std::move(commands)}; });
     }
 
     FenceHandle MetalDevice::Submit(ICommandList &cmdList, const SubmitDesc & /*desc*/)
     {
-        auto                &mcl = static_cast<MetalCommandList &>(cmdList);
-        FenceHandle          fence{NextFence()};
-        MTL4::CommandBuffer *buffers[1]{mcl.commandBuffer()};
-        auto                *captureScope = SubmissionCaptureScope(mcl.debugName());
+        auto                      &mcl{static_cast<MetalCommandList &>(cmdList)};
+        FenceHandle                fence{NextFence()};
+        MTL4::CommandBuffer *const buffers[1]{mcl.commandBuffer()};
+        auto                      *captureScope{SubmissionCaptureScope(mcl.debugName())};
         if (captureScope)
         {
             captureScope->beginScope();
         }
-        Mtl4Queue()->commit(buffers, 1);
-        Mtl4Queue()->signalEvent(TimelineEvent(), fence.Id);
+        Mtl4Queue().commit(buffers, 1);
+        Mtl4Queue().signalEvent(&TimelineEvent(), fence.Id);
         mcl.setCompletionFence(fence);
+
+        // A recorded present is shown by the submission that drew it: Metal 4 orders that on the
+        // queue, so it belongs here, after the commit and before this call returns.
+        if (auto *target{mcl.takeRecordedPresentTarget()})
+        {
+            target->PresentHeldFrame();
+        }
+
         if (captureScope)
         {
             captureScope->endScope();

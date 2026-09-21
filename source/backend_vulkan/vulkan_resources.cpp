@@ -1,12 +1,32 @@
-// vulkan_resources.cpp — Format / sampler conversion tables
-// Factored out from vulkan_device.cpp to keep that file focused on lifecycle.
+/**
+ * {file} vulkan_resources.cpp
+ * {brief} Converts backend-neutral formats and sampler values to Vulkan values.
+ */
 
 module;
-#define VK_NO_PROTOTYPES
+// vulkan_internal.h is included after the module declaration, so every standard header it
+// needs must already be visible here; including one inside the module purview instead would
+// re-declare what this fragment brought in.
+#include "vulkan_platform.h"
+
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
-#include <vulkan/vulkan.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <expected>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
 
 module lightRHI;
 import rhi;
@@ -84,7 +104,7 @@ namespace rhi::vulkan
 
     [[nodiscard]] VkFormat toVkFormat(Format f) noexcept
     {
-        const auto idx = static_cast<size_t>(f);
+        const auto idx{static_cast<size_t>(f)};
         if (idx >= kFormatTable.size())
         {
             return VK_FORMAT_UNDEFINED;
@@ -98,61 +118,62 @@ namespace rhi::vulkan
 
     [[nodiscard]] VkSamplerCreateInfo toVkSamplerCreateInfo(const SamplerDesc &desc) noexcept
     {
-        auto toFilter = [](SamplerFilter f)
-        { return f == SamplerFilter::Linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; };
-        auto toMipMode = [](SamplerMipMode m)
-        { return m == SamplerMipMode::Linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST; };
-        auto toAddressMode = [](SamplerAddressMode m) -> VkSamplerAddressMode
-        {
-            switch (m)
-            {
-                case SamplerAddressMode::Repeat:
-                    return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-                case SamplerAddressMode::MirroredRepeat:
-                    return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-                case SamplerAddressMode::ClampToEdge:
-                    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-                case SamplerAddressMode::ClampToBorder:
-                    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-            }
-            return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        };
-        auto toBorderColor = [](BorderColor c) -> VkBorderColor
-        {
-            switch (c)
-            {
-                case BorderColor::TransparentBlack:
-                    return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-                case BorderColor::OpaqueBlack:
-                    return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-                case BorderColor::OpaqueWhite:
-                    return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-            }
-            return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-        };
-        auto toCompareOp = [](CompareOp op) -> VkCompareOp
-        {
-            switch (op)
-            {
-                case CompareOp::Never:
-                    return VK_COMPARE_OP_NEVER;
-                case CompareOp::Less:
-                    return VK_COMPARE_OP_LESS;
-                case CompareOp::Equal:
-                    return VK_COMPARE_OP_EQUAL;
-                case CompareOp::LessEqual:
-                    return VK_COMPARE_OP_LESS_OR_EQUAL;
-                case CompareOp::Greater:
-                    return VK_COMPARE_OP_GREATER;
-                case CompareOp::NotEqual:
-                    return VK_COMPARE_OP_NOT_EQUAL;
-                case CompareOp::GreaterEqual:
-                    return VK_COMPARE_OP_GREATER_OR_EQUAL;
-                case CompareOp::Always:
-                    return VK_COMPARE_OP_ALWAYS;
-            }
-            return VK_COMPARE_OP_ALWAYS;
-        };
+        auto toFilter{[](SamplerFilter f)
+                      { return f == SamplerFilter::Linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; }};
+        auto toMipMode{
+            [](SamplerMipMode m)
+            { return m == SamplerMipMode::Linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST; }};
+        auto toAddressMode{[](SamplerAddressMode m) -> VkSamplerAddressMode
+                           {
+                               switch (m)
+                               {
+                                   case SamplerAddressMode::Repeat:
+                                       return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                                   case SamplerAddressMode::MirroredRepeat:
+                                       return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+                                   case SamplerAddressMode::ClampToEdge:
+                                       return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                                   case SamplerAddressMode::ClampToBorder:
+                                       return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+                               }
+                               return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                           }};
+        auto toBorderColor{[](BorderColor c) -> VkBorderColor
+                           {
+                               switch (c)
+                               {
+                                   case BorderColor::TransparentBlack:
+                                       return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+                                   case BorderColor::OpaqueBlack:
+                                       return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+                                   case BorderColor::OpaqueWhite:
+                                       return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+                               }
+                               return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+                           }};
+        auto toCompareOp{[](CompareOp op) -> VkCompareOp
+                         {
+                             switch (op)
+                             {
+                                 case CompareOp::Never:
+                                     return VK_COMPARE_OP_NEVER;
+                                 case CompareOp::Less:
+                                     return VK_COMPARE_OP_LESS;
+                                 case CompareOp::Equal:
+                                     return VK_COMPARE_OP_EQUAL;
+                                 case CompareOp::LessEqual:
+                                     return VK_COMPARE_OP_LESS_OR_EQUAL;
+                                 case CompareOp::Greater:
+                                     return VK_COMPARE_OP_GREATER;
+                                 case CompareOp::NotEqual:
+                                     return VK_COMPARE_OP_NOT_EQUAL;
+                                 case CompareOp::GreaterEqual:
+                                     return VK_COMPARE_OP_GREATER_OR_EQUAL;
+                                 case CompareOp::Always:
+                                     return VK_COMPARE_OP_ALWAYS;
+                             }
+                             return VK_COMPARE_OP_ALWAYS;
+                         }};
 
         return VkSamplerCreateInfo{
             .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,

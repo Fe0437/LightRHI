@@ -36,6 +36,17 @@ include(Sanitizers)
 
 # -------------------------------------------------------------------
 # Backend selection — driven by target OS, not by user option.
+
+# A development build also compiles the backend this platform does not build, so a change to it
+# fails here rather than on someone else's machine. Shipping builds compile only what they ship.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    set(_light_rhi_check_default OFF)
+else()
+    set(_light_rhi_check_default ON)
+endif()
+option(LIGHT_RHI_CHECK_INACTIVE_BACKEND "Compile the backend this platform does not build"
+       ${_light_rhi_check_default})
+
 # One backend per platform; the selection is not a knob.
 # -------------------------------------------------------------------
 if(APPLE)
@@ -93,7 +104,12 @@ if(WIN32)
 endif()
 
 target_compile_features(LightRHI PUBLIC cxx_std_23)
-target_compile_options(LightRHI PUBLIC -fno-rtti)
+# Failure is reported through return values, never by unwinding. These language settings must reach
+# every C++ consumer because a named module cannot be imported across a configuration mismatch.
+# The language guard keeps the options away from Swift or C sources in a mixed-language consumer.
+target_compile_options(LightRHI PUBLIC
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 target_compile_definitions(LightRHI PUBLIC
     $<$<BOOL:${DEBUG_ENABLED}>:DEBUG_ENABLED=1>
     $<$<NOT:$<BOOL:${DEBUG_ENABLED}>>:DEBUG_ENABLED=0>)
@@ -127,6 +143,30 @@ if(LIGHT_RHI_BACKEND STREQUAL "Vulkan")
     target_compile_features(LightRHIBackend PUBLIC cxx_std_23)
     target_compile_options(LightRHIBackend PRIVATE -fno-rtti)
 
+    # A Vulkan build may expose every window-system integration whose native headers are present.
+    # These target-scoped definitions build the matching backend-owned descriptors and also let a
+    # consumer select one without guessing from the host environment.
+    set(_light_rhi_vulkan_surface_definitions)
+    if(WIN32)
+        list(APPEND _light_rhi_vulkan_surface_definitions LIGHT_RHI_VULKAN_HAS_WIN32_SURFACE=1)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        include(CheckIncludeFileCXX)
+        check_include_file_cxx("wayland-client.h" LIGHT_RHI_HAVE_WAYLAND_CLIENT_H)
+        check_include_file_cxx("xcb/xcb.h" LIGHT_RHI_HAVE_XCB_H)
+        check_include_file_cxx("X11/Xlib.h" LIGHT_RHI_HAVE_XLIB_H)
+
+        if(LIGHT_RHI_HAVE_WAYLAND_CLIENT_H)
+            list(APPEND _light_rhi_vulkan_surface_definitions LIGHT_RHI_VULKAN_HAS_WAYLAND_SURFACE=1)
+        endif()
+        if(LIGHT_RHI_HAVE_XCB_H)
+            list(APPEND _light_rhi_vulkan_surface_definitions LIGHT_RHI_VULKAN_HAS_XCB_SURFACE=1)
+        endif()
+        if(LIGHT_RHI_HAVE_XLIB_H)
+            list(APPEND _light_rhi_vulkan_surface_definitions LIGHT_RHI_VULKAN_HAS_XLIB_SURFACE=1)
+        endif()
+    endif()
+    target_compile_definitions(LightRHIBackend PUBLIC ${_light_rhi_vulkan_surface_definitions})
+
     # Glob the backend tree: *.cppm are module interfaces, *.cpp are regular
     # TUs (GLOB_RECURSE picks up external/vma/vulkan_vma.cpp).
     file(GLOB _vk_modules CONFIGURE_DEPENDS
@@ -141,6 +181,9 @@ if(LIGHT_RHI_BACKEND STREQUAL "Vulkan")
         PRIVATE ${_vk_sources}
     )
 
+    # Both private: this backend's module interface names no Vulkan type, so a consumer creates a
+    # provider without ever having the Vulkan headers. The platform object reaches it as an opaque
+    # rhi::NativeTextureOwner and is cast here, where the real type is known.
     target_link_libraries(LightRHIBackend
         PUBLIC  LightRHI::LightRHI
         PRIVATE volk::volk Vulkan::Headers
@@ -176,6 +219,14 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
 
     target_compile_features(LightRHIBackend PUBLIC cxx_std_23)
     target_compile_options(LightRHIBackend PRIVATE -fno-rtti)
+    # metal-cpp's NS::SharedPtr destructor calls release() on its pointer without checking it,
+    # because Objective-C lets a message to nil do nothing - true of the machine, not of C++, where
+    # it is a member call on a null pointer (the header marks it no_sanitize("undefined") for the
+    # same reason). A moved-from or empty SharedPtr takes that path, and an optimizing build that
+    # may assume the pointer is not null then treats everything after it as unreachable: every
+    # failure return and every return after a move became a trap instruction. This keeps those
+    # checks, which is what the interop the headers were written for actually requires.
+    target_compile_options(LightRHIBackend PRIVATE -fno-delete-null-pointer-checks)
 
     file(GLOB _mtl_modules CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_metal/*.cppm")
@@ -189,6 +240,9 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
         PRIVATE ${_mtl_sources}
     )
 
+    # All private: this backend's module interface names no Metal type, so a consumer creates a
+    # provider without ever having metal-cpp. The layer reaches it as an opaque
+    # rhi::NativeTextureOwner and is cast here, where the real type is known.
     target_link_libraries(LightRHIBackend
         PUBLIC  LightRHI::LightRHI
         PRIVATE
@@ -231,3 +285,6 @@ if(LIGHT_RHI_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+include(InactiveBackendCheck)
+light_rhi_check_inactive_backend()

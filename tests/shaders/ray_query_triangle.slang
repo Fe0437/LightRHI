@@ -23,12 +23,13 @@
 // outright, which is why the handle form (not an array) is the bindless
 // mechanism here.
 
+#include "light_rhi_shader_abi.slangh"
+
 struct PC {
     uint64_t outputAddr;
     DescriptorHandle<RaytracingAccelerationStructure> accel;
 };
-// register(b30) forces Metal buffer(30) — matches kPushConstantSlot in the backend.
-[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(b30);
+[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
 
 [shader("compute")]
 [numthreads(1, 1, 1)]

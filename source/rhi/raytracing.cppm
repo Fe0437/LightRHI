@@ -37,13 +37,16 @@ export namespace rhi
     };
 
     /** {brief} Modifies culling and opacity for one top-level acceleration-structure instance. */
+    // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
+    // has today, so shrinking it to fit the current set would cap the type.
+    // NOLINTNEXTLINE(performance-enum-size)
     enum class AccelerationStructureInstanceFlags : uint32_t
     {
         None                          = 0,      ///< Uses the geometry's default culling and opacity.
-        TriangleCullDisable           = 1 << 0, ///< Makes both triangle faces visible to ray queries.
-        TriangleFrontCounterClockwise = 1 << 1, ///< Treats counter-clockwise triangles as front-facing.
-        ForceOpaque                   = 1 << 2, ///< Treats all geometry in the instance as opaque.
-        ForceNonOpaque                = 1 << 3, ///< Treats all geometry in the instance as non-opaque.
+        TriangleCullDisable           = 1U << 0U, ///< Makes both triangle faces visible to ray queries.
+        TriangleFrontCounterClockwise = 1U << 1U, ///< Treats counter-clockwise triangles as front-facing.
+        ForceOpaque                   = 1U << 2U, ///< Treats all geometry in the instance as opaque.
+        ForceNonOpaque                = 1U << 3U, ///< Treats all geometry in the instance as non-opaque.
     };
 
     /** {brief} Combines acceleration-structure instance flags. */
@@ -56,7 +59,7 @@ export namespace rhi
     /** {brief} Places one already-built BLAS in a TLAS. */
     struct AccelerationStructureInstance
     {
-        AccelerationStructureHandle Blas; ///< Live BLAS referenced by this instance.
+        AccelerationStructureHandle Blas{}; ///< Live BLAS referenced by this instance.
         /** {brief} Row-major 3x4 object-to-world transform. */
         float Transform[3][4]{
             {1.F, 0.F, 0.F, 0.F},
@@ -79,14 +82,14 @@ export namespace rhi
      *
      * \par Build sequence
      * ```cpp
-     * auto desc = BlasFromTriangleBuffer(
-     *     device->BufferAddress(vertices), sizeof(Vertex), vertexCount);
-     * const auto sizes = device->QueryAccelerationStructureBuildSizes(desc);
-     * const auto accelerationStructure = device->CreateAccelerationStructure(desc);
-     * const auto scratch = device->CreateBuffer({
+     * auto desc{BlasFromTriangleBuffer(
+     *     device->BufferAddress(vertices), sizeof(Vertex), vertexCount)};
+     * const auto sizes{device->QueryAccelerationStructureBuildSizes(desc)};
+     * const auto accelerationStructure{device->CreateAccelerationStructure(desc)};
+     * const auto scratch{device->CreateBuffer({
      *     .Size = sizes.BuildScratchSize,
      *     .Usage = BufferUsage::Storage | BufferUsage::DeviceAddress,
-     * });
+     * })};
      *
      * cmd->BuildAccelerationStructure(accelerationStructure, desc, scratch);
      * cmd->Transition(accelerationStructure,
@@ -109,10 +112,10 @@ export namespace rhi
         IndexType  IndexType{IndexType::Uint32}; ///< Width of each index.
 
         // ---- TLAS fields (Type == TopLevel) ----
-        std::vector<AccelerationStructureInstance> Instances; ///< Instances copied for TLAS construction.
+        std::vector<AccelerationStructureInstance> Instances{}; ///< Instances copied for TLAS construction.
 
         bool             PreferFastTrace{true}; ///< Favors traversal speed over build speed when true.
-        std::string_view DebugName;             ///< Optional diagnostic name, copied during creation.
+        std::string_view DebugName{};           ///< Optional diagnostic name, copied during creation.
     };
 
     /**
@@ -166,9 +169,9 @@ export namespace rhi
     /** {brief} Orders access to one acceleration structure between build and traversal commands. */
     struct AccelerationStructureBarrier
     {
-        AccelerationStructureHandle AccelerationStructure; ///< Resource whose access is ordered.
-        ResourceState               Before;                ///< State of preceding access.
-        ResourceState               After;                 ///< State required by following access.
+        AccelerationStructureHandle AccelerationStructure{}; ///< Resource whose access is ordered.
+        ResourceState               Before{};                ///< State of preceding access.
+        ResourceState               After{};                 ///< State required by following access.
     };
 
 } // namespace rhi

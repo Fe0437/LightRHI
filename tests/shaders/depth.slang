@@ -2,12 +2,14 @@
 // Vertex shader placing a fullscreen triangle at a configurable NDC depth.
 // Pairs with red_frag / green_frag from fullscreen.slang.
 
+#include "light_rhi_shader_abi.slangh"
+
 [[vk::binding(0, 0)]] StructuredBuffer<uint64_t> g_bufAddresses;
 [[vk::binding(1, 0)]] StructuredBuffer<uint64_t> g_texIds;
 [[vk::binding(2, 0)]] StructuredBuffer<uint64_t> g_smpIds;
 
 struct PC { float depth; };
-[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(b30);  // Vulkan push constant; register(b30) pins Metal buffer(30)
+[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
 
 struct VOut { float4 pos : SV_Position; };
 

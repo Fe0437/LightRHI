@@ -20,13 +20,31 @@ export namespace rhi
      */
     struct TextureView
     {
-        TextureHandle    Texture; ///< Texture containing the selected subresources.
-        SubresourceRange Range{}; ///< Mip levels and array layers visible through the view.
+        TextureHandle    Texture{}; ///< Texture containing the selected subresources.
+        SubresourceRange Range{};   ///< Mip levels and array layers visible through the view.
         TextureDimension ViewDimension{TextureDimension::Tex2D}; ///< Dimension exposed to the consuming operation.
         Format           Format{Format::Undefined}; ///< Compatible view format; Undefined inherits the texture format.
     };
 
-    // ---- Buffer information ----
+    // ---- Resource information ----
+
+    /**
+     * {brief} Describes a live texture returned by IDevice::GetTextureInfo().
+     *
+     * What a texture is, asked of the texture. A frame taken from a surface answers here like any
+     * other texture, which is what lets work be sized by the image it is drawing into rather than
+     * by a window that may have changed since.
+     */
+    struct TextureInfo
+    {
+        Extent3D         Extent{};                           ///< Size in pixels of mip level zero.
+        Format           Format{Format::Undefined};          ///< Format selected at creation.
+        TextureUsage     Usage{};                            ///< Usage flags selected at creation.
+        TextureDimension Dimension{TextureDimension::Tex2D}; ///< Dimension selected at creation.
+        uint32_t         MipLevels{1};                       ///< Mip levels the texture holds.
+        uint32_t         ArrayLayers{1};                     ///< Array layers the texture holds.
+        uint32_t         SampleCount{1};                     ///< Samples per pixel.
+    };
 
     /** {brief} Describes a live buffer returned by IDevice::GetBufferInfo(). */
     struct BufferInfo

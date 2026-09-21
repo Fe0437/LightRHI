@@ -1,0 +1,5 @@
+#pragma once
+
+// LightRHI reserves this register for push constants on backends that need an
+// explicit buffer slot. Keep the push-constant declaration visible in shaders.
+#define LIGHTRHI_PUSH_CONSTANT_REGISTER b30

@@ -8,8 +8,9 @@
 // about how these bytes reached disk.
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -22,12 +23,18 @@
 namespace rhitest
 {
 
+    /** {brief} Stops with a message: a missing or unreadable artifact means the build is wrong. */
+    [[noreturn]] inline void failArtifact(const std::string &message)
+    {
+        std::fprintf(stderr, "[rhi_tests] %s\n", message.c_str());
+        std::exit(1);
+    }
     inline std::vector<std::byte> readShaderArtifactBytes(const std::string &path)
     {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file)
         {
-            throw std::runtime_error("[rhi_tests] failed to open shader artifact: " + path);
+            failArtifact("[rhi_tests] failed to open shader artifact: " + path);
         }
 
         const std::streamsize size{file.tellg()};
@@ -36,7 +43,7 @@ namespace rhitest
         std::vector<std::byte> bytes(static_cast<size_t>(size));
         if (size > 0 && !file.read(reinterpret_cast<char *>(bytes.data()), size))
         {
-            throw std::runtime_error("[rhi_tests] failed to read shader artifact: " + path);
+            failArtifact("[rhi_tests] failed to read shader artifact: " + path);
         }
         return bytes;
     }
@@ -54,7 +61,7 @@ namespace rhitest
     inline rhi::ShaderDesc loadShaderArtifact(std::string_view source, std::string_view entryPoint,
                                               rhi::ShaderStage stage)
     {
-        static std::unordered_map<std::string, std::vector<std::byte>> cache;
+        static std::unordered_map<std::string, std::vector<std::byte>> cache{};
 
         const std::string name{std::string{source} + "_" + std::string{entryPoint}};
 
@@ -70,23 +77,22 @@ namespace rhitest
 #error "loadShaderArtifact: no RHI_BACKEND_METAL / RHI_BACKEND_VULKAN defined"
 #endif
 
-        auto [it, inserted] = cache.try_emplace(name);
+        auto [it, inserted]{cache.try_emplace(name)};
         if (inserted)
         {
             it->second = readShaderArtifactBytes(path);
         }
-        const auto &bytes = it->second;
-
+        const auto             &bytes{it->second};
         rhi::ShaderArtifactView artifact{
             .Format     = format,
             .Stage      = stage,
             .EntryPoint = backendEntryPoint,
             .Data       = bytes,
         };
-        auto desc = rhi::ToShaderDesc(artifact);
+        auto desc{rhi::ToShaderDesc(artifact)};
         if (!desc)
         {
-            throw std::runtime_error("[rhi_tests] ToShaderDesc failed for shader artifact: " + path);
+            failArtifact("[rhi_tests] ToShaderDesc failed for shader artifact: " + path);
         }
         return *desc;
     }

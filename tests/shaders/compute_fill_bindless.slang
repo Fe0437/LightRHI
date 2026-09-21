@@ -4,10 +4,12 @@
 
 // Set 1 is Slang's system bindless space. Bindings 0 and 2 are reserved for
 // sampler and resource descriptor arrays respectively.
+
+#include "light_rhi_shader_abi.slangh"
 [[vk::binding(3, 1)]] StructuredBuffer<uint64_t> g_bufAddresses;
 
 struct PC { uint slot; };
-[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(b30);  // Vulkan push constant; register(b30) pins Metal buffer(30)
+[[vk::push_constant]] ConstantBuffer<PC> g_pc : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
 
 [shader("compute")]
 [numthreads(64, 1, 1)]

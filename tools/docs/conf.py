@@ -13,11 +13,13 @@ names its documents in upper case, and a published site answers on `index.html`.
 
 from __future__ import annotations
 
+import os
+
 project = "LightRHI"
 author = "LightRHI contributors"
 copyright = "2026, LightRHI contributors"
 
-extensions = ["myst_parser"]
+extensions = ["myst_parser", "sphinxcontrib.plantuml"]
 
 myst_enable_extensions = ["colon_fence", "deflist", "fieldlist"]
 myst_heading_anchors = 3
@@ -28,6 +30,8 @@ exclude_patterns = ["Thumbs.db", ".DS_Store"]
 
 html_theme = "furo"
 html_title = "LightRHI"
+plantuml = os.environ.get("PLANTUML_COMMAND", "plantuml")
+plantuml_output_format = "svg_img"
 
 # The documents link to sources and to the README, which live outside the staged tree. Those are
 # real links for a reader on the repository, not broken document references.

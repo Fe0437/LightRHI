@@ -1,8 +1,34 @@
-// vulkan_command_list.cpp — VulkanCommandList + VulkanDevice::CreateCommandList/Submit
+/**
+ * {file} vulkan_command_list.cpp
+ * {brief} Records and submits Vulkan command lists. Device resource creation is implemented elsewhere.
+ */
 
 module;
+// vulkan_internal.h is included after the module declaration, so every standard header it
+// needs must already be visible here; including one inside the module purview instead would
+// re-declare what this fragment brought in.
+#include "vulkan_platform.h"
+
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
 
 module lightRHI;
 import rhi;
@@ -19,7 +45,7 @@ namespace rhi::vulkan
     class VulkanCommandList final : public ICommandList
     {
       public:
-        VulkanCommandList(VulkanDevice *dev, VkCommandPool pool, std::mutex *poolMtx, VkCommandBuffer cmd,
+        VulkanCommandList(VulkanDevice &dev, VkCommandPool pool, std::mutex &poolMtx, VkCommandBuffer cmd,
                           QueueType qtype)
             : _dev{dev}, _pool{pool}, _poolMtx{poolMtx}, _cmd{cmd}, _qtype{qtype}
         {
@@ -33,14 +59,11 @@ namespace rhi::vulkan
             // per this API's documented contract) is done with it.
             for (BufferHandle buf : _asInstanceBuffers)
             {
-                _dev->DestroyBuffer(buf);
+                _dev.DestroyBuffer(buf);
             }
 
-            if (_cmd != VK_NULL_HANDLE)
-            {
-                std::scoped_lock lk{*_poolMtx};
-                vkFreeCommandBuffers(_dev->NativeDevice(), _pool, 1, &_cmd);
-            }
+            std::scoped_lock lk{_poolMtx};
+            vkFreeCommandBuffers(_dev.NativeDevice(), _pool, 1, &_cmd);
         }
 
         // ---- Lifecycle ----
@@ -55,7 +78,7 @@ namespace rhi::vulkan
 
             // Bind the global bindless descriptor buffer once per command buffer.
             // All draws/dispatches in this buffer see the same bindless heap.
-            VkDeviceAddress heapAddr{_dev->Heap().DescriptorBufferAddress()};
+            VkDeviceAddress heapAddr{_dev.Heap().DescriptorBufferAddress()};
             if (heapAddr != 0)
             {
                 VkDescriptorBufferBindingInfoEXT bnd{
@@ -64,7 +87,7 @@ namespace rhi::vulkan
                     .usage   = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
                                VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT,
                 };
-                _dev->pfn_CmdBindDescriptorBuffers(_cmd, 1, &bnd);
+                _dev.pfn_CmdBindDescriptorBuffers(_cmd, 1, &bnd);
                 _bindHeapOffsets(VK_PIPELINE_BIND_POINT_GRAPHICS);
                 _bindHeapOffsets(VK_PIPELINE_BIND_POINT_COMPUTE);
             }
@@ -74,6 +97,20 @@ namespace rhi::vulkan
         {
             FlushBarriers();
             vkEndCommandBuffer(_cmd);
+        }
+
+        void Present(ExternalTextureProviderHandle target) override
+        {
+            // Recorded, not performed: presentation is a queue operation ordered by the submission
+            // that drew the frame, so it happens where that submission does. The handle is kept
+            // rather than an object, and resolved through the device when the frame is submitted.
+            _presentTarget = target;
+        }
+
+        /** The target a recorded present named, cleared as it is taken. */
+        [[nodiscard]] IFramePresenter *takeRecordedPresentTarget() noexcept
+        {
+            return _dev.ResolveExternalTextureProvider(std::exchange(_presentTarget, ExternalTextureProviderHandle{}));
         }
 
         // ---- Barriers ----
@@ -87,7 +124,7 @@ namespace rhi::vulkan
             // keeps this value honest.
             if (b.Texture.Valid())
             {
-                _dev->Texture(b.Texture).layout = _toLayout(b.After);
+                _dev.Texture(b.Texture).layout = _toLayout(b.After);
             }
         }
         void Transition(const BufferBarrier &b) override
@@ -145,7 +182,7 @@ namespace rhi::vulkan
                 _ensureLayout(desc.Depth.Texture, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             }
 
-            std::vector<VkRenderingAttachmentInfo> color;
+            std::vector<VkRenderingAttachmentInfo> color{};
             color.reserve(desc.Color.size());
             for (const auto &ca : desc.Color)
             {
@@ -154,7 +191,7 @@ namespace rhi::vulkan
                     .imageView        = _lookupView(ca.Texture),
                     .imageLayout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     .resolveMode      = ca.ResolveTexture.Valid() ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
-                    .resolveImageView = _lookupView(ca.ResolveTexture),
+                    .resolveImageView = ca.ResolveTexture.Valid() ? _lookupView(ca.ResolveTexture) : VK_NULL_HANDLE,
                     .resolveImageLayout = ca.ResolveTexture.Valid() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                                                                     : VK_IMAGE_LAYOUT_UNDEFINED,
                     .loadOp             = _toLoadOp(ca.LoadOp),
@@ -214,10 +251,10 @@ namespace rhi::vulkan
             {
                 return;
             }
-            const auto &p  = _dev->Pipeline(h);
-            auto        bp = p.isCompute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS;
+            const auto &p{_dev.Pipeline(h)};
+            auto        bp{p.isCompute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS};
             vkCmdBindPipeline(_cmd, bp, p.pipeline);
-            _currentLayout            = _dev->GlobalPipelineLayout();
+            _currentLayout            = _dev.GlobalPipelineLayout();
             _currentPushConstantBytes = p.pushConstantBytes;
             // Re-set descriptor buffer offsets for the new bind point
             _bindHeapOffsets(bp);
@@ -235,14 +272,18 @@ namespace rhi::vulkan
 
         // ---- Push constants ----
 
-        void SetPushConstants(const void *data, uint32_t size, uint32_t offset) override
+        void SetPushConstants(std::span<const std::byte> data, uint32_t offset) override
         {
-            if (!_currentLayout || !data || size > _currentPushConstantBytes ||
-                offset > _currentPushConstantBytes - size)
+            if (_currentLayout == VK_NULL_HANDLE)
             {
-                return;
+                FailContract("SetPushConstants was recorded before SetPipeline()");
             }
-            vkCmdPushConstants(_cmd, _currentLayout, VK_SHADER_STAGE_ALL, offset, size, data);
+            if (data.size_bytes() > _currentPushConstantBytes || offset > _currentPushConstantBytes - data.size_bytes())
+            {
+                FailContract("push constants exceed the bound pipeline's push-constant range");
+            }
+            vkCmdPushConstants(_cmd, _currentLayout, VK_SHADER_STAGE_ALL, offset,
+                               static_cast<uint32_t>(data.size_bytes()), data.data());
         }
 
         // ---- Index buffer ----
@@ -307,23 +348,22 @@ namespace rhi::vulkan
             VkDeviceAddress instanceAddr{0};
             if (desc.Type == AccelerationStructureType::TopLevel)
             {
-                std::vector<VkAccelerationStructureInstanceKHR> instances;
+                std::vector<VkAccelerationStructureInstanceKHR> instances{};
                 instances.reserve(desc.Instances.size());
                 for (const auto &inst : desc.Instances)
                 {
                     if (!inst.Blas.Valid())
                     {
-                        throw std::runtime_error(
-                            "[LightRHI::Vulkan] TlasFromInstances: AccelerationStructureInstance.Blas is not a "
-                            "valid handle");
+                        FailContract("TlasFromInstances: AccelerationStructureInstance.Blas is not a "
+                                     "valid handle");
                     }
 
-                    VkDeviceAddress blasAddr{_dev->AccelStruct(inst.Blas).deviceAddress};
+                    VkDeviceAddress blasAddr{_dev.AccelStruct(inst.Blas).deviceAddress};
 
                     VkAccelerationStructureInstanceKHR vkInst{};
-                    for (int r = 0; r < 3; ++r)
+                    for (int r{0}; r < 3; ++r)
                     {
-                        for (int c = 0; c < 4; ++c)
+                        for (int c{0}; c < 4; ++c)
                         {
                             vkInst.transform.matrix[r][c] = inst.Transform[r][c];
                         }
@@ -344,27 +384,35 @@ namespace rhi::vulkan
                 // (sizeof(VkAccelerationStructureInstanceKHR) per instance),
                 // so host-visible (CpuToGpu) memory is the right tradeoff.
                 // Freed in ~VulkanCommandList() — see _asInstanceBuffers.
-                uint64_t     instanceBytes{sizeof(VkAccelerationStructureInstanceKHR) * instances.size()};
-                BufferHandle instanceBuf{_dev->CreateBuffer({
+                uint64_t instanceBytes{sizeof(VkAccelerationStructureInstanceKHR) * instances.size()};
+                auto     instanceStorage{_dev.CreateBuffer({
                     .Size       = instanceBytes,
                     .Usage      = BufferUsage::Storage | BufferUsage::DeviceAddress,
                     .MemoryType = MemoryType::CpuToGpu,
                     .DebugName  = "tlas_instance_buffer",
                 })};
-                MappedBuffer mapped{_dev->MapBuffer(instanceBuf)};
-                std::memcpy(mapped.Data, instances.data(), instanceBytes);
-                _dev->UnmapBuffer(instanceBuf);
+                if (!instanceStorage)
+                {
+                    // The instances cannot be staged, so the build is not recorded rather than
+                    // recorded against memory that was never allocated.
+                    ReportRefusal("the device refused the instance buffer for a TLAS build");
+                    return;
+                }
+                const BufferHandle         instanceBuf{*instanceStorage};
+                const std::span<std::byte> mapped{_dev.MapBuffer(instanceBuf).Bytes()};
+                std::memcpy(mapped.data(), instances.data(), instanceBytes);
+                _dev.UnmapBuffer(instanceBuf);
                 _asInstanceBuffers.push_back(instanceBuf);
-                instanceAddr = _dev->BufferAddress(instanceBuf).Address;
+                instanceAddr = _dev.BufferAddress(instanceBuf).Address;
             }
 
             VkAccelerationStructureGeometryKHR          geometry{};
             VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
             uint32_t                                    primCount{0};
-            _dev->BuildAccelGeometryInfo(desc, instanceAddr, geometry, buildInfo, primCount);
+            _dev.BuildAccelGeometryInfo(desc, instanceAddr, geometry, buildInfo, primCount);
 
-            buildInfo.dstAccelerationStructure  = _dev->AccelStruct(handle).as;
-            buildInfo.scratchData.deviceAddress = _dev->BufferAddress(scratchBuffer).Address + scratchOffset;
+            buildInfo.dstAccelerationStructure  = _dev.AccelStruct(handle).as;
+            buildInfo.scratchData.deviceAddress = _dev.BufferAddress(scratchBuffer).Address + scratchOffset;
 
             VkAccelerationStructureBuildRangeInfoKHR        rangeInfo{.primitiveCount = primCount};
             const VkAccelerationStructureBuildRangeInfoKHR *pRange{&rangeInfo};
@@ -372,7 +420,7 @@ namespace rhi::vulkan
             // never the host-side vkBuildAccelerationStructuresKHR (deprecated
             // by Khronos; see
             // https://www.khronos.org/blog/vulkan-ray-tracing-deprecating-host-side-acceleration-structure-builds).
-            _dev->pfn_CmdBuildAccelerationStructures(_cmd, 1, &buildInfo, &pRange);
+            _dev.pfn_CmdBuildAccelerationStructures(_cmd, 1, &buildInfo, &pRange);
         }
 
         // ---- Copy ----
@@ -498,7 +546,7 @@ namespace rhi::vulkan
 
         void WriteComputeTimestamp(TimestampQueryPoolHandle pool, uint32_t index) override
         {
-            const auto &record{_dev->TimestampQueryPool(pool)};
+            const auto &record{_dev.TimestampQueryPool(pool)};
             assert(index < record.count);
             FlushBarriers();
             vkCmdWriteTimestamp2(_cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, record.pool, index);
@@ -513,24 +561,24 @@ namespace rhi::vulkan
                 .pLabelName = name.data(),
                 .color      = {r, g, b, 1.f},
             };
-            if (_dev->pfn_CmdBeginDebugUtilsLabel)
+            if (_dev.pfn_CmdBeginDebugUtilsLabel)
             {
-                _dev->pfn_CmdBeginDebugUtilsLabel(_cmd, &l);
+                _dev.pfn_CmdBeginDebugUtilsLabel(_cmd, &l);
             }
         }
         void EndDebugGroup() override
         {
-            if (_dev->pfn_CmdEndDebugUtilsLabel)
+            if (_dev.pfn_CmdEndDebugUtilsLabel)
             {
-                _dev->pfn_CmdEndDebugUtilsLabel(_cmd);
+                _dev.pfn_CmdEndDebugUtilsLabel(_cmd);
             }
         }
         void InsertDebugLabel(std::string_view lbl) override
         {
             VkDebugUtilsLabelEXT l{.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = lbl.data()};
-            if (_dev->pfn_CmdInsertDebugUtilsLabel)
+            if (_dev.pfn_CmdInsertDebugUtilsLabel)
             {
-                _dev->pfn_CmdInsertDebugUtilsLabel(_cmd, &l);
+                _dev.pfn_CmdInsertDebugUtilsLabel(_cmd, &l);
             }
         }
 
@@ -551,36 +599,53 @@ namespace rhi::vulkan
         }
 
       private:
-        VulkanDevice    *_dev{nullptr};
-        VkCommandPool    _pool{VK_NULL_HANDLE};
-        std::mutex      *_poolMtx{nullptr};
-        VkCommandBuffer  _cmd{VK_NULL_HANDLE};
-        QueueType        _qtype{QueueType::Graphics};
-        VkPipelineLayout _currentLayout{VK_NULL_HANDLE};
-        uint32_t         _currentPushConstantBytes{0};
+        VulkanDevice   &_dev;
+        VkCommandPool   _pool{VK_NULL_HANDLE};
+        std::mutex     &_poolMtx;
+        VkCommandBuffer _cmd{VK_NULL_HANDLE};
+        /// The surface a recorded Present() named, shown by the submission carrying this list.
+        ExternalTextureProviderHandle  _presentTarget{};
+        QueueType            _qtype{QueueType::Graphics};
+        VkPipelineLayout     _currentLayout{VK_NULL_HANDLE};
+        uint32_t             _currentPushConstantBytes{0};
 
         // TLAS instance buffers created by BuildAccelerationStructure(),
         // freed in ~VulkanCommandList() — see the destructor comment.
-        std::vector<BufferHandle> _asInstanceBuffers;
+        std::vector<BufferHandle> _asInstanceBuffers{};
 
         // Deferred barriers — flushed together for a single vkCmdPipelineBarrier2 call
-        std::vector<VkImageMemoryBarrier2>  _pendingImg;
-        std::vector<VkBufferMemoryBarrier2> _pendingBuf;
-        std::vector<VkMemoryBarrier2>       _pendingMem;
+        std::vector<VkImageMemoryBarrier2>  _pendingImg{};
+        std::vector<VkBufferMemoryBarrier2> _pendingBuf{};
+        std::vector<VkMemoryBarrier2>       _pendingMem{};
 
         // ---- Handle lookups ----
 
-        [[nodiscard]] VkBuffer _lookupBuf(BufferHandle h) const noexcept
+        // A command that names a resource needs one: recording it against an invalid handle is a
+        // caller mistake, stopped here rather than recorded against VK_NULL_HANDLE.
+
+        [[nodiscard]] VkBuffer _lookupBuf(BufferHandle h) const
         {
-            return h.Valid() ? _dev->Buffer(h).buffer : VK_NULL_HANDLE;
+            if (!h.Valid())
+            {
+                FailContract("a command was recorded against an invalid buffer handle");
+            }
+            return _dev.Buffer(h).buffer;
         }
-        [[nodiscard]] VkImage _lookupImg(TextureHandle h) const noexcept
+        [[nodiscard]] VkImage _lookupImg(TextureHandle h) const
         {
-            return h.Valid() ? _dev->Texture(h).image : VK_NULL_HANDLE;
+            if (!h.Valid())
+            {
+                FailContract("a command was recorded against an invalid texture handle");
+            }
+            return _dev.Texture(h).image;
         }
-        [[nodiscard]] VkImageView _lookupView(TextureHandle h) const noexcept
+        [[nodiscard]] VkImageView _lookupView(TextureHandle h) const
         {
-            return h.Valid() ? _dev->Texture(h).view : VK_NULL_HANDLE;
+            if (!h.Valid())
+            {
+                FailContract("a command was recorded against an invalid texture handle");
+            }
+            return _dev.Texture(h).view;
         }
 
         // ---- Automatic image layout tracking ----
@@ -598,7 +663,7 @@ namespace rhi::vulkan
             {
                 return VK_IMAGE_ASPECT_COLOR_BIT;
             }
-            switch (_dev->Texture(h).desc.Format)
+            switch (_dev.Texture(h).desc.Format)
             {
                 case Format::D16Unorm:
                 case Format::D32Float:
@@ -623,7 +688,7 @@ namespace rhi::vulkan
             // image's real layout.
             FlushBarriers();
 
-            auto &rec = _dev->Texture(h);
+            auto &rec{_dev.Texture(h)};
             if (rec.layout == newLayout)
             {
                 return;
@@ -662,10 +727,10 @@ namespace rhi::vulkan
                 return;
             }
             // Use the global layout — it's always valid by the time we begin
-            VkPipelineLayout layout{_dev->GlobalPipelineLayout()};
+            VkPipelineLayout layout{_dev.GlobalPipelineLayout()};
             uint32_t         descriptorBufferIndex{0};
             VkDeviceSize     off{0};
-            _dev->pfn_CmdSetDescriptorBufferOffsets(_cmd, bp, layout, 1, 1, &descriptorBufferIndex, &off);
+            _dev.pfn_CmdSetDescriptorBufferOffsets(_cmd, bp, layout, 1, 1, &descriptorBufferIndex, &off);
         }
 
         // ---- Conversion helpers ----
@@ -950,51 +1015,57 @@ namespace rhi::vulkan
     // VulkanDevice methods that reference VulkanCommandList
     // ============================================================================
 
-    std::unique_ptr<ICommandList> VulkanDevice::CreateCommandList(QueueType qtype, std::string_view /*name*/)
+    std::expected<std::unique_ptr<ICommandList>, DeviceError> VulkanDevice::CreateCommandList(QueueType qtype,
+                                                                                              std::string_view /*name*/)
     {
-        VkCommandPool pool;
-        std::mutex   *mtx;
-        switch (qtype)
-        {
-            case QueueType::Compute:
-                pool = computePool;
-                mtx  = &computePoolMtx;
-                break;
-            case QueueType::Transfer:
-                pool = xferPool;
-                mtx  = &xferPoolMtx;
-                break;
-            default:
-                pool = gfxPool;
-                mtx  = &gfxPoolMtx;
-                break;
-        }
-
+        const CommandPool           commandPool{CommandPoolFor(qtype)};
         VkCommandBufferAllocateInfo ai{
             .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool        = pool,
+            .commandPool        = commandPool.pool,
             .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1,
         };
-        VkCommandBuffer cmd;
+        VkCommandBuffer cmd{VK_NULL_HANDLE};
         {
-            std::scoped_lock lk{*mtx};
+            std::scoped_lock lk{commandPool.mutex};
             VK_CHECK(vkAllocateCommandBuffers(_device, &ai, &cmd));
         }
-        return std::make_unique<VulkanCommandList>(this, pool, mtx, cmd, qtype);
+        return std::make_unique<VulkanCommandList>(*this, commandPool.pool, commandPool.mutex, cmd, qtype);
     }
 
     FenceHandle VulkanDevice::Submit(ICommandList &cmdList, const SubmitDesc &desc)
     {
-        auto &vcl = static_cast<VulkanCommandList &>(cmdList);
+        // A recorded present is shown by the submission that drew it: the target adds the wait and
+        // signal this submission needs, which is what keeps a frame down to one submission.
+        auto &vcl{static_cast<VulkanCommandList &>(cmdList)};
+        if (auto *target{vcl.takeRecordedPresentTarget()})
+        {
+            return target->SubmitAndPresentHeldFrame(cmdList, desc);
+        }
+        return _submit(cmdList, desc, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    }
 
-        uint64_t signalVal;
+    FenceHandle VulkanDevice::_submit(ICommandList &cmdList, const SubmitDesc &desc, VkSemaphore waitBinary,
+                                      VkSemaphore signalBinary)
+    {
+        auto    &vcl{static_cast<VulkanCommandList &>(cmdList)};
+        uint64_t signalVal{};
         {
             std::scoped_lock lk{_timelineMtx};
             signalVal = ++_timelineValue;
         }
 
-        std::vector<VkSemaphoreSubmitInfo> waits;
+        std::vector<VkSemaphoreSubmitInfo> waits{};
+        if (waitBinary != VK_NULL_HANDLE)
+        {
+            // A binary semaphore from image acquisition: the colour attachment cannot be written
+            // until the presentation engine has finished with the image.
+            waits.push_back({
+                .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = waitBinary,
+                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            });
+        }
         if (desc.WaitFence.Valid())
         {
             waits.push_back({
@@ -1009,42 +1080,36 @@ namespace rhi::vulkan
             .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
             .commandBuffer = vcl.commandBuffer(),
         };
-        VkSemaphoreSubmitInfo ssi{
+        std::vector<VkSemaphoreSubmitInfo> signals{};
+        signals.push_back({
             .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .semaphore = _timeline,
             .value     = signalVal,
             .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        };
+        });
+        if (signalBinary != VK_NULL_HANDLE)
+        {
+            // Presentation waits on this one, so the display never reads a half-drawn image.
+            signals.push_back({
+                .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = signalBinary,
+                .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            });
+        }
         VkSubmitInfo2 si{
             .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
             .waitSemaphoreInfoCount   = static_cast<uint32_t>(waits.size()),
             .pWaitSemaphoreInfos      = waits.data(),
             .commandBufferInfoCount   = 1,
             .pCommandBufferInfos      = &csi,
-            .signalSemaphoreInfoCount = 1,
-            .pSignalSemaphoreInfos    = &ssi,
+            .signalSemaphoreInfoCount = static_cast<uint32_t>(signals.size()),
+            .pSignalSemaphoreInfos    = signals.data(),
         };
 
-        VkQueue     q;
-        std::mutex *qmtx;
-        switch (vcl.queueType())
+        QueueInfo &queue{QueueFor(vcl.queueType())};
         {
-            case QueueType::Compute:
-                q    = computeQ.q;
-                qmtx = &computeQ.mtx;
-                break;
-            case QueueType::Transfer:
-                q    = transferQ.q;
-                qmtx = &transferQ.mtx;
-                break;
-            default:
-                q    = gfxQ.q;
-                qmtx = &gfxQ.mtx;
-                break;
-        }
-        {
-            std::scoped_lock lk{*qmtx};
-            VK_CHECK(vkQueueSubmit2(q, 1, &si, VK_NULL_HANDLE));
+            std::scoped_lock lk{queue.mtx};
+            VK_CHECK(vkQueueSubmit2(queue.q, 1, &si, VK_NULL_HANDLE));
         }
 
         return FenceHandle{signalVal};

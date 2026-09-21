@@ -1,3 +1,7 @@
+/**
+ * {file} bindless.cppm
+ * {brief} Defines the backend-neutral bindless heap contract and its limits.
+ */
 module;
 #include <cstdint>
 
@@ -14,8 +18,8 @@ export namespace rhi
      */
     struct BindlessLimits
     {
-        uint32_t MaxBuffers{1 << 20};  ///< Maximum simultaneously live bindless buffers.
-        uint32_t MaxTextures{1 << 20}; ///< Maximum simultaneously live bindless textures.
+        uint32_t MaxBuffers{1U << 20U};  ///< Maximum simultaneously live bindless buffers.
+        uint32_t MaxTextures{1U << 20U}; ///< Maximum simultaneously live bindless textures.
         uint32_t MaxSamplers{2048};    ///< Maximum simultaneously live bindless samplers.
     };
 
@@ -33,7 +37,9 @@ export namespace rhi
      *     DescriptorHandle<Texture2D> Texture;
      * };
      *
-     * [[vk::push_constant]] ConstantBuffer<RootConstants> constants : register(b30);
+     * #include "light_rhi_shader_abi.slangh"
+     * [[vk::push_constant]] ConstantBuffer<RootConstants> constants
+     *     : register(LIGHTRHI_PUSH_CONSTANT_REGISTER);
      * Texture2D texture = constants.Texture;
      * ```
      * Populate the matching host field with IDevice::TextureAddress(). The

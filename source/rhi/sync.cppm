@@ -35,18 +35,18 @@ export namespace rhi
      */
     struct TextureBarrier
     {
-        TextureHandle    Texture; ///< Texture being transitioned.
-        ResourceState    Before;  ///< State of earlier access.
-        ResourceState    After;   ///< State required by later access.
-        SubresourceRange Range{}; ///< Affected subresources; defaults to the whole texture.
+        TextureHandle    Texture{}; ///< Texture being transitioned.
+        ResourceState    Before{};  ///< State of earlier access.
+        ResourceState    After{};   ///< State required by later access.
+        SubresourceRange Range{};   ///< Affected subresources; defaults to the whole texture.
     };
 
     /** {brief} Describes an explicit state transition for a byte range of a buffer. */
     struct BufferBarrier
     {
-        BufferHandle  Buffer;      ///< Buffer being transitioned.
-        ResourceState Before;      ///< State of earlier access.
-        ResourceState After;       ///< State required by later access.
+        BufferHandle  Buffer{};    ///< Buffer being transitioned.
+        ResourceState Before{};    ///< State of earlier access.
+        ResourceState After{};     ///< State required by later access.
         uint64_t      Offset{0};   ///< First affected byte.
         uint64_t      Size{~0ULL}; ///< Number of bytes, or `~0ULL` for the rest of the buffer.
     };
@@ -57,8 +57,8 @@ export namespace rhi
      */
     struct MemoryBarrier
     {
-        ResourceState Before; ///< State of accesses that must complete first.
-        ResourceState After;  ///< State of accesses that may begin afterward.
+        ResourceState Before{}; ///< State of accesses that must complete first.
+        ResourceState After{};  ///< State of accesses that may begin afterward.
     };
 
     // ---- Timeline points ----
