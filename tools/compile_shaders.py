@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Compile Slang shaders listed in a shaders_registry.generated.json manifest
-to backend-specific artifacts.
+"""Compile the Slang shaders listed in a shaders_registry.generated.json manifest into one
+backend-specific library per .slang file.
 
-This is the tooling/build-layer step in the shader pipeline:
+    <source>.slang --(slangc)--> <output-dir>/<source>.spv        Vulkan: one SPIR-V module
+                                 <output-dir>/<source>.metallib   Metal, with --metal-sdk
+                                 <output-dir>/<source>.metal      Metal, MSL compiled at startup
 
-    .slang source --(slangc)--> backend-specific artifact
-        Vulkan: <output-dir>/vulkan/<name>.generated.spv
-        Metal:  <output-dir>/metal/<name>.generated.metal
+A library holds every entry point its source declares, under the names the source gives them, which
+is how Metal libraries and multi-entry SPIR-V modules are addressed at run time. With --metal-sdk the
+MSL is compiled ahead of time by Apple's toolchain for that SDK; the MSL and AIR it went through are
+kept under <output-dir>/intermediate/ for reading and debugging, and are not part of the output.
 
-It never emits C++ — the RHI loads these artifact files directly (see
-tests/shader_artifact_loader.h). Slang is a tooling concern only; the RHI
-core and backends do not know about it.
+It never emits C++: an application ships the output directory and reads libraries from it (see
+rhi::ReadShaderArtifact). Slang is a tooling concern only; the RHI core and backends do not know
+about it.
 """
 import argparse
 import json
@@ -23,11 +26,6 @@ _STAGE_TO_SLANG_STAGE = {
     "vertex": "vertex",
     "fragment": "fragment",
     "compute": "compute",
-}
-
-_TARGETS = {
-    "vulkan": ("spirv", ".spv"),
-    "metal": ("metal", ".metal"),
 }
 
 
@@ -148,11 +146,17 @@ def inject_argument_buffer_ids(text: str) -> tuple[str, bool]:
     back via pipeline reflection (member->argumentIndex()), so the ids this
     injects and the ids the C++ side already assumes stay consistent.
     """
-    m = re.search(rf"(\w+)\s+constant\s*\*\s*\w+\s*\[\[buffer\({_METAL_PUSH_CONSTANT_BUFFER_SLOT}\)\]\]", text)
-    if not m:
-        return text, False
-    struct_name = m.group(1)
+    # A library holds several kernels, and each may bind its own push-constant struct.
+    pattern = rf"(\w+)\s+constant\s*\*\s*\w+\s*\[\[buffer\({_METAL_PUSH_CONSTANT_BUFFER_SLOT}\)\]\]"
+    changed = False
+    for struct_name in dict.fromkeys(m.group(1) for m in re.finditer(pattern, text)):
+        text, struct_changed = _inject_ids_for_struct(text, struct_name)
+        changed = changed or struct_changed
+    return text, changed
 
+
+def _inject_ids_for_struct(text: str, struct_name: str) -> tuple[str, bool]:
+    """Annotates one argument-buffer struct's members with sequential [[id(n)]]."""
     struct_re = re.compile(rf"(struct\s+{re.escape(struct_name)}\s*\{{)(.*?)(\}}\s*;)", re.DOTALL)
     sm = struct_re.search(text)
     if not sm:
@@ -175,59 +179,75 @@ def inject_argument_buffer_ids(text: str) -> tuple[str, bool]:
     return text, True
 
 
-def compile_one(slangc: str, shaders_root: pathlib.Path, entry: dict, target: str, ext: str,
-                 out_dir: pathlib.Path, include_dirs: list[pathlib.Path] | None = None,
-                 defines: list[str] | None = None) -> None:
-    name = entry["name"]
-    source = shaders_root / entry["source"]
-    entry_point = entry["entryPoint"]
+def postprocess_metal_file(path: pathlib.Path) -> None:
+    """Applies the MSL workarounds above to a file in place."""
+    text = path.read_text()
+    text, injected = postprocess_metal_source(text)
+    text, ids_injected = inject_argument_buffer_ids(text)
+    if injected or ids_injected:
+        path.write_text(text)
+        if injected:
+            print(f"[compile_shaders]   postprocessed {path.name}: injected missing struct definition(s): "
+                  f"{', '.join(injected)} (slang metal codegen workaround)")
+        if ids_injected:
+            print(f"[compile_shaders]   postprocessed {path.name}: injected [[id(n)]] "
+                  f"argument-buffer annotations (slang metal codegen workaround)")
 
+
+def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pathlib.Path,
+                    include_dirs: list[pathlib.Path], defines: list[str], metal_sdk: str | None) -> pathlib.Path:
+    """Compiles every entry point in `source` into one library, and returns its path."""
+    library = source.stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{name}.generated{ext}"
 
-    cmd = [slangc, "-target", target, "-entry", entry_point]
-    if target == "spirv":
-        # GPU-addressed structs are shared with C++; emit their C-compatible
-        # member layout and satisfy Vulkan physical-storage-buffer validation.
-        cmd += ["-fvk-use-c-layout"]
-    for include_dir in include_dirs or []:
+    cmd = [slangc]
+    if backend == "vulkan":
+        output = out_dir / f"{library}.spv"
+        # GPU-addressed structs are shared with C++: emit their C-compatible member layout. Keep
+        # each entry point's own name instead of Slang's default "main", so one module can hold
+        # them all and they are addressed alike on every backend.
+        cmd += ["-target", "spirv", "-fvk-use-c-layout", "-fvk-use-entrypoint-name"]
+    elif metal_sdk:
+        output = out_dir / f"{library}.metallib"
+        cmd += ["-target", "metal"]
+    else:
+        output = out_dir / f"{library}.metal"
+        cmd += ["-target", "metal"]
+
+    msl = out_dir / "intermediate" / f"{library}.metal" if backend == "metal" and metal_sdk else output
+    msl.parent.mkdir(parents=True, exist_ok=True)
+    for include_dir in include_dirs:
         cmd += ["-I", str(include_dir)]
-    for define in defines or []:
+    for define in defines:
         cmd += ["-D", define]
-    cmd += ["-o", str(out_path), str(source)]
-    print(f"[compile_shaders] {source.name}:{entry_point} -> {out_path}")
+    # No -entry: slangc takes every [shader(...)] entry point the source declares.
+    cmd += ["-o", str(msl if backend == "metal" else output), str(source)]
+    print(f"[compile_shaders] {source.name} -> {output.name}")
     subprocess.run(cmd, check=True)
 
-    if target == "metal":
-        text = out_path.read_text()
-        text, injected = postprocess_metal_source(text)
-        text, ids_injected = inject_argument_buffer_ids(text)
-        if injected or ids_injected:
-            out_path.write_text(text)
-            if injected:
-                print(f"[compile_shaders]   postprocessed {out_path.name}: injected missing "
-                      f"struct definition(s): {', '.join(injected)} (slang metal codegen workaround)")
-            if ids_injected:
-                print(f"[compile_shaders]   postprocessed {out_path.name}: injected [[id(n)]] "
-                      f"argument-buffer annotations (slang metal codegen workaround)")
+    if backend == "metal":
+        postprocess_metal_file(msl)
+        if metal_sdk:
+            air = msl.with_suffix(".air")
+            subprocess.run(["xcrun", "-sdk", metal_sdk, "metal", "-c", str(msl), "-o", str(air)], check=True)
+            subprocess.run(["xcrun", "-sdk", metal_sdk, "metallib", str(air), "-o", str(output)], check=True)
+    return output
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shaders-json", required=True, type=pathlib.Path)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path,
-                         help="Base output dir; vulkan/ and metal/ subdirectories are created inside it")
+                        help="Where the libraries are written, one per .slang file")
     parser.add_argument("--slangc", required=True, help="Path to the slangc compiler")
-    parser.add_argument("--backend", choices=["vulkan", "metal", "all"], default="all")
-    parser.add_argument("--only", help="Compile only the manifest entry with this 'name' "
-                                        "(lets the build system invoke this script once per "
-                                        "shader, in parallel, instead of once for the whole manifest)")
-    parser.add_argument("--include-dir", action="append", dest="include_dirs", default=[],
-                         type=pathlib.Path,
-                         help="Extra directory for slangc to resolve #include \"...\" against "
-                              "(repeatable) — needed when a shader #includes a header living "
-                              "outside its own source directory (e.g. a project's shared "
-                              "CPU/GPU struct-definition headers).")
+    parser.add_argument("--backend", choices=["vulkan", "metal"], required=True)
+    parser.add_argument("--only-source", help="Compile only this .slang file from the manifest (lets the build "
+                                              "system compile each library as its own step, in parallel)")
+    parser.add_argument("--include-dir", action="append", dest="include_dirs", default=[], type=pathlib.Path,
+                        help="Extra directory for slangc to resolve #include \"...\" against (repeatable) - "
+                             "needed when a shader includes a header living outside its own directory.")
+    parser.add_argument("--metal-sdk", help="Compile Metal libraries ahead of time for this Apple SDK "
+                                            "(macosx, iphoneos, iphonesimulator, ...)")
     parser.add_argument("--define", action="append", dest="defines", default=[],
                         help="Slang preprocessor definition as NAME or NAME=VALUE (repeatable).")
     args = parser.parse_args()
@@ -235,19 +255,15 @@ def main() -> int:
     manifest = load_manifest(args.shaders_json)
     shaders_root = args.shaders_json.parent
 
-    entries = manifest["shaders"]
-    if args.only is not None:
-        entries = [e for e in entries if e["name"] == args.only]
-        if not entries:
-            raise ValueError(f"{args.shaders_json}: no shader entry named '{args.only}'")
+    sources = list(dict.fromkeys(entry["source"] for entry in manifest["shaders"]))
+    if args.only_source is not None:
+        if args.only_source not in sources:
+            raise ValueError(f"{args.shaders_json}: no shader entry comes from '{args.only_source}'")
+        sources = [args.only_source]
 
-    backends = _TARGETS.keys() if args.backend == "all" else [args.backend]
-    for entry in entries:
-        for backend in backends:
-            target, ext = _TARGETS[backend]
-            compile_one(args.slangc, shaders_root, entry, target, ext, args.output_dir / backend,
-                        args.include_dirs, args.defines)
-
+    for source in sources:
+        compile_library(args.slangc, shaders_root / source, args.backend, args.output_dir,
+                        args.include_dirs, args.defines, args.metal_sdk)
     return 0
 
 

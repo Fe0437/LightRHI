@@ -257,6 +257,13 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
         INSTALL_RPATH "@loader_path"
     )
 
+    # Which Metal shader libraries the build ships, decided once by light_rhi_compile_shaders' option.
+    if(LIGHT_RHI_METAL_SHADER_FORMAT STREQUAL "MetalLib")
+        target_compile_definitions(LightRHIBackend PRIVATE LIGHT_RHI_METAL_PRECOMPILED_SHADERS=1)
+    else()
+        target_compile_definitions(LightRHIBackend PRIVATE LIGHT_RHI_METAL_PRECOMPILED_SHADERS=0)
+    endif()
+
     target_warnings(LightRHIBackend)
 endif()
 

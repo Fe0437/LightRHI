@@ -80,9 +80,9 @@ int main()
     // ---- Pipeline ----
     // Shaders authored in Slang, compiled by the build to this backend's
     // format and loaded from RHI_EXAMPLE_SHADER_DIR.
-    const auto vertShader{rhiexample::loadShaderArtifact("triangle_vert_main", "vert_main", rhi::ShaderStage::Vertex)};
+    const auto vertShader{rhiexample::loadShaderArtifact("triangle", "vert_main", rhi::ShaderStage::Vertex)};
     const auto fragShader{
-        rhiexample::loadShaderArtifact("triangle_frag_main", "frag_main", rhi::ShaderStage::Fragment)};
+        rhiexample::loadShaderArtifact("triangle", "frag_main", rhi::ShaderStage::Fragment)};
 
     auto pipeline{rhiexample::required(device->CreateGraphicsPipeline(rhi::GraphicsPipelineDesc{
         .VertexShader      = vertShader,
@@ -132,7 +132,6 @@ int main()
     device->DestroyTexture(colorTex);
     device->DestroyBuffer(vertBuf);
     device->DestroyBuffer(readback);
-    device->WaitIdle();
 
     return EXIT_SUCCESS;
 }

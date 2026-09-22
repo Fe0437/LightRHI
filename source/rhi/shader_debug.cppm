@@ -1,4 +1,9 @@
+/**
+ * {file}
+ * {brief} The record a shader writes to report values back to the host while debugging.
+ */
 module;
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -21,8 +26,8 @@ export namespace rhi
     struct ShaderDebugRecord
     {
         std::uint32_t ThreadIndex{0};                  ///< Linear invocation index that wrote the record.
-        std::uint32_t Symbols[ShaderDebugSlotCount]{}; ///< Application-defined identifiers for captured values.
-        std::uint32_t Values[ShaderDebugSlotCount]{};  ///< Bit patterns captured for the matching symbols.
+        std::array<std::uint32_t, ShaderDebugSlotCount> Symbols{}; ///< Application-defined identifiers for captured values.
+        std::array<std::uint32_t, ShaderDebugSlotCount> Values{};  ///< Bit patterns captured for the matching symbols.
     };
 
     static_assert(sizeof(ShaderDebugRecord) == 132);

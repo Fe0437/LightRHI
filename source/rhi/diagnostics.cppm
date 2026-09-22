@@ -17,6 +17,7 @@ module;
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <print>
 #include <string_view>
 
 export module rhi:diagnostics;
@@ -46,7 +47,7 @@ export namespace rhi
      */
     inline void ReportRefusal(std::string_view what) noexcept
     {
-        std::fprintf(stderr, "[LightRHI] %.*s\n", static_cast<int>(what.size()), what.data());
+        std::println(stderr, "[LightRHI] {}", what);
     }
 
     /**
@@ -57,7 +58,7 @@ export namespace rhi
      */
     [[noreturn]] inline void FailContract(std::string_view what) noexcept
     {
-        std::fprintf(stderr, "[LightRHI] broken contract: %.*s\n", static_cast<int>(what.size()), what.data());
+        std::println(stderr, "[LightRHI] broken contract: {}", what);
         std::abort();
     }
 } // namespace rhi

@@ -838,6 +838,9 @@ def _signature_for(entity: Entity, domain: str) -> str:
         body = signature[len(prefix) :] if prefix else signature
         # The directive already says which kind this is; the keyword would be read as part of a name.
         body = re.sub(r"^(?:enum\s+class|enum|class|struct|union)\s+", "", body)
+        # This source macro expands to a compiler attribute (or nothing). Sphinx
+        # needs the enum name at the start of its signature.
+        body = re.sub(r"^LIGHT_RHI_FLAG_ENUM\s+", "", body)
         return (prefix + body).strip()
     return signature
 

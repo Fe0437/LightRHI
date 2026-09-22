@@ -3,6 +3,7 @@
  * {brief} Defines backend-neutral GPU value types, flags, and errors.
  */
 module;
+#include "flag_enum.h"
 #include <cstdint>
 #include <utility> // std::to_underlying
 
@@ -122,7 +123,7 @@ export namespace rhi
     // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
     // has today, so shrinking it to fit the current set would cap the type.
     // NOLINTNEXTLINE(performance-enum-size)
-    enum class ResourceState : uint32_t
+    enum class LIGHT_RHI_FLAG_ENUM ResourceState : uint32_t
     {
         Undefined                  = 0,           ///< Contents and previous access need not be preserved.
         VertexBuffer               = 1U << 0U,      ///< Read as vertex input.
@@ -165,7 +166,7 @@ export namespace rhi
     // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
     // has today, so shrinking it to fit the current set would cap the type.
     // NOLINTNEXTLINE(performance-enum-size)
-    enum class BufferUsage : uint32_t
+    enum class LIGHT_RHI_FLAG_ENUM BufferUsage : uint32_t
     {
         None          = 0,      ///< No GPU operation is declared.
         Vertex        = 1U << 0U, ///< May be bound as vertex input.
@@ -200,7 +201,7 @@ export namespace rhi
     // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
     // has today, so shrinking it to fit the current set would cap the type.
     // NOLINTNEXTLINE(performance-enum-size)
-    enum class TextureUsage : uint32_t
+    enum class LIGHT_RHI_FLAG_ENUM TextureUsage : uint32_t
     {
         None    = 0,      ///< No GPU operation is declared.
         Sampled = 1U << 0U, ///< May be sampled or read by shaders.
@@ -386,7 +387,7 @@ export namespace rhi
     // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
     // has today, so shrinking it to fit the current set would cap the type.
     // NOLINTNEXTLINE(performance-enum-size)
-    enum class ShaderStage : uint32_t
+    enum class LIGHT_RHI_FLAG_ENUM ShaderStage : uint32_t
     {
         None     = 0,
         Vertex   = 1U << 0U,

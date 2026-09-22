@@ -12,7 +12,8 @@
 // macOS 26 / iOS 26 as the minimum deployment target; there is no classic-
 // Metal fallback path.
 
-#pragma once
+#ifndef LIGHTRHI_BACKEND_METAL_METAL_INTERNAL_H
+#define LIGHTRHI_BACKEND_METAL_METAL_INTERNAL_H
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
@@ -51,7 +52,7 @@ namespace rhi::metal
     // ============================================================================
 
     /** Describes why Metal refused a request; Metal leaves `error` null when it gives no reason. */
-    template <typename Error> [[nodiscard]] std::string errorText(Error *error)
+    template <typename Error> [[nodiscard]] std::string ErrorText(Error *error)
     {
         return error != nullptr ? std::string{error->localizedDescription()->utf8String()} : std::string{"unknown"};
     }
@@ -61,14 +62,28 @@ namespace rhi::metal
      * `what` with Metal's reason and returns `refusal` instead.
      */
     template <typename T>
-    [[nodiscard]] std::expected<NS::SharedPtr<T>, DeviceError> adoptCreated(T *created, std::string_view what,
+    [[nodiscard]] std::expected<NS::SharedPtr<T>, DeviceError> AdoptCreated(T *created, std::string_view what,
                                                                             NS::Error  *error   = nullptr,
                                                                             DeviceError refusal = DeviceError::Refused)
     {
         if (created == nullptr)
         {
-            ReportRefusal(error != nullptr ? std::string{what} + ": " + errorText(error) : std::string{what});
+            ReportRefusal(error != nullptr ? std::string{what} + ": " + ErrorText(error) : std::string{what});
             return std::unexpected{refusal};
+        }
+        return NS::TransferPtr(created);
+    }
+
+    /**
+     * Takes ownership of an object a Metal `alloc()->init()` call returned, where the caller has no
+     * way to report a refusal. Metal returns none only when memory is exhausted, which leaves
+     * nothing sensible to do, so that stops the process with `what` as the reason.
+     */
+    template <typename T> [[nodiscard]] NS::SharedPtr<T> AdoptRequired(T *created, std::string_view what)
+    {
+        if (created == nullptr)
+        {
+            FailContract(what);
         }
         return NS::TransferPtr(created);
     }
@@ -109,7 +124,7 @@ namespace rhi::metal
             }
         }
         /** Takes a free slot, or kInvalidIndex when the pool has none left. */
-        [[nodiscard]] uint32_t alloc()
+        [[nodiscard]] uint32_t Alloc()
         {
             const std::scoped_lock lk{_mutex};
             if (_freeList.empty())
@@ -120,19 +135,19 @@ namespace rhi::metal
             _freeList.pop_back();
             return idx;
         }
-        void free(uint32_t idx)
+        void Free(uint32_t idx)
         {
             const std::scoped_lock lk{_mutex};
             assert(idx < _slots.size());
             _slots[idx] = {};
             _freeList.push_back(idx);
         }
-        [[nodiscard]] T &get(uint32_t idx) noexcept
+        [[nodiscard]] T &Get(uint32_t idx) noexcept
         {
             assert(idx < _slots.size());
             return _slots[idx];
         }
-        [[nodiscard]] const T &get(uint32_t idx) const noexcept
+        [[nodiscard]] const T &Get(uint32_t idx) const noexcept
         {
             assert(idx < _slots.size());
             return _slots[idx];
@@ -145,26 +160,26 @@ namespace rhi::metal
 
     struct MetalBuffer
     {
-        NS::SharedPtr<MTL::Buffer> buffer{};
-        uint64_t                   size{0};
-        BufferUsage                usage{};
+        NS::SharedPtr<MTL::Buffer> Buffer{};
+        uint64_t                   Size{0};
+        BufferUsage                Usage{};
         // Invalid for a buffer that owns its allocation. A placed buffer keeps its heap and offset
         // so destruction can release the range without touching the heap's residency.
-        MemoryHeapHandle heap{};
-        uint64_t         offset{0};
+        MemoryHeapHandle Heap{};
+        uint64_t         Offset{0};
     };
 
     struct MetalTexture
     {
-        NS::SharedPtr<MTL::Texture> texture{};
-        TextureDesc                 desc{};
+        NS::SharedPtr<MTL::Texture> Texture{};
+        TextureDesc                 Desc{};
         // Invalid for a texture that owns its allocation. A placed texture keeps its heap and
         // offset so destruction can release the range without touching the heap's residency.
-        MemoryHeapHandle heap{};
-        uint64_t         offset{0};
+        MemoryHeapHandle Heap{};
+        uint64_t         Offset{0};
         // True for a surface texture borrowed from a drawable: the layer owns it, the layer's
         // residency set covers it, and destroying the handle must not touch either.
-        bool borrowed{false};
+        bool Borrowed{false};
     };
 
     // Memory the application places textures into: one MTLHeap of type placement, plus the live
@@ -172,45 +187,45 @@ namespace rhi::metal
     // choose one — offsets always come from the caller.
     struct MetalMemoryHeap
     {
-        NS::SharedPtr<MTL::Heap>     heap{};
-        uint64_t                     size{0};
-        MemoryType                   memory{MemoryType::GpuOnly};
-        std::map<uint64_t, uint64_t> liveRanges{}; // placement offset -> end offset
+        NS::SharedPtr<MTL::Heap>     Heap{};
+        uint64_t                     Size{0};
+        MemoryType                   Memory{MemoryType::GpuOnly};
+        std::map<uint64_t, uint64_t> LiveRanges{}; // placement offset -> end offset
     };
 
     struct MetalSampler
     {
-        NS::SharedPtr<MTL::SamplerState> state{};
+        NS::SharedPtr<MTL::SamplerState> State{};
     };
 
     struct MetalTimestampQueryPool
     {
-        NS::SharedPtr<MTL4::CounterHeap> heap{};
-        uint32_t                         count{0};
+        NS::SharedPtr<MTL4::CounterHeap> Heap{};
+        uint32_t                         Count{0};
     };
 
     struct MetalAccelerationStructure
     {
-        NS::SharedPtr<MTL::AccelerationStructure> as{};
-        AccelerationStructureType                 type{AccelerationStructureType::BottomLevel};
-        uint64_t                                  size{0};
+        NS::SharedPtr<MTL::AccelerationStructure> As{};
+        AccelerationStructureType                 Type{AccelerationStructureType::BottomLevel};
+        uint64_t                                  Size{0};
     };
 
     struct MetalPipeline
     {
-        NS::SharedPtr<MTL::RenderPipelineState>  renderPso{};
-        NS::SharedPtr<MTL::ComputePipelineState> computePso{};
+        NS::SharedPtr<MTL::RenderPipelineState>  RenderPso{};
+        NS::SharedPtr<MTL::ComputePipelineState> ComputePso{};
         // Rasterizer/depth state applied to the encoder when this pipeline is set
-        NS::SharedPtr<MTL::DepthStencilState> depthStencilState{};
-        MTL::Winding                          winding{MTL::WindingCounterClockwise};
-        MTL::CullMode                         cullMode{MTL::CullModeNone};
-        MTL::TriangleFillMode                 fillMode{MTL::TriangleFillModeFill};
-        float                                 depthBiasConstant{0.F};
-        float                                 depthBiasSlope{0.F};
-        bool                                  isCompute{false};
-        uint32_t                              threadGroupSizeX{1};
-        uint32_t                              threadGroupSizeY{1};
-        uint32_t                              threadGroupSizeZ{1};
+        NS::SharedPtr<MTL::DepthStencilState> DepthStencilState{};
+        MTL::Winding                          Winding{MTL::WindingCounterClockwise};
+        MTL::CullMode                         CullMode{MTL::CullModeNone};
+        MTL::TriangleFillMode                 FillMode{MTL::TriangleFillModeFill};
+        float                                 DepthBiasConstant{0.F};
+        float                                 DepthBiasSlope{0.F};
+        bool                                  IsCompute{false};
+        uint32_t                              ThreadGroupSizeX{1};
+        uint32_t                              ThreadGroupSizeY{1};
+        uint32_t                              ThreadGroupSizeZ{1};
     };
 
     struct MetalCommandResources
@@ -304,21 +319,21 @@ namespace rhi::metal
         IFramePresenter &operator=(const IFramePresenter &) = delete;
         IFramePresenter &operator=(IFramePresenter &&)      = delete;
 
-        virtual ~IFramePresenter() = default;
+        virtual ~IFramePresenter();
 
         /** Shows the frame this object is holding, after the submission that drew it. */
         virtual void PresentHeldFrame() = 0;
 
       protected:
-        IFramePresenter() = default;
+        IFramePresenter();
     };
 
     class MetalDevice final : public IDevice
     {
       public:
-        static constexpr uint32_t kMaxBuffers{1U << 20};
+        static constexpr uint32_t kMaxBuffers{1U << 20U};
         static constexpr uint32_t kMaxMemoryHeaps{4096};
-        static constexpr uint32_t kMaxTextures{1U << 20};
+        static constexpr uint32_t kMaxTextures{1U << 20U};
         static constexpr uint32_t kMaxSamplers{2048};
         static constexpr uint32_t kMaxPipelines{65536};
         static constexpr uint32_t kMaxAccelerationStructures{65536};
@@ -330,18 +345,18 @@ namespace rhi::metal
         /** Restricts construction to Create(), while still letting it use std::make_unique. */
         struct ConstructionToken
         {
-            explicit ConstructionToken() = default;
+            explicit ConstructionToken();
         };
 
         /** The Metal objects a device cannot work without, each one non-null. */
         struct RequiredObjects
         {
-            NS::SharedPtr<MTL::Device>        device{};
-            NS::SharedPtr<MTL4::CommandQueue> queue{};
-            NS::SharedPtr<MTL::CommandQueue>  legacyQueue{};
-            NS::SharedPtr<MTL4::Compiler>     compiler{};
-            NS::SharedPtr<MTL::ResidencySet>  residencySet{};
-            NS::SharedPtr<MTL::SharedEvent>   timelineEvent{};
+            NS::SharedPtr<MTL::Device>        Device{};
+            NS::SharedPtr<MTL4::CommandQueue> Queue{};
+            NS::SharedPtr<MTL::CommandQueue>  LegacyQueue{};
+            NS::SharedPtr<MTL4::Compiler>     Compiler{};
+            NS::SharedPtr<MTL::ResidencySet>  ResidencySet{};
+            NS::SharedPtr<MTL::SharedEvent>   TimelineEvent{};
         };
 
         /** Creates every required object, stopping at the first one Metal refuses. */
@@ -354,10 +369,14 @@ namespace rhi::metal
          */
         [[nodiscard]] static std::expected<std::unique_ptr<MetalDevice>, DeviceError> Create(const DeviceDesc &desc);
 
-        MetalDevice(ConstructionToken, RequiredObjects &&objects, const DeviceDesc &desc);
+        MetalDevice(ConstructionToken /*unused*/, RequiredObjects objects, const DeviceDesc &desc);
 
         // Defined out-of-line in metal_device.cpp for the reason given on MetalBindlessHeap above:
         // this header reaches more than one translation unit of the same named module.
+        MetalDevice(const MetalDevice &)            = delete;
+        MetalDevice(MetalDevice &&)                 = delete;
+        MetalDevice &operator=(const MetalDevice &) = delete;
+        MetalDevice &operator=(MetalDevice &&)      = delete;
         ~MetalDevice() override;
 
         // IDevice
@@ -365,16 +384,17 @@ namespace rhi::metal
         [[nodiscard]] uint64_t         VideoMemoryBytes() const noexcept override;
         [[nodiscard]] IBindlessHeap   &BindlessHeap() noexcept override;
 
-        [[nodiscard]] std::expected<MemoryHeapHandle, DeviceError> CreateMemoryHeap(const MemoryHeapDesc &d) override;
-        void                                                       DestroyMemoryHeap(MemoryHeapHandle h) override;
+        [[nodiscard]] std::expected<MemoryHeapHandle, DeviceError>
+             CreateMemoryHeap(const MemoryHeapDesc &desc) override;
+        void DestroyMemoryHeap(MemoryHeapHandle h) override;
         [[nodiscard]] std::expected<PlacementRequirements, PlacementError>
-        TexturePlacementRequirements(const TextureDesc &d, MemoryType memory) const override;
+        TexturePlacementRequirements(const TextureDesc &desc, MemoryType memory) const override;
 
         [[nodiscard]] std::expected<PlacementRequirements, PlacementError>
-        BufferPlacementRequirements(const BufferDesc &d) const override;
+        BufferPlacementRequirements(const BufferDesc &desc) const override;
 
-        [[nodiscard]] std::expected<BufferHandle, DeviceError>    CreateBuffer(const BufferDesc &d) override;
-        [[nodiscard]] std::expected<BufferHandle, PlacementError> CreateBuffer(const BufferDesc    &d,
+        [[nodiscard]] std::expected<BufferHandle, DeviceError>    CreateBuffer(const BufferDesc &desc) override;
+        [[nodiscard]] std::expected<BufferHandle, PlacementError> CreateBuffer(const BufferDesc    &desc,
                                                                                const HeapPlacement &placement) override;
         void                                                      DestroyBuffer(BufferHandle h) override;
         [[nodiscard]] GpuAddress                                  BufferAddress(BufferHandle h) const override;
@@ -383,13 +403,13 @@ namespace rhi::metal
         [[nodiscard]] MappedBuffer                                MapBuffer(BufferHandle h) override;
         void                                                      UnmapBuffer(BufferHandle h) override;
 
-        [[nodiscard]] std::expected<TextureHandle, DeviceError> CreateTexture(const TextureDesc &d) override;
+        [[nodiscard]] std::expected<TextureHandle, DeviceError> CreateTexture(const TextureDesc &desc) override;
         [[nodiscard]] std::expected<TextureHandle, PlacementError>
-                                 CreateTexture(const TextureDesc &d, const HeapPlacement &placement) override;
+                                 CreateTexture(const TextureDesc &desc, const HeapPlacement &placement) override;
         void                     DestroyTexture(TextureHandle h) override;
         [[nodiscard]] GpuAddress TextureAddress(TextureHandle h) const override;
 
-        [[nodiscard]] std::expected<SamplerHandle, DeviceError> CreateSampler(const SamplerDesc &d) override;
+        [[nodiscard]] std::expected<SamplerHandle, DeviceError> CreateSampler(const SamplerDesc &desc) override;
         void                                                    DestroySampler(SamplerHandle h) override;
         [[nodiscard]] GpuAddress                                SamplerAddress(SamplerHandle h) const override;
 
@@ -402,17 +422,17 @@ namespace rhi::metal
         void ReadTimestampQueries(TimestampQueryPoolHandle pool, uint32_t first, std::span<uint64_t> results) override;
 
         [[nodiscard]] std::expected<PipelineHandle, DeviceError>
-        CreateGraphicsPipeline(const GraphicsPipelineDesc &d) override;
+        CreateGraphicsPipeline(const GraphicsPipelineDesc &desc) override;
         [[nodiscard]] std::expected<PipelineHandle, DeviceError>
-             CreateComputePipeline(const ComputePipelineDesc &d) override;
+             CreateComputePipeline(const ComputePipelineDesc &desc) override;
         void DestroyPipeline(PipelineHandle h) override;
 
         // ---- Ray tracing ----
         [[nodiscard]] bool SupportsRayTracing() const noexcept override;
         [[nodiscard]] AccelerationStructureBuildSizes
-        QueryAccelerationStructureBuildSizes(const AccelerationStructureDesc &d) const override;
+        QueryAccelerationStructureBuildSizes(const AccelerationStructureDesc &desc) const override;
         [[nodiscard]] std::expected<AccelerationStructureHandle, DeviceError>
-                                 CreateAccelerationStructure(const AccelerationStructureDesc &d) override;
+                                 CreateAccelerationStructure(const AccelerationStructureDesc &desc) override;
         void                     DestroyAccelerationStructure(AccelerationStructureHandle h) override;
         [[nodiscard]] GpuAddress AccelerationStructureAddress(AccelerationStructureHandle h) const override;
 
@@ -422,9 +442,9 @@ namespace rhi::metal
         void BeginCaptureScope(std::string_view name) override;
         void EndCaptureScope() override;
 
-        [[nodiscard]] FenceHandle Submit(ICommandList &cmd, const SubmitDesc &d = {}) override;
-        void                      WaitForFence(FenceHandle f) override;
-        [[nodiscard]] bool        IsFenceComplete(FenceHandle f) override;
+        [[nodiscard]] FenceHandle Submit(ICommandList &cmdList, const SubmitDesc &d = {}) override;
+        void                      WaitForFence(FenceHandle fence) override;
+        [[nodiscard]] bool        IsFenceComplete(FenceHandle fence) override;
         void                      WaitIdle() override;
 
         void UploadBuffer(BufferHandle dst, std::span<const std::byte> data, uint64_t dstOffset = 0) override;
@@ -432,17 +452,18 @@ namespace rhi::metal
                            const TextureCopyRegion &region) override;
 
         // ---- Accessors for MetalCommandList ----
-        [[nodiscard]] MTL::Device                &MtlDevice() const noexcept;
-        [[nodiscard]] MTL4::CommandQueue         &Mtl4Queue() const noexcept;
-        [[nodiscard]] bool                        DebugCaptureEnabled() const noexcept;
-        [[nodiscard]] MetalBuffer                &Buffer(BufferHandle h);
-        [[nodiscard]] MetalTexture               &Texture(TextureHandle h);
-        [[nodiscard]] MetalSampler               &Sampler(SamplerHandle h);
-        [[nodiscard]] MetalTimestampQueryPool    &TimestampQueryPool(TimestampQueryPoolHandle h);
-        [[nodiscard]] MetalPipeline              &Pipeline(PipelineHandle h);
-        [[nodiscard]] MetalAccelerationStructure &AccelStruct(AccelerationStructureHandle h);
-        [[nodiscard]] FenceHandle                 NextFence() noexcept;
-        [[nodiscard]] MTL::SharedEvent           &TimelineEvent() const noexcept;
+        [[nodiscard]] MTL::Device                      &MtlDevice() const noexcept;
+        [[nodiscard]] MTL4::CommandQueue               &Mtl4Queue() const noexcept;
+        [[nodiscard]] bool                              DebugCaptureEnabled() const noexcept;
+        [[nodiscard]] MetalBuffer                      &Buffer(BufferHandle h);
+        [[nodiscard]] MetalTexture                     &Texture(TextureHandle h);
+        [[nodiscard]] MetalSampler                     &Sampler(SamplerHandle h);
+        [[nodiscard]] MetalTimestampQueryPool          &TimestampQueryPool(TimestampQueryPoolHandle h);
+        [[nodiscard]] MetalPipeline                    &Pipeline(PipelineHandle h);
+        [[nodiscard]] MetalAccelerationStructure       &AccelStruct(AccelerationStructureHandle h);
+        [[nodiscard]] const MetalAccelerationStructure &AccelStruct(AccelerationStructureHandle h) const;
+        [[nodiscard]] FenceHandle                       NextFence() noexcept;
+        [[nodiscard]] MTL::SharedEvent                 &TimelineEvent() const noexcept;
         /** The capture scope for a submission named `name`, or null while capture metadata is off. */
         [[nodiscard]] MTL::CaptureScope *SubmissionCaptureScope(std::string_view name);
         /** Whether the hardware is gone, which a surface reports instead of handing out a texture. */
@@ -451,7 +472,7 @@ namespace rhi::metal
         [[nodiscard]] static MTL::PixelFormat ExternalTexturePixelFormat(Format f) noexcept;
         /** Names a drawable's texture for one frame; released by DestroyTexture() once presented. */
         [[nodiscard]] std::expected<TextureHandle, DeviceError> AdoptExternalTexture(NS::SharedPtr<MTL::Texture> tex,
-                                                                                    const TextureDesc          &d);
+                                                                                     const TextureDesc          &desc);
         /** Reuses resources a completed submission released, or creates new ones. */
         [[nodiscard]] std::expected<MetalCommandResources, DeviceError> AcquireCommandResources();
         void RecycleCommandResources(MetalCommandResources &&resources);
@@ -465,8 +486,8 @@ namespace rhi::metal
         [[nodiscard]] ExternalTextureProviderHandle RegisterExternalTextureProvider(IFramePresenter &target);
         void UnregisterExternalTextureProvider(ExternalTextureProviderHandle handle) noexcept;
         /** Resolves a recorded present's handle, or null when it names nothing on this device. */
-        [[nodiscard]] IFramePresenter *ResolveExternalTextureProvider(
-            ExternalTextureProviderHandle handle) const noexcept;
+        [[nodiscard]] IFramePresenter *
+        ResolveExternalTextureProvider(ExternalTextureProviderHandle handle) const noexcept;
 
         // Acceleration structures deliberately stay on the CLASSIC (non-MTL4)
         // Metal raytracing API — everything else in this backend targets
@@ -487,8 +508,8 @@ namespace rhi::metal
         // LegacyQueue() — synchronously, since classic
         // MTL4::CommandBuffer has no accelerationStructureCommandEncoder()).
         [[nodiscard]] NS::SharedPtr<MTL::AccelerationStructureDescriptor>
-        MakeAccelerationStructureDescriptor(const AccelerationStructureDesc        &d,
-                                            std::vector<NS::SharedPtr<NS::Object>> &keepAlive);
+        MakeAccelerationStructureDescriptor(const AccelerationStructureDesc        &desc,
+                                            std::vector<NS::SharedPtr<NS::Object>> &keepAlive) const;
 
         // Classic MTL::CommandQueue used only for the acceleration-structure
         // build exception above.
@@ -565,9 +586,9 @@ namespace rhi::metal
          */
         [[nodiscard]] MTL::Buffer &_bufferAtAddress(GpuAddress addr, std::string_view role) const;
 
-        /** Builds the MTLTextureDescriptor for `d`; shared by owned and placed creation. */
-        [[nodiscard]] NS::SharedPtr<MTL::TextureDescriptor> _makeTextureDescriptor(const TextureDesc &d,
-                                                                                   MTL::StorageMode   storage) const;
+        /** Builds the MTLTextureDescriptor for `desc`; shared by owned and placed creation. */
+        [[nodiscard]] static NS::SharedPtr<MTL::TextureDescriptor> _makeTextureDescriptor(const TextureDesc &desc,
+                                                                                          MTL::StorageMode   storage);
 
         /**
          * Checks a placement against the heap it names and reserves its range on success.
@@ -578,11 +599,11 @@ namespace rhi::metal
 
         /** Registers the finished buffer in a slot, indexes its address and reports its handle. */
         [[nodiscard]] std::expected<BufferHandle, DeviceError>
-        _adoptBuffer(NS::SharedPtr<MTL::Buffer> buf, const BufferDesc &d, MemoryHeapHandle heap, uint64_t offset);
+        _adoptBuffer(NS::SharedPtr<MTL::Buffer> buf, const BufferDesc &desc, MemoryHeapHandle heap, uint64_t offset);
 
         /** Registers the finished texture in a slot and reports its handle. */
         [[nodiscard]] std::expected<TextureHandle, DeviceError> _adoptTexture(NS::SharedPtr<MTL::Texture> tex,
-                                                                              const TextureDesc          &d,
+                                                                              const TextureDesc          &desc,
                                                                               MemoryHeapHandle heap, uint64_t offset,
                                                                               bool borrowed = false);
 
@@ -622,13 +643,18 @@ namespace rhi::metal
     class MetalPresentingTextureProvider final : public IExternalTextureProvider, public IFramePresenter
     {
       public:
-        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer, Format format) noexcept;
+        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer,
+                                       Format format) noexcept;
+        MetalPresentingTextureProvider(const MetalPresentingTextureProvider &)            = delete;
+        MetalPresentingTextureProvider(MetalPresentingTextureProvider &&)                 = delete;
+        MetalPresentingTextureProvider &operator=(const MetalPresentingTextureProvider &) = delete;
+        MetalPresentingTextureProvider &operator=(MetalPresentingTextureProvider &&)      = delete;
         ~MetalPresentingTextureProvider() override;
 
         // IExternalTextureProvider
-        [[nodiscard]] Format                                     TextureFormat() const noexcept override;
+        [[nodiscard]] Format                                             TextureFormat() const noexcept override;
         [[nodiscard]] std::expected<TextureHandle, ExternalTextureError> NextTexture() override;
-        [[nodiscard]] ExternalTextureProviderHandle                        Handle() const noexcept override;
+        [[nodiscard]] ExternalTextureProviderHandle                      Handle() const noexcept override;
 
         // IFramePresenter
         void PresentHeldFrame() override;
@@ -642,7 +668,9 @@ namespace rhi::metal
         NS::SharedPtr<CA::MetalDrawable> _drawable{}; ///< Held between NextTexture() and the present.
         TextureHandle                    _texture{};  ///< The drawable's texture, named for this frame only.
         Format                           _format{Format::Undefined};
-        ExternalTextureProviderHandle              _handle{};   ///< What a recorded present names this target by.
+        ExternalTextureProviderHandle    _handle{}; ///< What a recorded present names this target by.
     };
 
 } // namespace rhi::metal
+
+#endif // LIGHTRHI_BACKEND_METAL_METAL_INTERNAL_H

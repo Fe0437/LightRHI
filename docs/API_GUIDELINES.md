@@ -58,7 +58,9 @@ descriptor value to a long parameter list. Do not add a field without a concrete
 use.
 
 Use RAII and standard smart pointers for ownership. Do not use raw `new` or
-`delete`. Use references for required borrowed objects and plain pointers only
+`delete`. The one exception is a factory whose constructor is private, so that
+the factory is the only way to build the object: it may pass `new` straight into
+the `std::unique_ptr` it returns, with a comment saying why. Use references for required borrowed objects and plain pointers only
 when null is meaningful. Use `gsl::not_null` when pointer syntax is required but
 null is not valid. Use `std::span` for synchronous borrowed contiguous sequences.
 Use `T&&` only when the callee takes ownership.

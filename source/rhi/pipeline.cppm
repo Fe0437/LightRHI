@@ -1,3 +1,7 @@
+/**
+ * {file}
+ * {brief} Shader artifacts, pipeline state, and the descriptors pipelines are created from.
+ */
 module;
 #include <cstddef>
 #include <cstdint>
@@ -70,10 +74,13 @@ export namespace rhi
         std::span<const std::byte> Data{};                      ///< Complete artifact bytes.
     };
 
-    /** {brief} Recoverable validation errors returned by ToShaderDesc(). */
+    /** {brief} Why a shader artifact could not be found, read, or described. */
     enum class ShaderArtifactError : std::uint8_t
     {
         SpirvSizeNotWordAligned, ///< SPIR-V data size is not a multiple of one 32-bit word.
+        NotFound,                ///< No shader library has the requested name.
+        Unreadable,              ///< The library file exists but could not be read.
+        InvalidSize,             ///< The library file is empty, or larger than the bound it was read with.
     };
 
     /**
@@ -103,17 +110,24 @@ export namespace rhi
                 {
                     return std::unexpected(ShaderArtifactError::SpirvSizeNotWordAligned);
                 }
+                // SPIR-V is a sequence of 32-bit words; the bytes were read or mapped from one, on storage
+                // at least word-aligned, and are handed on as the words they are.
                 desc.Bytecode = SpirvBytecode{
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                     .Words = std::span<const uint32_t>{reinterpret_cast<const uint32_t *>(artifact.Data.data()),
                                                        artifact.Data.size() / 4}};
                 break;
             case ShaderFormat::MslSource:
+                // char may view any object's bytes: MSL source is text, read as the characters it holds.
                 desc.Bytecode =
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                     MslSource{.Source = std::string_view{reinterpret_cast<const char *>(artifact.Data.data()),
                                                          artifact.Data.size()}};
                 break;
             case ShaderFormat::MetalLib:
+                // unsigned char may view any object's bytes: the library is handed on byte for byte.
                 desc.Bytecode = MetalLibBytecode{
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                     .Bytes = std::span<const uint8_t>{reinterpret_cast<const uint8_t *>(artifact.Data.data()),
                                                       artifact.Data.size()}};
                 break;

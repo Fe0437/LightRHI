@@ -20,9 +20,14 @@ include_guard(GLOBAL)
 # default). Needed when a .slang file #includes a header living elsewhere —
 # e.g. a project's shared CPU/GPU struct-definition headers.
 #
-# Outputs are written as:
-#   <OUTPUT_DIR>/<backend>/<name>.generated.spv
-#   <OUTPUT_DIR>/<backend>/<name>.generated.metal
+# Each .slang file becomes one library holding all of its entry points, in the backend's own format:
+#   <OUTPUT_DIR>/<source>.spv        Vulkan
+#   <OUTPUT_DIR>/<source>.metallib   Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MetalLib (default)
+#   <OUTPUT_DIR>/<source>.metal      Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MslSource
+# Anything else the compile goes through is kept under <OUTPUT_DIR>/intermediate/ and is not shipped.
+#
+# The backend reads them back with rhi::ReadShaderLibrary(directory, "<source>"): what the files are
+# called and what they hold stays the backend's business, so a consumer never names either.
 #
 # The generated custom target is named "${TARGET}_shaders" by default, which
 # collides if this function is called more than once against the same
@@ -32,6 +37,39 @@ include_guard(GLOBAL)
 # add_dependencies() wiring, only the custom target's own name changes, so no
 # extra indirection (dummy INTERFACE target, manual add_dependencies) is
 # needed at the call site.
+
+# How Metal shaders ship. MetalLib compiles them ahead of time with Apple's toolchain, so the device
+# loads a finished library; MslSource ships the source and the device compiles it at startup, which
+# needs no Apple toolchain at build time and is kept for that case.
+if(APPLE)
+    execute_process(COMMAND xcrun -f metal OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _light_rhi_no_metal_toolchain)
+    if(_light_rhi_no_metal_toolchain EQUAL 0)
+        set(_light_rhi_metal_format_default MetalLib)
+    else()
+        set(_light_rhi_metal_format_default MslSource)
+    endif()
+    set(LIGHT_RHI_METAL_SHADER_FORMAT "${_light_rhi_metal_format_default}" CACHE STRING
+        "How Metal shaders are shipped: MetalLib (precompiled) or MslSource (compiled at startup)")
+    set_property(CACHE LIGHT_RHI_METAL_SHADER_FORMAT PROPERTY STRINGS MetalLib MslSource)
+endif()
+
+# The Apple SDK a .metallib is compiled for: the one this build targets.
+function(_light_rhi_metal_sdk out)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+            set(${out} iphonesimulator PARENT_SCOPE)
+        else()
+            set(${out} iphoneos PARENT_SCOPE)
+        endif()
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+        set(${out} appletvos PARENT_SCOPE)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+        set(${out} xros PARENT_SCOPE)
+    else()
+        set(${out} macosx PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(light_rhi_compile_shaders)
     set(_options "")
     set(_one_value_args TARGET NAME_PREFIX SHADERS_JSON OUTPUT_DIR BACKEND ARTIFACTS_VAR BACKEND_DIR_VAR EXTENSION_VAR FORMAT_VAR)
@@ -86,7 +124,14 @@ function(light_rhi_compile_shaders)
         set(_backend vulkan)
     endif()
 
-    if(_backend STREQUAL "metal")
+    set(_metal_sdk_args "")
+    if(_backend STREQUAL "metal" AND LIGHT_RHI_METAL_SHADER_FORMAT STREQUAL "MetalLib")
+        set(_target metal)
+        set(_extension ".metallib")
+        set(_format "rhi::ShaderFormat::MetalLib")
+        _light_rhi_metal_sdk(_metal_sdk)
+        set(_metal_sdk_args --metal-sdk "${_metal_sdk}")
+    elseif(_backend STREQUAL "metal")
         set(_target metal)
         set(_extension ".metal")
         set(_format "rhi::ShaderFormat::MslSource")
@@ -137,37 +182,42 @@ function(light_rhi_compile_shaders)
     file(GLOB _manifest_dir_headers CONFIGURE_DEPENDS "${_manifest_dir}/*.slangh")
     list(APPEND _include_dir_headers ${_manifest_dir_headers})
 
+    # One library per .slang file: the manifest lists entry points, so collect their sources.
     file(READ "${LIGHT_RHI_SHADER_SHADERS_JSON}" _manifest_content)
     string(JSON _shader_count LENGTH "${_manifest_content}" shaders)
-
-    set(_artifacts "")
+    set(_sources "")
     if(_shader_count GREATER 0)
         math(EXPR _shader_last "${_shader_count} - 1")
         foreach(_i RANGE ${_shader_last})
-            string(JSON _shader_name GET "${_manifest_content}" shaders ${_i} name)
             string(JSON _shader_source GET "${_manifest_content}" shaders ${_i} source)
-
-            set(_shader_out
-                "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_backend}/${_shader_name}.generated${_extension}")
-
-            add_custom_command(
-                OUTPUT "${_shader_out}"
-                COMMAND "${Python3_EXECUTABLE}"
-                        "${_compile_shaders_py}"
-                        --shaders-json "${LIGHT_RHI_SHADER_SHADERS_JSON}"
-                        --output-dir   "${LIGHT_RHI_SHADER_OUTPUT_DIR}"
-                        --slangc       "${SLANGC}"
-                        --backend      "${_backend}"
-                        --only         "${_shader_name}"
-                        ${_include_dir_args}
-                        ${_define_args}
-                DEPENDS "${LIGHT_RHI_SHADER_SHADERS_JSON}" "${_manifest_dir}/${_shader_source}" ${_include_dir_headers}
-                COMMENT "Slang -> ${_backend}: ${_shader_name}"
-                VERBATIM
-            )
-            list(APPEND _artifacts "${_shader_out}")
+            list(APPEND _sources "${_shader_source}")
         endforeach()
+        list(REMOVE_DUPLICATES _sources)
     endif()
+
+    set(_artifacts "")
+    foreach(_shader_source IN LISTS _sources)
+        get_filename_component(_library "${_shader_source}" NAME_WE)
+        set(_shader_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_library}${_extension}")
+        add_custom_command(
+            OUTPUT "${_shader_out}"
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${_compile_shaders_py}"
+                    --shaders-json "${LIGHT_RHI_SHADER_SHADERS_JSON}"
+                    --output-dir   "${LIGHT_RHI_SHADER_OUTPUT_DIR}"
+                    --slangc       "${SLANGC}"
+                    --backend      "${_backend}"
+                    --only-source  "${_shader_source}"
+                    ${_include_dir_args}
+                    ${_define_args}
+                    ${_metal_sdk_args}
+            DEPENDS "${LIGHT_RHI_SHADER_SHADERS_JSON}" "${_manifest_dir}/${_shader_source}" ${_include_dir_headers}
+                    "${_compile_shaders_py}"
+            COMMENT "Slang -> ${_backend}: ${_library}${_extension}"
+            VERBATIM
+        )
+        list(APPEND _artifacts "${_shader_out}")
+    endforeach()
 
     if(LIGHT_RHI_SHADER_NAME_PREFIX)
         set(_shader_target "${LIGHT_RHI_SHADER_NAME_PREFIX}_shaders")
@@ -176,6 +226,10 @@ function(light_rhi_compile_shaders)
     endif()
     add_custom_target("${_shader_target}" DEPENDS ${_artifacts})
     add_dependencies("${LIGHT_RHI_SHADER_TARGET}" "${_shader_target}")
+    # Which target builds each library, so light_rhi_ship_shaders can wait for it from any directory.
+    foreach(_artifact IN LISTS _artifacts)
+        set_property(GLOBAL PROPERTY "_LIGHT_RHI_BUILT_BY:${_artifact}" "${_shader_target}")
+    endforeach()
 
     if(LIGHT_RHI_SHADER_ARTIFACTS_VAR)
         set("${LIGHT_RHI_SHADER_ARTIFACTS_VAR}" "${_artifacts}" PARENT_SCOPE)
@@ -189,4 +243,52 @@ function(light_rhi_compile_shaders)
     if(LIGHT_RHI_SHADER_FORMAT_VAR)
         set("${LIGHT_RHI_SHADER_FORMAT_VAR}" "${_format}" PARENT_SCOPE)
     endif()
+endfunction()
+
+# Put compiled shader libraries where an application finds them at run time.
+#
+#   light_rhi_ship_shaders(
+#       TARGET    my_app                        # an executable
+#       ARTIFACTS ${artifacts}                  # from light_rhi_compile_shaders(ARTIFACTS_VAR ...)
+#       [DIRECTORY shaders])                    # the folder name, "shaders" by default
+#
+# The libraries are copied into DIRECTORY beside the executable, or into the bundle's resources
+# for an Apple app bundle (Contents/Resources on macOS, the bundle root on iOS) - where SDL's
+# SDL_GetBasePath(), NSBundle's resourcePath and a plain executable-relative path all look. The
+# copy is refreshed on every build of TARGET, so an edited shader never runs stale. Install rules
+# stay with the application, which knows its own layout.
+function(light_rhi_ship_shaders)
+    cmake_parse_arguments(SHIP "" "TARGET;DIRECTORY" "ARTIFACTS" ${ARGN})
+    foreach(_required TARGET ARTIFACTS)
+        if(NOT SHIP_${_required})
+            message(FATAL_ERROR "light_rhi_ship_shaders requires ${_required}")
+        endif()
+    endforeach()
+    if(NOT SHIP_DIRECTORY)
+        set(SHIP_DIRECTORY shaders)
+    endif()
+
+    get_target_property(_bundle "${SHIP_TARGET}" MACOSX_BUNDLE)
+    if(_bundle AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(_destination "$<TARGET_BUNDLE_CONTENT_DIR:${SHIP_TARGET}>/Resources/${SHIP_DIRECTORY}")
+    elseif(_bundle)
+        set(_destination "$<TARGET_BUNDLE_DIR:${SHIP_TARGET}>/${SHIP_DIRECTORY}")
+    else()
+        set(_destination "$<TARGET_FILE_DIR:${SHIP_TARGET}>/${SHIP_DIRECTORY}")
+    endif()
+
+    set(_copy_target "${SHIP_TARGET}_ship_shaders")
+    add_custom_target("${_copy_target}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_destination}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${SHIP_ARTIFACTS} "${_destination}"
+        COMMENT "Ship shader libraries with ${SHIP_TARGET}"
+        VERBATIM)
+    foreach(_artifact IN LISTS SHIP_ARTIFACTS)
+        get_property(_built_by GLOBAL PROPERTY "_LIGHT_RHI_BUILT_BY:${_artifact}")
+        if(NOT _built_by)
+            message(FATAL_ERROR "light_rhi_ship_shaders: ${_artifact} was not compiled by light_rhi_compile_shaders")
+        endif()
+        add_dependencies("${_copy_target}" "${_built_by}")
+    endforeach()
+    add_dependencies("${SHIP_TARGET}" "${_copy_target}")
 endfunction()

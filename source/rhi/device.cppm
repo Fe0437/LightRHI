@@ -1,6 +1,8 @@
 /**
  * {file} device.cppm
- * {brief} Defines the backend-neutral device lifecycle and synchronized access contract.
+ * {brief} Defines the backend-neutral device lifecycle contract.
+ *
+ * Sharing one device across threads is built on top of it, in sharedDevice.cppm.
  */
 module;
 #include <concepts>
@@ -8,7 +10,6 @@ module;
 #include <cstdint>
 #include <expected>
 #include <memory>
-#include <mutex>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -28,7 +29,6 @@ import :raytracing;
 
 export namespace rhi
 {
-
     /**
      * {brief} Describes an optional dependency for one command-list submission.
      *
@@ -455,7 +455,7 @@ export namespace rhi
         template <std::ranges::contiguous_range Range>
         requires std::ranges::sized_range<Range> && std::is_trivially_copyable_v<std::ranges::range_value_t<Range>> &&
                  (!std::convertible_to<Range, std::span<const std::byte>>)
-        void UploadBuffer(BufferHandle dst, Range &&data, uint64_t dstOffset = 0)
+        void UploadBuffer(BufferHandle dst, const Range &data, uint64_t dstOffset = 0)
         {
             UploadBuffer(dst, std::as_bytes(std::span{std::ranges::data(data), std::ranges::size(data)}), dstOffset);
         }
@@ -483,122 +483,11 @@ export namespace rhi
         template <std::ranges::contiguous_range Range>
         requires std::ranges::sized_range<Range> && std::is_trivially_copyable_v<std::ranges::range_value_t<Range>> &&
                  (!std::convertible_to<Range, std::span<const std::byte>>)
-        void UploadTexture(TextureHandle dst, Range &&data, uint64_t rowPitch, uint64_t slicePitch,
+        void UploadTexture(TextureHandle dst, const Range &data, uint64_t rowPitch, uint64_t slicePitch,
                            const TextureCopyRegion &region)
         {
             UploadTexture(dst, std::as_bytes(std::span{std::ranges::data(data), std::ranges::size(data)}), rowPitch,
                           slicePitch, region);
         }
     };
-
-    /**
-     * {brief} Serializes access to an owned IDevice for callers that share it across threads.
-     *
-     * Keep the object returned by Synchronize() in the narrowest practical scope;
-     * it holds exclusive access until destroyed.
-     *
-     * ```cpp
-     * SharedDevice device = rhi::AcquireSharedDevice(desc);
-     * {
-     *     auto lockedDevice{device->Synchronize()};
-     *     lockedDevice->WaitIdle();
-     * }
-     * ```
-     */
-    class SynchronizedDevice
-    {
-      public:
-        /** {brief} Scoped exclusive access to a SynchronizedDevice's IDevice. */
-        class StrictLockPtr
-        {
-          public:
-            /** {brief} Locks `mutex` and exposes `device` until this object is destroyed. */
-            StrictLockPtr(IDevice &device, std::mutex &mutex) : _device{device}, _lock{mutex} {}
-
-            /** {brief} Returns the locked device. */
-            [[nodiscard]] IDevice &operator*() const noexcept
-            {
-                return _device;
-            }
-            /** {brief} Provides member access to the locked device. */
-            [[nodiscard]] IDevice *operator->() const noexcept
-            {
-                return &_device;
-            }
-
-          private:
-            IDevice                     &_device;
-            std::unique_lock<std::mutex> _lock{};
-        };
-
-        /** {brief} Takes ownership of `device` and records the descriptor used to create it. */
-        SynchronizedDevice(std::unique_ptr<IDevice> device, const DeviceDesc &desc)
-            : _device{std::move(device)}, _desc{desc}
-        {
-        }
-
-        /** {brief} Acquires exclusive device access for the lifetime of the returned guard. */
-        [[nodiscard]] StrictLockPtr Synchronize()
-        {
-            return StrictLockPtr{*_device, _mutex};
-        }
-
-        /**
-         * {brief} Returns the immutable descriptor used to create the device.
-         * {note} This accessor does not require Synchronize().
-         */
-        [[nodiscard]] const DeviceDesc &Desc() const noexcept
-        {
-            return _desc;
-        }
-
-      private:
-        std::unique_ptr<IDevice> _device{};
-        std::mutex               _mutex{};
-        DeviceDesc               _desc{};
-    };
-
-    /** {brief} Shared ownership of the process-wide synchronized device. */
-    using SharedDevice = std::shared_ptr<SynchronizedDevice>;
-
-    /** {brief} Backend factory accepted by the backend-neutral AcquireSharedDevice() helper. */
-    using DeviceFactory = std::expected<std::unique_ptr<IDevice>, DeviceError> (*)(const DeviceDesc &);
-
-    /**
-     * {brief} Acquires the process-wide device, creating it through `factory` on first use.
-     *
-     * Subsequent calls while the device is alive return the same object and must
-     * request matching validation settings.
-     * {returns} Shared ownership of the synchronized device.
-     */
-    [[nodiscard]] inline std::expected<SharedDevice, DeviceError> AcquireSharedDevice(const DeviceDesc &desc,
-                                                                                      DeviceFactory     factory)
-    {
-        static std::mutex                        mutex{};
-        static std::weak_ptr<SynchronizedDevice> weakDevice{};
-
-        const std::scoped_lock lock{mutex};
-
-        if (const SharedDevice device{weakDevice.lock()})
-        {
-            if (device->Desc().EnableValidation != desc.EnableValidation ||
-                device->Desc().EnableGpuValidation != desc.EnableGpuValidation)
-            {
-                // Two parts of one process asking for different validation settings cannot both be
-                // served by one device, and neither could act on a null: the settings have to agree.
-                FailContract("a shared device already exists with different validation settings");
-            }
-            return device;
-        }
-
-        auto created{factory(desc)};
-        if (!created)
-        {
-            return std::unexpected{created.error()};
-        }
-        auto device{std::make_shared<SynchronizedDevice>(std::move(*created), desc)};
-        weakDevice = device;
-        return device;
-    }
-
 } // namespace rhi

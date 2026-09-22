@@ -1,4 +1,9 @@
+/**
+ * {file}
+ * {brief} Acceleration structures, their instances, and how they are built.
+ */
 module;
+#include "flag_enum.h"
 #include <cstdint>
 #include <string_view>
 #include <utility> // std::to_underlying
@@ -40,7 +45,7 @@ export namespace rhi
     // Bit flags. The width is chosen for the flags this may still gain, not for the ones it
     // has today, so shrinking it to fit the current set would cap the type.
     // NOLINTNEXTLINE(performance-enum-size)
-    enum class AccelerationStructureInstanceFlags : uint32_t
+    enum class LIGHT_RHI_FLAG_ENUM AccelerationStructureInstanceFlags : uint32_t
     {
         None                          = 0,      ///< Uses the geometry's default culling and opacity.
         TriangleCullDisable           = 1U << 0U, ///< Makes both triangle faces visible to ray queries.
@@ -60,7 +65,12 @@ export namespace rhi
     struct AccelerationStructureInstance
     {
         AccelerationStructureHandle Blas{}; ///< Live BLAS referenced by this instance.
-        /** {brief} Row-major 3x4 object-to-world transform. */
+        /**
+         * {brief} Row-major 3x4 object-to-world transform.
+         * {note} A C array on purpose: it is the layout of VkTransformMatrixKHR::matrix and Metal's
+         * packed instance transform, and callers fill it by copying their own 3x4 matrix in.
+         */
+        // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
         float Transform[3][4]{
             {1.F, 0.F, 0.F, 0.F},
             {0.F, 1.F, 0.F, 0.F},

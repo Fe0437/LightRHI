@@ -39,6 +39,9 @@ HeaderFileExtensions: ['', h, hh, hpp, hxx]
 ImplementationFileExtensions: [c, cc, cpp, cppm, cxx]
 
 CheckOptions:
+  # Handles, timeline points and mapped views are plain aggregates whose data is the interface; a
+  # member function beside that data (Valid(), As<T>()) does not make them classes with invariants.
+  misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: true
   # Repository naming policy.
   readability-identifier-naming.NamespaceCase: lower_case
   readability-identifier-naming.InlineNamespaceCase: lower_case

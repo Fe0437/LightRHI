@@ -7,9 +7,12 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -156,6 +159,34 @@ TEST(gpu_address_offset)
     auto            shifted{base.Offset(256)};
     REQUIRE(shifted.Address == 1256);
     REQUIRE(shifted.Valid());
+}
+
+TEST(shader_library_refuses_bad_sizes)
+{
+    // A library's size is checked before anything is allocated for it: an empty file and one
+    // beyond the bound are refused, and one exactly at the bound is read.
+    std::error_code error;
+    const auto      directory{std::filesystem::temp_directory_path(error) / "lightrhi_shader_library_test"};
+    std::filesystem::create_directories(directory, error);
+    const auto write{[&](const char *name, const std::size_t bytes)
+                     {
+                         const auto              path{directory / name};
+                         std::ofstream           file{path, std::ios::binary};
+                         const std::vector<char> contents(bytes, 'x');
+                         file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+                         return path.string();
+                     }};
+
+    const auto missing{rhi::ShaderLibrary::Read((directory / "missing.spv").string(), rhi::ShaderFormat::Spirv)};
+    REQUIRE(!missing && missing.error() == rhi::ShaderArtifactError::NotFound);
+    const auto empty{rhi::ShaderLibrary::Read(write("empty.spv", 0), rhi::ShaderFormat::Spirv)};
+    REQUIRE(!empty && empty.error() == rhi::ShaderArtifactError::InvalidSize);
+    const auto oversized{rhi::ShaderLibrary::Read(write("large.spv", 64), rhi::ShaderFormat::Spirv, 32)};
+    REQUIRE(!oversized && oversized.error() == rhi::ShaderArtifactError::InvalidSize);
+    const auto atBound{rhi::ShaderLibrary::Read(write("bound.spv", 32), rhi::ShaderFormat::Spirv, 32)};
+    REQUIRE(atBound.has_value());
+
+    std::filesystem::remove_all(directory, error);
 }
 
 TEST(texture_convenience_constructors)
@@ -401,6 +432,66 @@ TEST(buffer_upload_readback)
     device->DestroyBuffer(src);
     device->DestroyBuffer(readback);
     std::printf("  upload+readback: %u bytes verified\n", kSize);
+}
+
+// ---------------------------------------------------------------------------
+// A command list recorded again after its submission completed runs the new recording, as
+// Begin() promises, so a caller can keep one list per in-flight slot instead of creating one per
+// submission.
+// ---------------------------------------------------------------------------
+TEST(command_list_records_again_after_completion)
+{
+    auto device{rhitest::Required(rhi::CreateDevice({}))};
+
+    constexpr uint32_t kSize{64};
+    auto               first{rhitest::Required(device->CreateBuffer({
+        .Size       = kSize,
+        .Usage      = rhi::BufferUsage::TransferSrc | rhi::BufferUsage::TransferDst,
+        .MemoryType = rhi::MemoryType::GpuOnly,
+        .DebugName  = "reuse_first",
+    }))};
+    auto               second{rhitest::Required(device->CreateBuffer({
+        .Size       = kSize,
+        .Usage      = rhi::BufferUsage::TransferSrc | rhi::BufferUsage::TransferDst,
+        .MemoryType = rhi::MemoryType::GpuOnly,
+        .DebugName  = "reuse_second",
+    }))};
+    uint8_t            ones[kSize];
+    uint8_t            twos[kSize];
+    std::memset(ones, 1, kSize);
+    std::memset(twos, 2, kSize);
+    device->UploadBuffer(first, ones);
+    device->UploadBuffer(second, twos);
+    auto readback{rhitest::Required(device->CreateBuffer({
+        .Size       = kSize,
+        .Usage      = rhi::BufferUsage::TransferDst,
+        .MemoryType = rhi::MemoryType::GpuToCpu,
+        .DebugName  = "reuse_readback",
+    }))};
+
+    auto cmd{rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "reuse_cmd"))};
+    for (const rhi::BufferHandle source : {first, second, first})
+    {
+        cmd->Begin();
+        cmd->CopyBuffer(source, readback, {.SrcOffset = 0, .DstOffset = 0, .Size = kSize});
+        cmd->End();
+        device->WaitForFence(device->Submit(*cmd));
+
+        auto mapped{device->MapBuffer(readback)};
+        REQUIRE(mapped.Data != nullptr);
+        const uint8_t expected{source == first ? uint8_t{1} : uint8_t{2}};
+        const auto   *bytes{static_cast<const uint8_t *>(mapped.Data)};
+        for (uint32_t i{0}; i < kSize; ++i)
+        {
+            REQUIRE(bytes[i] == expected);
+        }
+        device->UnmapBuffer(readback);
+    }
+
+    device->DestroyBuffer(first);
+    device->DestroyBuffer(second);
+    device->DestroyBuffer(readback);
+    std::printf("  command list recorded three times, each recording ran\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1656,6 +1747,7 @@ int main()
     test_sampler_presets_are_valid();
     test_blend_presets();
     test_gpu_address_offset();
+    test_shader_library_refuses_bad_sizes();
     test_texture_convenience_constructors();
 
     std::printf("\n── Device tests ────────────────────────────────\n");
@@ -1668,6 +1760,7 @@ int main()
 
     std::printf("\n── Integration tests ───────────────────────────\n");
     test_buffer_upload_readback();
+    test_command_list_records_again_after_completion();
     test_large_buffer_upload_readback();
     test_slot_pool_stress();
     test_compute_fill_via_bda();

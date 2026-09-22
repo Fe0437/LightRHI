@@ -1,20 +1,20 @@
+/**
+ * {file}
+ * {brief} Loads the examples' compiled shader libraries.
+ *
+ * The examples author shaders once in Slang, as .slang files in examples/<name>/shaders/, and
+ * light_rhi_compile_shaders() compiles them for the active backend. This helper reads them from
+ * RHI_EXAMPLE_SHADER_DIR with the backend's rhi::ReadShaderLibrary.
+ */
 #pragma once
-// example_shader_loader.h — loads Slang-compiled shader artifacts for examples.
-//
-// The examples author shaders once in Slang (examples/<name>/shaders/*.slang)
-// and the build compiles them to the active backend's format via
-// tools/compile_shaders.py (Slang -> SPIR-V for Vulkan, Slang -> MSL for
-// Metal). This helper reads the resulting .spv / .metal file from
-// RHI_EXAMPLE_SHADER_DIR and hands it to the RHI through the public
-// rhi::ToShaderDesc() path — the same artifact flow the tests use.
 
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifndef RHI_EXAMPLE_SHADER_DIR
@@ -30,62 +30,30 @@ namespace rhiexample
         std::fprintf(stderr, "[example] %s\n", message.c_str());
         std::exit(1);
     }
-    inline std::vector<std::byte> readShaderArtifactBytes(const std::string &path)
-    {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            failArtifact("[example] failed to open shader artifact: " + path);
-        }
 
-        const std::streamsize size{file.tellg()};
-        file.seekg(0);
-
-        std::vector<std::byte> bytes(static_cast<size_t>(size));
-        if (size > 0 && !file.read(reinterpret_cast<char *>(bytes.data()), size))
-        {
-            failArtifact("[example] failed to read shader artifact: " + path);
-        }
-        return bytes;
-    }
-
-    // Loads the artifact for `name` (as declared in the example's
-    // shaders_registry.generated.json) for the backend this binary was built
-    // for. Bytes are cached for the process lifetime so the ShaderDesc's
-    // non-owning spans stay valid.
-    inline rhi::ShaderDesc loadShaderArtifact(const std::string &name, [[maybe_unused]] std::string_view entryPoint,
+    // Describes `entryPoint` in the library compiled from `library`.slang. Each library
+    // is read once and kept for the process, so the ShaderDesc's view stays valid.
+    inline rhi::ShaderDesc loadShaderArtifact(std::string_view library, std::string_view entryPoint,
                                               rhi::ShaderStage stage)
     {
-        static std::unordered_map<std::string, std::vector<std::byte>> cache;
+        static std::unordered_map<std::string, rhi::ShaderLibrary> cache{};
 
-#if defined(RHI_BACKEND_METAL)
-        const std::string       path{std::string(RHI_EXAMPLE_SHADER_DIR) + "/metal/" + name + ".generated.metal"};
-        const rhi::ShaderFormat format{rhi::ShaderFormat::MslSource};
-        const std::string_view  backendEntryPoint{entryPoint};
-#elif defined(RHI_BACKEND_VULKAN)
-        const std::string       path{std::string(RHI_EXAMPLE_SHADER_DIR) + "/vulkan/" + name + ".generated.spv"};
-        const rhi::ShaderFormat format{rhi::ShaderFormat::Spirv};
-        const std::string_view  backendEntryPoint{"main"};
-#else
-#error "loadShaderArtifact: no RHI_BACKEND_METAL / RHI_BACKEND_VULKAN defined"
-#endif
-
-        auto [it, inserted]{cache.try_emplace(name)};
-        if (inserted)
+        std::string name{library};
+        auto        found{cache.find(name)};
+        if (found == cache.end())
         {
-            it->second = readShaderArtifactBytes(path);
+            auto read{rhi::ReadShaderLibrary(RHI_EXAMPLE_SHADER_DIR, library)};
+            if (!read)
+            {
+                failArtifact("shader library not found or unreadable: " + name);
+            }
+            found = cache.emplace(std::move(name), std::move(*read)).first;
         }
-        const auto             &bytes{it->second};
-        rhi::ShaderArtifactView artifact{
-            .Format     = format,
-            .Stage      = stage,
-            .EntryPoint = backendEntryPoint,
-            .Data       = bytes,
-        };
-        auto desc{rhi::ToShaderDesc(artifact)};
+
+        auto desc{found->second.Describe(entryPoint, stage)};
         if (!desc)
         {
-            failArtifact("[example] ToShaderDesc failed for shader artifact: " + path);
+            failArtifact("cannot describe " + std::string{entryPoint} + " in shader library " + found->first);
         }
         return *desc;
     }

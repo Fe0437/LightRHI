@@ -16,7 +16,7 @@
                     "name": {
                         "type": "string",
                         "pattern": "^[A-Za-z0-9_]+$",
-                        "description": "Output artifact stem: <name>.generated.spv / <name>.generated.metal"
+                        "description": "Stable identity of this entry point, <source>_<entryPoint>; the library it compiles into is named after its source file"
                     },
                     "source": {
                         "type": "string",

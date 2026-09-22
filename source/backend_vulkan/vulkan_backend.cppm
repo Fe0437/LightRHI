@@ -17,6 +17,7 @@
  */
 
 module;
+#include <string_view>
 #include "vulkan_platform.h"
 
 #include <concepts>
@@ -29,6 +30,16 @@ export import rhi; // re-exports all rhi types and interfaces to consumers
 
 export namespace rhi
 {
+
+    /**
+     * {brief} Reads the shader library compiled from `library`.slang out of `directory`.
+     * {param directory} Where the application's shader libraries were shipped.
+     * {param library} The shader source's name, without extension.
+     * {returns} The library, or NotFound / Unreadable.
+     * {note} A `.spv` module holding every entry point.
+     */
+    [[nodiscard]] std::expected<ShaderLibrary, ShaderArtifactError> ReadShaderLibrary(std::string_view directory,
+                                                                                     std::string_view library);
 
     /**
      * {brief} Creates an independently owned Vulkan device.

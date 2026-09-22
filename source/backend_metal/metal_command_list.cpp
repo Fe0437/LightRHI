@@ -58,32 +58,35 @@ namespace rhi::metal
     // Helpers — bytes per pixel (used for CopyBufferToTexture row-pitch calculation)
     // ============================================================================
 
-    static uint64_t bytesPerPixel(Format f) noexcept
+    namespace
     {
-        switch (f)
+        [[nodiscard]] uint64_t BytesPerPixel(Format f) noexcept
         {
-            case Format::R8Unorm:
-                return 1;
-            case Format::RG8Unorm:
-                return 2;
-            case Format::RGBA8Unorm:
-            case Format::RGBA8Srgb:
-            case Format::BGRA8Unorm:
-            case Format::BGRA8Srgb:
-            case Format::R32Float:
-            case Format::R32Uint:
-            case Format::D32Float:
-            case Format::D16Unorm:
-                return 4;
-            case Format::RG32Float:
-            case Format::RGBA16Float:
-                return 8;
-            case Format::RGBA32Float:
-                return 16;
-            default:
-                return 4; // safe fallback
+            switch (f)
+            {
+                case Format::R8Unorm:
+                    return 1;
+                case Format::RG8Unorm:
+                    return 2;
+                case Format::RGBA8Unorm:
+                case Format::RGBA8Srgb:
+                case Format::BGRA8Unorm:
+                case Format::BGRA8Srgb:
+                case Format::R32Float:
+                case Format::R32Uint:
+                case Format::D32Float:
+                case Format::D16Unorm:
+                    return 4;
+                case Format::RG32Float:
+                case Format::RGBA16Float:
+                    return 8;
+                case Format::RGBA32Float:
+                    return 16;
+                default:
+                    return 4; // safe fallback
+            }
         }
-    }
+    } // namespace
 
     // ============================================================================
     // MetalCommandList
@@ -137,7 +140,7 @@ namespace rhi::metal
                 }
             }
             NS::Error *err{nullptr};
-            auto       argTable{adoptCreated(device.MtlDevice().newArgumentTable(tableDesc.get(), &err),
+            auto       argTable{AdoptCreated(device.MtlDevice().newArgumentTable(tableDesc.get(), &err),
                                              "MTLDevice::newArgumentTable refused the table", err)};
             if (!argTable)
             {
@@ -155,7 +158,7 @@ namespace rhi::metal
                                                       std::move(*argTable), *firstBlock, queueType, debugName);
         }
 
-        MetalCommandList(ConstructionToken, MetalDevice &device, MetalCommandResources &&resources,
+        MetalCommandList(ConstructionToken /*unused*/, MetalDevice &device, MetalCommandResources resources,
                          NS::SharedPtr<MTL4::ArgumentTable> argTable, BufferHandle firstPushConstantBlock,
                          QueueType queueType, std::string_view debugName)
             : _device{device}, _allocator{std::move(resources.Allocator)}, _cmd{std::move(resources.CommandBuffer)},
@@ -170,15 +173,19 @@ namespace rhi::metal
             _cmd->beginCommandBuffer(_allocator.get());
         }
 
+        MetalCommandList(const MetalCommandList &)            = delete;
+        MetalCommandList(MetalCommandList &&)                 = delete;
+        MetalCommandList &operator=(const MetalCommandList &) = delete;
+        MetalCommandList &operator=(MetalCommandList &&)      = delete;
         ~MetalCommandList() override
         {
             _endActiveEncoder();
             _endCommandBuffer();
             for (const BufferHandle block : _pushConstantBlocks)
             {
-                _device.DestroyBuffer(block);
+                _device.get().DestroyBuffer(block);
             }
-            _device.RecycleCommandResources(MetalCommandResources{
+            _device.get().RecycleCommandResources(MetalCommandResources{
                 .Allocator       = std::move(_allocator),
                 .CommandBuffer   = std::move(_cmd),
                 .CompletionFence = _completionFence,
@@ -188,7 +195,30 @@ namespace rhi::metal
         // ---- Lifecycle ----
 
         void Begin() override
-        { /* MTL4::CommandBuffer is opened (beginCommandBuffer) immediately after creation */
+        {
+            // A new list's command buffer is opened when it is created. Beginning a list whose last
+            // recording ended reopens it: the caller waited for that submission, so its allocator
+            // and root-data blocks are free to reuse, and nothing has to be created again.
+            if (!_cmdEnded)
+            {
+                return;
+            }
+            for (const BufferHandle block : std::span{_pushConstantBlocks}.subspan(1))
+            {
+                _device.get().DestroyBuffer(block);
+            }
+            _pushConstantBlocks.resize(1);
+            _pushConstantCursor              = 0;
+            _encoder                         = std::monostate{};
+            _presentTarget                   = {};
+            _pendingAfterStages              = {};
+            _pendingBeforeStages             = {};
+            _barrierPending                  = false;
+            _pendingBarrierConsumesPriorPass = false;
+            _indexBuffer                     = {};
+            _allocator->reset();
+            _cmd->beginCommandBuffer(_allocator.get());
+            _cmdEnded = false;
         }
         void End() override
         {
@@ -205,9 +235,9 @@ namespace rhi::metal
         }
 
         /** The target a recorded present named, cleared as it is taken. */
-        [[nodiscard]] IFramePresenter *takeRecordedPresentTarget() noexcept
+        [[nodiscard]] IFramePresenter *TakeRecordedPresentTarget() noexcept
         {
-            return _device.ResolveExternalTextureProvider(
+            return _device.get().ResolveExternalTextureProvider(
                 std::exchange(_presentTarget, ExternalTextureProviderHandle{}));
         }
 
@@ -323,33 +353,33 @@ namespace rhi::metal
             {
                 return;
             }
-            auto &p{_device.Pipeline(handle)};
-            if (p.isCompute)
+            auto &p{_device.get().Pipeline(handle)};
+            if (p.IsCompute)
             {
                 auto &compute{_computeEncoder()};
-                if (auto *label{p.computePso->label()})
+                if (auto *label{p.ComputePso->label()})
                 {
                     compute.setLabel(label);
                 }
-                compute.setComputePipelineState(p.computePso.get());
-                _tgX = p.threadGroupSizeX;
-                _tgY = p.threadGroupSizeY;
-                _tgZ = p.threadGroupSizeZ;
+                compute.setComputePipelineState(p.ComputePso.get());
+                _tgX = p.ThreadGroupSizeX;
+                _tgY = p.ThreadGroupSizeY;
+                _tgZ = p.ThreadGroupSizeZ;
             }
             else
             {
                 auto &render{_renderEncoder("SetPipeline(graphics)")};
-                render.setRenderPipelineState(p.renderPso.get());
-                if (p.depthStencilState)
+                render.setRenderPipelineState(p.RenderPso.get());
+                if (p.DepthStencilState)
                 {
-                    render.setDepthStencilState(p.depthStencilState.get());
+                    render.setDepthStencilState(p.DepthStencilState.get());
                 }
-                render.setFrontFacingWinding(p.winding);
-                render.setCullMode(p.cullMode);
-                render.setTriangleFillMode(p.fillMode);
-                if (p.depthBiasConstant != 0.F || p.depthBiasSlope != 0.F)
+                render.setFrontFacingWinding(p.Winding);
+                render.setCullMode(p.CullMode);
+                render.setTriangleFillMode(p.FillMode);
+                if (p.DepthBiasConstant != 0.F || p.DepthBiasSlope != 0.F)
                 {
-                    render.setDepthBias(p.depthBiasConstant, p.depthBiasSlope, 0.F);
+                    render.setDepthBias(p.DepthBiasConstant, p.DepthBiasSlope, 0.F);
                 }
             }
         }
@@ -362,7 +392,7 @@ namespace rhi::metal
             {
                 return;
             }
-            _argTable->setTexture(_device.Texture(texture).texture->gpuResourceID(), index);
+            _argTable->setTexture(_device.get().Texture(texture).Texture->gpuResourceID(), index);
         }
 
         void BindSampler(SamplerHandle sampler, uint32_t index) override
@@ -371,7 +401,7 @@ namespace rhi::metal
             {
                 return;
             }
-            _argTable->setSamplerState(_device.Sampler(sampler).state->gpuResourceID(), index);
+            _argTable->setSamplerState(_device.get().Sampler(sampler).State->gpuResourceID(), index);
         }
 
         // ---- Push constants ----
@@ -395,26 +425,27 @@ namespace rhi::metal
                 _pushConstantCursor = 0;
             }
 
-            const std::span<std::byte> slice{_device.MapBuffer(_pushConstantBlocks.back())
-                                                 .Bytes()
-                                                 .subspan(_pushConstantCursor, kPushConstantSliceSize)};
+            const std::span<std::byte> block{_device.get().MapBuffer(_pushConstantBlocks.back()).Bytes()};
+            const std::span<std::byte> slice{block.subspan(_pushConstantCursor, kPushConstantSliceSize)};
             // A caller may update part of the root data and expect the rest to stand, so a new
             // slice starts as a copy of the one in force before it.
             if (_pushConstantCursor > 0)
             {
-                std::memcpy(slice.data(), slice.data() - kPushConstantSliceSize, kPushConstantSliceSize);
+                const std::span<const std::byte> current{
+                    block.subspan(_pushConstantCursor - kPushConstantSliceSize, kPushConstantSliceSize)};
+                std::memcpy(slice.data(), current.data(), kPushConstantSliceSize);
             }
             else if (_pushConstantBlocks.size() > 1)
             {
-                const std::span<std::byte> previous{
-                    _device.MapBuffer(_pushConstantBlocks[_pushConstantBlocks.size() - 2])
-                        .Bytes()
-                        .last(kPushConstantSliceSize)};
+                const std::span<std::byte> previous{_device.get()
+                                                        .MapBuffer(_pushConstantBlocks[_pushConstantBlocks.size() - 2])
+                                                        .Bytes()
+                                                        .last(kPushConstantSliceSize)};
                 std::memcpy(slice.data(), previous.data(), kPushConstantSliceSize);
             }
-            std::memcpy(slice.data() + offset, data.data(), data.size_bytes());
+            std::memcpy(slice.subspan(offset).data(), data.data(), data.size_bytes());
 
-            _argTable->setAddress(_device.BufferAddress(_pushConstantBlocks.back()).Address + _pushConstantCursor,
+            _argTable->setAddress(_device.get().BufferAddress(_pushConstantBlocks.back()).Address + _pushConstantCursor,
                                   kPushConstantSlot);
             _pushConstantCursor += kPushConstantSliceSize;
         }
@@ -441,9 +472,9 @@ namespace rhi::metal
         {
             const uint32_t stride{_indexType == IndexType::Uint16 ? 2U : 4U};
             auto           idxType{_indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32};
-            const auto     indexStart{_indexOffset + static_cast<uint64_t>(firstIndex) * stride};
-            const MTL::GPUAddress addr{_device.BufferAddress(_indexBuffer).Address + indexStart};
-            auto                  len{static_cast<NS::UInteger>(_device.GetBufferInfo(_indexBuffer).Size - indexStart)};
+            const auto     indexStart{_indexOffset + (static_cast<uint64_t>(firstIndex) * stride)};
+            const MTL::GPUAddress addr{_device.get().BufferAddress(_indexBuffer).Address + indexStart};
+            auto len{static_cast<NS::UInteger>(_device.get().GetBufferInfo(_indexBuffer).Size - indexStart)};
             _renderEncoder("DrawIndexed")
                 .drawIndexedPrimitives(_primitiveType, indexCount, idxType, addr, len, instanceCount, vertexOffset,
                                        static_cast<NS::UInteger>(firstInstance));
@@ -452,11 +483,11 @@ namespace rhi::metal
         void DrawIndirect(BufferHandle argsBuffer, uint64_t argsOffset, uint32_t drawCount,
                           uint32_t /*stride*/) override
         {
-            const auto base{_device.BufferAddress(argsBuffer).Address};
+            const auto base{_device.get().BufferAddress(argsBuffer).Address};
             auto      &render{_renderEncoder("DrawIndirect")};
             for (uint32_t i{0}; i < drawCount; ++i)
             {
-                render.drawPrimitives(_primitiveType, base + argsOffset + i * sizeof(DrawIndirectArgs));
+                render.drawPrimitives(_primitiveType, base + argsOffset + (i * sizeof(DrawIndirectArgs)));
             }
         }
 
@@ -464,18 +495,19 @@ namespace rhi::metal
                                  uint32_t /*stride*/) override
         {
             auto idxType{_indexType == IndexType::Uint16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32};
-            const MTL::GPUAddress idxAddr{_device.BufferAddress(_indexBuffer).Address + _indexOffset};
-            auto       idxLen{static_cast<NS::UInteger>(_device.GetBufferInfo(_indexBuffer).Size - _indexOffset)};
-            const auto argBase{_device.BufferAddress(argsBuffer).Address};
+            const MTL::GPUAddress idxAddr{_device.get().BufferAddress(_indexBuffer).Address + _indexOffset};
+            auto       idxLen{static_cast<NS::UInteger>(_device.get().GetBufferInfo(_indexBuffer).Size - _indexOffset)};
+            const auto argBase{_device.get().BufferAddress(argsBuffer).Address};
             auto      &render{_renderEncoder("DrawIndexedIndirect")};
             for (uint32_t i{0}; i < drawCount; ++i)
             {
                 render.drawIndexedPrimitives(_primitiveType, idxType, idxAddr, idxLen,
-                                             argBase + argsOffset + i * sizeof(DrawIndexedIndirectArgs));
+                                             argBase + argsOffset + (i * sizeof(DrawIndexedIndirectArgs)));
             }
         }
 
-        void DrawIndirectCount(BufferHandle, uint64_t, BufferHandle, uint64_t, uint32_t, uint32_t) override
+        void DrawIndirectCount(BufferHandle /*argsBuffer*/, uint64_t /*argsOffset*/, BufferHandle /*countBuffer*/,
+                               uint64_t /*countOffset*/, uint32_t /*maxDrawCount*/, uint32_t /*stride*/) override
         {
             // True GPU-driven multi-draw needs MTLIndirectCommandBuffer.
             // Not implemented; use DrawIndirect with a fixed draw count.
@@ -490,7 +522,7 @@ namespace rhi::metal
 
         void DispatchIndirect(BufferHandle argsBuffer, uint64_t argsOffset) override
         {
-            const MTL::GPUAddress addr{_device.BufferAddress(argsBuffer).Address + argsOffset};
+            const MTL::GPUAddress addr{_device.get().BufferAddress(argsBuffer).Address + argsOffset};
             _computeEncoder().dispatchThreadgroups(addr, MTL::Size::Make(_tgX, _tgY, _tgZ));
         }
 
@@ -511,9 +543,9 @@ namespace rhi::metal
             // buffer written host-side) only need to stay alive until that
             // wait returns, not until this command list's own Submit().
             std::vector<NS::SharedPtr<NS::Object>> keepAlive{};
-            auto descriptor{_device.MakeAccelerationStructureDescriptor(desc, keepAlive)};
+            auto descriptor{_device.get().MakeAccelerationStructureDescriptor(desc, keepAlive)};
 
-            auto *legacyCmd{_device.LegacyQueue().commandBuffer()};
+            auto *legacyCmd{_device.get().LegacyQueue().commandBuffer()};
             auto *enc{legacyCmd->accelerationStructureCommandEncoder()};
             if (!desc.DebugName.empty())
             {
@@ -521,16 +553,16 @@ namespace rhi::metal
                 legacyCmd->setLabel(label);
                 enc->setLabel(label);
             }
-            enc->buildAccelerationStructure(_device.AccelStruct(handle).as.get(), descriptor.get(),
+            enc->buildAccelerationStructure(_device.get().AccelStruct(handle).As.get(), descriptor.get(),
                                             &_lookupBuffer(scratchBuffer), scratchOffset);
             enc->endEncoding();
 
             // Suspended around the synchronous cross-queue wait below — see
             // SuspendActiveCaptureScope's doc comment in metal_internal.h.
-            _device.SuspendActiveCaptureScope();
+            _device.get().SuspendActiveCaptureScope();
             legacyCmd->commit();
             legacyCmd->waitUntilCompleted();
-            _device.ResumeActiveCaptureScope();
+            _device.get().ResumeActiveCaptureScope();
         }
 
         // ---- Copy ----
@@ -559,8 +591,8 @@ namespace rhi::metal
         void CopyBufferToTexture(BufferHandle src, uint64_t srcOffset, TextureHandle dst,
                                  const TextureCopyRegion &region) override
         {
-            auto          &t{_device.Texture(dst)};
-            const uint64_t bpp{bytesPerPixel(t.desc.Format)};
+            auto          &t{_device.get().Texture(dst)};
+            const uint64_t bpp{BytesPerPixel(t.Desc.Format)};
             const uint64_t rowP{bpp * region.Extent.Width};
             const uint64_t sliceP{rowP * region.Extent.Height};
             _computeEncoder().copyFromBuffer(
@@ -575,8 +607,8 @@ namespace rhi::metal
         void CopyTextureToBuffer(TextureHandle src, const TextureCopyRegion &region, BufferHandle dst,
                                  uint64_t dstOffset) override
         {
-            auto          &t{_device.Texture(src)};
-            const uint64_t bpp{bytesPerPixel(t.desc.Format)};
+            auto          &t{_device.get().Texture(src)};
+            const uint64_t bpp{BytesPerPixel(t.Desc.Format)};
             const uint64_t rowP{bpp * region.Extent.Width};
             const uint64_t sliceP{rowP * region.Extent.Height};
             _computeEncoder().copyFromTexture(
@@ -622,19 +654,19 @@ namespace rhi::metal
             // fillBuffer fills with a single byte value. For multi-byte
             // fill, a compute kernel is needed; we use the low byte for now.
             _computeEncoder().fillBuffer(&_lookupBuffer(buf), NS::Range::Make(offset, size),
-                                         static_cast<uint8_t>(value & 0xFF));
+                                         static_cast<uint8_t>(value & 0xFFU));
         }
 
         void WriteComputeTimestamp(TimestampQueryPoolHandle pool, uint32_t index) override
         {
-            const auto &record{_device.TimestampQueryPool(pool)};
-            assert(index < record.count);
-            _computeEncoder().writeTimestamp(MTL4::TimestampGranularityPrecise, record.heap.get(), index);
+            const auto &record{_device.get().TimestampQueryPool(pool)};
+            assert(index < record.Count);
+            _computeEncoder().writeTimestamp(MTL4::TimestampGranularityPrecise, record.Heap.get(), index);
         }
 
         // ---- Debug ----
 
-        void BeginDebugGroup(std::string_view name, float, float, float) override
+        void BeginDebugGroup(std::string_view name, float /*r*/, float /*g*/, float /*b*/) override
         {
             auto *ns{MakeLabel(name)};
             _pushDebugGroup(ns);
@@ -661,7 +693,7 @@ namespace rhi::metal
                 return;
             }
             _checkDebugBufferSlot(unusedBindingSlot);
-            _argTable->setAddress(_device.BufferAddress(buffer).Address, unusedBindingSlot);
+            _argTable->setAddress(_device.get().BufferAddress(buffer).Address, unusedBindingSlot);
         }
 
         void DebugExposeAccelerationStructure(AccelerationStructureHandle accelerationStructure,
@@ -672,7 +704,8 @@ namespace rhi::metal
                 return;
             }
             _checkDebugBufferSlot(unusedBindingSlot);
-            _argTable->setResource(_device.AccelStruct(accelerationStructure).as->gpuResourceID(), unusedBindingSlot);
+            _argTable->setResource(_device.get().AccelStruct(accelerationStructure).As->gpuResourceID(),
+                                   unusedBindingSlot);
         }
 
         void DebugExposeTexture(TextureHandle texture, uint32_t unusedBindingSlot) override
@@ -686,21 +719,21 @@ namespace rhi::metal
                 FailContract("DebugExposeTexture: binding slot " + std::to_string(unusedBindingSlot) +
                              " is out of range (max " + std::to_string(kMaxTextureBinds) + ")");
             }
-            _argTable->setTexture(_device.Texture(texture).texture->gpuResourceID(), unusedBindingSlot);
+            _argTable->setTexture(_device.get().Texture(texture).Texture->gpuResourceID(), unusedBindingSlot);
         }
 
         // ---- Internal accessor for MetalDevice::Submit ----
-        [[nodiscard]] MTL4::CommandBuffer *commandBuffer() const noexcept
+        [[nodiscard]] MTL4::CommandBuffer *CommandBuffer() const noexcept
         {
             return _cmd.get();
         }
 
-        [[nodiscard]] std::string_view debugName() const noexcept
+        [[nodiscard]] std::string_view DebugName() const noexcept
         {
             return _debugName;
         }
 
-        void setCompletionFence(FenceHandle fence) noexcept
+        void SetCompletionFence(FenceHandle fence) noexcept
         {
             _completionFence = fence;
         }
@@ -724,7 +757,7 @@ namespace rhi::metal
         using RenderEncoder  = NS::SharedPtr<MTL4::RenderCommandEncoder>;
         using ComputeEncoder = NS::SharedPtr<MTL4::ComputeCommandEncoder>;
 
-        MetalDevice                          &_device;
+        std::reference_wrapper<MetalDevice>   _device; ///< The device that created this list; outlives it.
         NS::SharedPtr<MTL4::CommandAllocator> _allocator{};
         NS::SharedPtr<MTL4::CommandBuffer>    _cmd{};
         NS::SharedPtr<MTL4::ArgumentTable>    _argTable{};
@@ -943,7 +976,7 @@ namespace rhi::metal
             {
                 FailContract("a command was recorded against an invalid buffer handle");
             }
-            return *_device.Buffer(h).buffer.get();
+            return *_device.get().Buffer(h).Buffer.get();
         }
 
         [[nodiscard]] MTL::Texture &_lookupTexture(TextureHandle h) const
@@ -952,7 +985,7 @@ namespace rhi::metal
             {
                 FailContract("a command was recorded against an invalid texture handle");
             }
-            return *_device.Texture(h).texture.get();
+            return *_device.get().Texture(h).Texture.get();
         }
 
         // ---- Debug helpers ----
@@ -963,7 +996,7 @@ namespace rhi::metal
         // out-of-range slot silently no-op'd the debug exposure in
         // non-assert builds with no signal. Thrown instead so a bad slot is
         // loud in every build configuration.
-        void _checkDebugBufferSlot(uint32_t slot) const
+        static void _checkDebugBufferSlot(uint32_t slot)
         {
             if (slot >= kPushConstantSlot)
             {
@@ -1039,26 +1072,28 @@ namespace rhi::metal
 
     FenceHandle MetalDevice::Submit(ICommandList &cmdList, const SubmitDesc & /*desc*/)
     {
-        auto                      &mcl{static_cast<MetalCommandList &>(cmdList)};
-        FenceHandle                fence{NextFence()};
-        MTL4::CommandBuffer *const buffers[1]{mcl.commandBuffer()};
-        auto                      *captureScope{SubmissionCaptureScope(mcl.debugName())};
-        if (captureScope)
+        // A device only receives command lists it created, and the build has no RTTI to check it.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        auto                                            &mcl{static_cast<MetalCommandList &>(cmdList)};
+        FenceHandle                                      fence{NextFence()};
+        const std::array<const MTL4::CommandBuffer *, 1> buffers{mcl.CommandBuffer()};
+        auto                                            *captureScope{SubmissionCaptureScope(mcl.DebugName())};
+        if (captureScope != nullptr)
         {
             captureScope->beginScope();
         }
-        Mtl4Queue().commit(buffers, 1);
+        Mtl4Queue().commit(buffers.data(), buffers.size());
         Mtl4Queue().signalEvent(&TimelineEvent(), fence.Id);
-        mcl.setCompletionFence(fence);
+        mcl.SetCompletionFence(fence);
 
         // A recorded present is shown by the submission that drew it: Metal 4 orders that on the
         // queue, so it belongs here, after the commit and before this call returns.
-        if (auto *target{mcl.takeRecordedPresentTarget()})
+        if (auto *target{mcl.TakeRecordedPresentTarget()})
         {
             target->PresentHeldFrame();
         }
 
-        if (captureScope)
+        if (captureScope != nullptr)
         {
             captureScope->endScope();
         }

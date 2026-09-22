@@ -28,7 +28,7 @@ Two targets exist because `LightRHI` (the interface) can be used as a submodule 
 
 ### `rhi` — the public interface
 
-A primary module with nine partitions, all re-exported from the root unit:
+A primary module whose partitions are all re-exported from the root unit. The main ones:
 
 ```
 rhi
@@ -40,7 +40,8 @@ rhi
 ├── :resources    — TextureView, BufferInfo, DrawIndirect/Dispatch arg structs
 ├── :bindless     — IBindlessHeap, BindlessLimits
 ├── :commandList  — ICommandList (pure virtual)
-└── :device       — IDevice (pure virtual), SubmitDesc
+├── :device       — IDevice (pure virtual), SubmitDesc
+└── :sharedDevice — SynchronizedDevice, SharedDevice, AcquireSharedDevice
 ```
 
 The `rhi` partitions are an implementation detail — consumers never import them directly.
@@ -268,20 +269,24 @@ Shaders are authored in [Slang](https://shader-slang.com) and compiled at build 
 > - Targets reference: [Compilation Targets](https://shader-slang.com/slang/user-guide/compiling.html#compilation-targets)
 
 ```
-shader.slang  ──slangc -target metal──►  shader.metal (MSL text)
-              ──slangc -target spirv──►  shader.spv   (SPIR-V binary)
+shader.slang  ──slangc -target metal──►  shader.metal ──xcrun metal/metallib──►  shader.metallib
+              ──slangc -target spirv──►  shader.spv   (SPIR-V, entry points keep their source names)
 ```
 
-The CMake helper `light_rhi_compile_shaders(...)` (defined in `cmake/Shaders.cmake`) reads a `shaders_registry.generated.json` manifest and invokes `tools/compile_shaders.py` once per shader entry. Outputs are backend-specific artifact files:
+The CMake helper `light_rhi_compile_shaders(...)` (defined in `cmake/Shaders.cmake`) reads a `shaders_registry.generated.json` manifest and compiles each `.slang` file into **one library holding every entry point it declares**, in the backend's own container - the same model as a Metal library or a multi-entry SPIR-V module:
 
 ```
-<output-dir>/metal/<name>.generated.metal
-<output-dir>/vulkan/<name>.generated.spv
+<output-dir>/<source>.metallib   Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MetalLib (default with an Apple toolchain)
+<output-dir>/<source>.metal      Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MslSource (compiled by the device at startup)
+<output-dir>/<source>.spv        Vulkan
 ```
 
-The RHI core does not invoke Slang and does not embed shader source into C++. Runtime or test code loads artifact bytes and converts them to `ShaderDesc` through `ShaderArtifactView` and `toShaderDesc()`. For Metal development builds, `ShaderDesc::MslSource` is populated with MSL text and the backend JIT-compiles it via [`MTLDevice::newLibraryWithSource`](https://developer.apple.com/documentation/metal/mtldevice/newlibrary_with_source_options_completionhandler_). For Vulkan, `ShaderDesc::Spirv` is populated with SPIR-V words.
+A `.metallib` is compiled for the SDK the build targets (`macosx`, `iphoneos`, `iphonesimulator`, ...), so an iOS build ships an iOS library; the MSL and AIR it went through stay under `<output-dir>/intermediate/`.
 
-> For production use, pre-compiling to `.metallib` with `xcrun metal` + `xcrun metallib` avoids the runtime MSL compilation cost. The `ShaderDesc::Metallib` field accepts pre-compiled `.metallib` bytes for this purpose.
+The RHI core does not invoke Slang, and shader libraries are never turned into C++ source. An application ships them as files:
+
+- `light_rhi_ship_shaders(TARGET app ARTIFACTS ...)` copies the libraries into a `shaders` folder beside the executable, or into the bundle's resources for an Apple app bundle, refreshed on every build.
+- `rhi::ReadShaderLibrary(folder, library)` reads one library back, and `ShaderLibrary::Describe(entryPoint, stage)` describes the function wanted from it; keep the library while any `ShaderDesc` made from it is used. Each backend module implements `ReadShaderLibrary` for its own files, so the backend-neutral interface names no file extension and no format a backend chose. A new backend adds its reader beside its device.
 
 ### Binding layout
 
