@@ -5,7 +5,7 @@ include_guard(GLOBAL)
 # One backend is selected per platform, so a change to the other one is not compiled where it was
 # written and only fails somewhere else. This makes that impossible: every development build also
 # syntax-checks the inactive backend's translation units against the same `rhi` module, with the
-# same standard, dialect and warnings the real build uses. It is incremental - a stamp per unit,
+# same standard, dialect, warnings and switches the real build uses. It is incremental - a stamp per unit,
 # rebuilt only when that unit or the module changes - and it is off for shipping builds, which
 # compile only what they ship.
 #
@@ -72,6 +72,9 @@ function(light_rhi_check_inactive_backend)
         -isystem "${volk_SOURCE_DIR}"
         -isystem "${vulkanmemoryallocator_SOURCE_DIR}/include"
         -I "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+        # The module was built with these, and parts of it exist only under them.
+        "-DDEBUG_ENABLED=$<BOOL:${DEBUG_ENABLED}>"
+        "-DMETRICS_ENABLED=$<BOOL:${METRICS_ENABLED}>"
         ${_module_flags})
     if(APPLE AND CMAKE_OSX_SYSROOT)
         list(APPEND _flags -isysroot "${CMAKE_OSX_SYSROOT}")

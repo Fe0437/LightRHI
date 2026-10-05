@@ -56,6 +56,7 @@ export namespace rhi
      * {brief} Lends out the textures of `layer`, so `device` can draw them and show them.
      * {param device} The device that will draw into them; it outlives the provider.
      * {param layer} Stays the caller's, and must outlive the provider.
+     * {param timing} When a presented frame may reach the screen.
      * {param requestedFormat} Undefined takes the device's preferred format.
      * {returns} Exclusive ownership of the provider, or InvalidArgument when the layer is unusable.
      * {note} One device serves as many providers as an application has layers.
@@ -64,7 +65,8 @@ export namespace rhi
      */
     [[nodiscard]] std::expected<std::unique_ptr<IExternalTextureProvider>, DeviceError>
     CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner,
-                                  Format requestedFormat = Format::Undefined);
+                                  Format        requestedFormat = Format::Undefined,
+                                  PresentTiming timing          = PresentTiming::OnRefresh);
 
     /**
      * {brief} What a caller must obtain from the device before making the platform object.

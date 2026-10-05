@@ -53,6 +53,7 @@ export namespace rhi
      * {param device} The device that will draw into it; it outlives the target.
      * {param textureSource} Asked for a surface while the target is made; the target takes it and
      * destroys it, so destroy the target before the window the surface came from.
+     * {param timing} When a presented frame may reach the screen.
      * {param requestedFormat} Undefined takes the surface's own preferred format.
      * {returns} Exclusive ownership of the target, or InvalidArgument when no surface came back.
      * {note} Which window system that surface belongs to is not asked and does not matter: a
@@ -60,7 +61,8 @@ export namespace rhi
      */
     [[nodiscard]] std::expected<std::unique_ptr<IExternalTextureProvider>, DeviceError>
     CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner,
-                                  Format requestedFormat = Format::Undefined);
+                                  Format        requestedFormat = Format::Undefined,
+                                  PresentTiming timing          = PresentTiming::OnRefresh);
 
     /**
      * {brief} What a caller must obtain from the device before making the platform object.

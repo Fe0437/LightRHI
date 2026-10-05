@@ -20,8 +20,10 @@
  */
 module;
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <span>
 
 export module rhi:externalTextures;
 
@@ -30,6 +32,29 @@ import :types;
 
 export namespace rhi
 {
+#if METRICS_ENABLED
+    /**
+     * {brief} What became of one presented frame: when it reached the screen, or that it never did.
+     *
+     * Compiled only with METRICS_ENABLED, like {apiref} IExternalTextureProvider::TakeShownFrames.
+     *
+     * ```cpp
+     * std::array<rhi::ShownFrame, 16> shown{};
+     * for (const auto &frame : std::span{shown}.first(provider.TakeShownFrames(shown)))
+     * {
+     *     if (frame.ShownNanoseconds != 0) { latency.Add(frame.ShownNanoseconds - presentedAt[frame.Present]); }
+     * }
+     * ```
+     */
+    struct ShownFrame
+    {
+        std::uint64_t Present{}; ///< Which present: 1 for the provider's first, then one more for each.
+        /// When it reached the screen, in nanoseconds of the process's `std::chrono::steady_clock`;
+        /// zero when a newer frame replaced it before the screen took it.
+        std::uint64_t ShownNanoseconds{};
+    };
+#endif // METRICS_ENABLED
+
     /** {brief} Why a provider has no texture to give. */
     enum class ExternalTextureError : std::uint8_t
     {
@@ -51,6 +76,25 @@ export namespace rhi
     struct ExternalTextureOwner
     {
         void *Value{}; ///< The owner, as the toolkit that made it returns it.
+    };
+
+    /**
+     * {brief} When a presented frame may reach the screen.
+     *
+     * Neither choice ever tears. `OnRefresh` queues every frame for its own refresh, so a frame
+     * presented while others wait is shown only after them. `AsSoonAsReady` lets the newest frame
+     * replace any that is still waiting, which keeps what is on screen closest to the latest input;
+     * a drawing surface wants this. Where a platform cannot do it, `OnRefresh` is used instead.
+     *
+     * ```cpp
+     * auto provider{rhi::CreateExternalTextureProvider(device, owner, rhi::Format::Undefined,
+     *                                                  rhi::PresentTiming::AsSoonAsReady)};
+     * ```
+     */
+    enum class PresentTiming : uint8_t
+    {
+        OnRefresh,     ///< Every frame waits for its own display refresh, in order.
+        AsSoonAsReady, ///< The newest finished frame is shown at the next refresh; older ones are skipped.
     };
 
     /**
@@ -155,6 +199,23 @@ export namespace rhi
          * and no backend has to recover a concrete type from a base it was handed.
          */
         [[nodiscard]] virtual ExternalTextureProviderHandle Handle() const noexcept = 0;
+
+#if METRICS_ENABLED
+        /**
+         * {brief} Hands over what became of presented frames since the last call, oldest first.
+         *
+         * Compiled only with METRICS_ENABLED: it exists to measure, so a shipping build neither
+         * records nor offers it.
+         * A frame's fate is known only once the platform reports it, a refresh or two after its
+         * present, so this answers for earlier presents than the latest. Call it often: at most a
+         * fixed number of fates are kept, and the oldest are dropped first.
+         * {param frames} Receives the fates; the number written is returned.
+         * {returns} How many were written. Always zero where the platform cannot tell when a frame
+         * reached the screen, as on Vulkan without a display-timing extension.
+         * {note} Safe to call from the thread that presents while the platform reports from another.
+         */
+        [[nodiscard]] virtual std::size_t TakeShownFrames(std::span<ShownFrame> frames) noexcept = 0;
+#endif // METRICS_ENABLED
 
       protected:
         IExternalTextureProvider() = default;

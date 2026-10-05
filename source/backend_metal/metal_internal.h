@@ -28,11 +28,13 @@
 // Metal.hpp already brought in.
 // Every standard header this file needs must already be included by each including TU's
 // global module fragment (see the note above): <expected> and <map> are pulled in there.
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -643,8 +645,12 @@ namespace rhi::metal
     class MetalPresentingTextureProvider final : public IExternalTextureProvider, public IFramePresenter
     {
       public:
-        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer,
-                                       Format format) noexcept;
+        /**
+         * {param paced} Take drawables from the layer's display link, one per refresh, instead of
+         * asking the layer; ignored where CAMetalDisplayLink does not exist.
+         */
+        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer, Format format,
+                                       bool paced) noexcept;
         MetalPresentingTextureProvider(const MetalPresentingTextureProvider &)            = delete;
         MetalPresentingTextureProvider(MetalPresentingTextureProvider &&)                 = delete;
         MetalPresentingTextureProvider &operator=(const MetalPresentingTextureProvider &) = delete;
@@ -655,20 +661,48 @@ namespace rhi::metal
         [[nodiscard]] Format                                             TextureFormat() const noexcept override;
         [[nodiscard]] std::expected<TextureHandle, ExternalTextureError> NextTexture() override;
         [[nodiscard]] ExternalTextureProviderHandle                      Handle() const noexcept override;
+#if METRICS_ENABLED
+        [[nodiscard]] std::size_t TakeShownFrames(std::span<ShownFrame> frames) noexcept override;
+#endif
 
         // IFramePresenter
         void PresentHeldFrame() override;
 
+#if METRICS_ENABLED
+        /**
+         * {brief} Fates the platform reported, waiting to be taken; shared with the presented
+         * handlers, which may run after this provider is gone.
+         */
+        struct ShownFrames
+        {
+            std::mutex                 Lock;
+            std::array<ShownFrame, 64> Fates{};
+            std::size_t                First{};
+            std::size_t                Count{};
+        };
+#endif // METRICS_ENABLED
+
       private:
+        /** Waits for the held drawable on the queue and names its texture for this frame. */
+        [[nodiscard]] std::expected<TextureHandle, ExternalTextureError> _adoptHeldDrawable(Extent2D extent);
         /** The layer's current size, which is what a new drawable will be. */
         [[nodiscard]] Extent2D _layerExtent() const noexcept;
 
         MetalDevice                     &_device;
         NS::SharedPtr<CA::MetalLayer>    _layer{};
         NS::SharedPtr<CA::MetalDrawable> _drawable{}; ///< Held between NextTexture() and the present.
-        TextureHandle                    _texture{};  ///< The drawable's texture, named for this frame only.
-        Format                           _format{Format::Undefined};
-        ExternalTextureProviderHandle    _handle{}; ///< What a recorded present names this target by.
+        /// Frames presented and not yet on screen. Shared with the presented handlers, which may run
+        /// after this provider is gone.
+        std::shared_ptr<std::atomic<uint32_t>> _framesWaiting{std::make_shared<std::atomic<uint32_t>>(0U)};
+#if METRICS_ENABLED
+        std::shared_ptr<ShownFrames> _shown{std::make_shared<ShownFrames>()};
+        uint64_t                     _presents{}; ///< Presents made so far.
+#endif
+        /// The layer's display link, which hands over a drawable once per refresh; 0 when unpaced.
+        std::uintptr_t                _pacer{};
+        TextureHandle                 _texture{}; ///< The drawable's texture, named for this frame only.
+        Format                        _format{Format::Undefined};
+        ExternalTextureProviderHandle _handle{}; ///< What a recorded present names this target by.
     };
 
 } // namespace rhi::metal

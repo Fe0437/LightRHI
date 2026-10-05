@@ -75,6 +75,14 @@ if(NOT DEFINED DEBUG_ENABLED)
     endif()
     option(DEBUG_ENABLED "Enable LightRHI debug-only host and shader facilities" ${_light_rhi_debug_default})
 endif()
+# What LightRHI measures for its caller, such as when a presented frame reached the screen. A
+# shipping build leaves it out. A debug build always measures too; a parent project's choice wins.
+if(NOT DEFINED METRICS_ENABLED)
+    option(METRICS_ENABLED "Compile what LightRHI measures for its caller" ${DEBUG_ENABLED})
+endif()
+if(DEBUG_ENABLED AND NOT METRICS_ENABLED)
+    set(METRICS_ENABLED ON CACHE BOOL "Compile what LightRHI measures for its caller" FORCE)
+endif()
 
 # -------------------------------------------------------------------
 # External dependencies (platform-specific)
@@ -112,7 +120,9 @@ target_compile_options(LightRHI PUBLIC
     $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 target_compile_definitions(LightRHI PUBLIC
     $<$<BOOL:${DEBUG_ENABLED}>:DEBUG_ENABLED=1>
-    $<$<NOT:$<BOOL:${DEBUG_ENABLED}>>:DEBUG_ENABLED=0>)
+    $<$<NOT:$<BOOL:${DEBUG_ENABLED}>>:DEBUG_ENABLED=0>
+    $<$<BOOL:${METRICS_ENABLED}>:METRICS_ENABLED=1>
+    $<$<NOT:$<BOOL:${METRICS_ENABLED}>>:METRICS_ENABLED=0>)
 target_include_directories(LightRHI PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shaders>)
 
@@ -211,6 +221,30 @@ endif()
 # Metal backend  (macOS)
 # -------------------------------------------------------------------
 if(LIGHT_RHI_BACKEND STREQUAL "Metal")
+    # CAMetalDisplayLink, which paces a surface to the display, exists only in Objective-C and
+    # Swift. A small Swift library reaches it and exposes plain functions to the C++ backend.
+    if(POLICY CMP0157)
+        cmake_policy(SET CMP0157 NEW) # compile and link Swift as separate steps
+    endif()
+    enable_language(Swift)
+    execute_process(
+        COMMAND xcrun swiftc -print-target-info
+        OUTPUT_VARIABLE _light_rhi_swift_target_info
+        COMMAND_ERROR_IS_FATAL ANY)
+    string(JSON _light_rhi_swift_resource_path GET "${_light_rhi_swift_target_info}" paths runtimeResourcePath)
+    set(_light_rhi_swift_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${_light_rhi_swift_generated_dir}")
+    file(GLOB _light_rhi_swift_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_metal/*.swift")
+    add_library(LightRHIMetalDisplayLink STATIC ${_light_rhi_swift_sources})
+    set_target_properties(LightRHIMetalDisplayLink PROPERTIES
+        Swift_MODULE_NAME LightRHIMetalDisplayLink
+        Swift_MODULE_DIRECTORY "${_light_rhi_swift_generated_dir}")
+    target_compile_options(LightRHIMetalDisplayLink PRIVATE
+        -cxx-interoperability-mode=default
+        "SHELL:-Xfrontend -clang-header-expose-decls=has-expose-attr"
+        -emit-objc-header-path "${_light_rhi_swift_generated_dir}/LightRHIMetalDisplayLink-Swift.h")
+    target_link_libraries(LightRHIMetalDisplayLink PRIVATE "-framework QuartzCore")
+
     add_library(LightRHIBackend SHARED)
     add_library(LightRHI::Backend ALIAS LightRHIBackend)
     if(WIN32)
@@ -247,10 +281,17 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
         PUBLIC  LightRHI::LightRHI
         PRIVATE
             metal-cpp::metal-cpp
+            LightRHIMetalDisplayLink
             ${METAL_FRAMEWORK}
             ${FOUNDATION_FRAMEWORK}
             ${QUARTZCORE_FRAMEWORK}
     )
+    add_dependencies(LightRHIBackend LightRHIMetalDisplayLink)
+    # The generated header, and the Swift runtime headers it includes.
+    target_include_directories(LightRHIBackend SYSTEM PRIVATE
+        "${_light_rhi_swift_generated_dir}" "${_light_rhi_swift_resource_path}")
+    set_source_files_properties(${_mtl_sources} PROPERTIES OBJECT_DEPENDS
+        "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}LightRHIMetalDisplayLink${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
     # LightRHIBackend.dylib looks for LightRHI.dylib in the same directory at runtime
     set_target_properties(LightRHIBackend PROPERTIES

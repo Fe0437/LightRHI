@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -748,13 +749,17 @@ namespace rhi::vulkan
     {
       public:
         VulkanPresentingTextureProvider(VulkanDevice &device, VkInstance instance, VkSurfaceKHR surface,
-                            Format requestedFormat) noexcept;
+                                        Format requestedFormat, PresentTiming timing) noexcept;
         ~VulkanPresentingTextureProvider() override;
 
         // IExternalTextureProvider
         [[nodiscard]] Format                                     TextureFormat() const noexcept override;
         [[nodiscard]] std::expected<TextureHandle, ExternalTextureError> NextTexture() override;
         [[nodiscard]] ExternalTextureProviderHandle                        Handle() const noexcept override;
+#if METRICS_ENABLED
+        /** Vulkan reports when a frame reached the screen only through extensions this does not use. */
+        [[nodiscard]] std::size_t TakeShownFrames(std::span<ShownFrame> frames) noexcept override;
+#endif
 
         // IFramePresenter
         [[nodiscard]] FenceHandle SubmitAndPresentHeldFrame(ICommandList &cmd, const SubmitDesc &desc) override;
@@ -762,6 +767,8 @@ namespace rhi::vulkan
       private:
         /** The surface's current size, which is what a new chain will be built at. */
         [[nodiscard]] Extent2D _surfaceExtent() const noexcept;
+        /** The mode `_timing` asks for when the surface offers it, otherwise FIFO. */
+        [[nodiscard]] VkPresentModeKHR _presentMode() const;
         /** Builds a chain for the surface's current size, retiring the previous one. */
         [[nodiscard]] bool _createSwapchain();
         /** Destroys the per-image views and semaphores, leaving the chain handle to its retirer. */
@@ -784,6 +791,7 @@ namespace rhi::vulkan
         TextureHandle            _texture{};
         Format                   _format{Format::Undefined};
         Format                   _requestedFormat{Format::Undefined};
+        PresentTiming                      _timing{PresentTiming::OnRefresh};
         ExternalTextureProviderHandle      _handle{}; ///< What a recorded present names this target by.
     };
 

@@ -218,7 +218,8 @@ namespace rhi
     }
 
     std::expected<std::unique_ptr<IExternalTextureProvider>, DeviceError>
-    CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner, Format requestedFormat)
+    CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner, Format requestedFormat,
+                                  PresentTiming timing)
     {
         // The one cast, written where the type is known: this build is the Vulkan one, so the
         // platform object a caller can have obtained is a VkSurfaceKHR and nothing else.
@@ -244,7 +245,8 @@ namespace rhi
             return std::unexpected{DeviceError::Unsupported};
         }
 
-        return std::make_unique<vulkan::VulkanPresentingTextureProvider>(vulkanDevice, instance, surface, requestedFormat);
+        return std::make_unique<vulkan::VulkanPresentingTextureProvider>(vulkanDevice, instance, surface,
+                                                                         requestedFormat, timing);
     }
 
     std::expected<SharedDevice, DeviceError> AcquireSharedDevice(const DeviceDesc &desc)
@@ -1511,17 +1513,39 @@ namespace rhi::vulkan
     // rest of the API can name it, while the chain keeps the image and its view.
     // ============================================================================
 
-    VulkanPresentingTextureProvider::VulkanPresentingTextureProvider(VulkanDevice &device, VkInstance instance, VkSurfaceKHR surface,
-                                             Format requestedFormat) noexcept
-        : _device{device}, _instance{instance}, _surface{surface}, _requestedFormat{requestedFormat},
+    VulkanPresentingTextureProvider::VulkanPresentingTextureProvider(VulkanDevice &device, VkInstance instance,
+                                                                     VkSurfaceKHR surface, Format requestedFormat,
+                                                                     PresentTiming timing) noexcept
+        : _device{device}, _instance{instance}, _surface{surface}, _requestedFormat{requestedFormat}, _timing{timing},
           _handle{device.RegisterExternalTextureProvider(*this)}
     {
+    }
+
+    VkPresentModeKHR VulkanPresentingTextureProvider::_presentMode() const
+    {
+        if (_timing != PresentTiming::AsSoonAsReady)
+        {
+            return VK_PRESENT_MODE_FIFO_KHR;
+        }
+        uint32_t count{0};
+        vkGetPhysicalDeviceSurfacePresentModesKHR(_device.NativePhysicalDevice(), _surface, &count, nullptr);
+        std::vector<VkPresentModeKHR> modes(count);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(_device.NativePhysicalDevice(), _surface, &count, modes.data());
+        const bool mailbox{std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()};
+        return mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
     }
 
     ExternalTextureProviderHandle VulkanPresentingTextureProvider::Handle() const noexcept
     {
         return _handle;
     }
+
+#if METRICS_ENABLED
+    std::size_t VulkanPresentingTextureProvider::TakeShownFrames(std::span<ShownFrame> /*frames*/) noexcept
+    {
+        return 0;
+    }
+#endif
 
     ExternalTextureProviderHandle VulkanDevice::RegisterExternalTextureProvider(IFramePresenter &target)
     {
@@ -1645,9 +1669,9 @@ namespace rhi::vulkan
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform     = caps.currentTransform,
             .compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            // FIFO is the only mode every implementation must support and the only one that never
-            // tears. Choosing between modes is frame pacing, which belongs to the application.
-            .presentMode  = VK_PRESENT_MODE_FIFO_KHR,
+            // FIFO is the only mode every implementation must support; MAILBOX, when asked for and
+            // offered, also never tears but lets the newest frame replace one still waiting.
+            .presentMode  = _presentMode(),
             .clipped      = VK_TRUE,
             .oldSwapchain = previous,
         };
@@ -1782,8 +1806,10 @@ namespace rhi::vulkan
 
         const VkSemaphore acquireSemaphore{_acquireSemaphores[_frameSlot]};
         uint32_t          imageIndex{0};
-        const VkResult    result{vkAcquireNextImageKHR(_device.NativeDevice(), _swapchain, UINT64_MAX, acquireSemaphore,
-                                                       VK_NULL_HANDLE, &imageIndex)};
+        // No wait: when every image is still queued for the display, VK_NOT_READY comes back at once
+        // and the caller retries later, instead of blocking its thread for a refresh.
+        const VkResult result{vkAcquireNextImageKHR(_device.NativeDevice(), _swapchain, 0U, acquireSemaphore,
+                                                    VK_NULL_HANDLE, &imageIndex)};
         if (result == VK_ERROR_DEVICE_LOST)
         {
             _device.MarkDeviceLost();

@@ -20,16 +20,20 @@ module;
 // Metal.hpp only forward-declares MTL4::AccelerationStructureDescriptor
 // (via MTL4ComputeCommandEncoder.hpp) — pull in the concrete MTL4 AS
 // descriptor/geometry types here, in the global module fragment.
+#include "LightRHIMetalDisplayLink-Swift.h"
+
 #include <Metal/MTL4AccelerationStructure.hpp>
 #include <QuartzCore/QuartzCore.hpp>
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <dispatch/dispatch.h>
 #include <expected>
 #include <functional>
+#include <mach/mach_time.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -65,7 +69,8 @@ namespace rhi
     }
 
     std::expected<std::unique_ptr<IExternalTextureProvider>, DeviceError>
-    CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner, Format requestedFormat)
+    CreateExternalTextureProvider(IDevice &device, ExternalTextureOwner owner, Format requestedFormat,
+                                  PresentTiming timing)
     {
         // The one cast, written where the type is known: this build is the Metal one, so the
         // platform object a caller can have obtained is a CAMetalLayer and nothing else.
@@ -86,6 +91,9 @@ namespace rhi
         // never its size.
         layer->setDevice(&metalDevice.MtlDevice());
         layer->setPixelFormat(metal::MetalDevice::ExternalTexturePixelFormat(format));
+        // Without display sync the window server takes the newest finished frame at its next
+        // composite, instead of showing every frame on its own refresh in order.
+        layer->setDisplaySyncEnabled(timing == PresentTiming::OnRefresh);
         // A surface texture is a texture like any other, so it has to accept every use a texture
         // accepts. A drawable is a colour attachment and nothing else until this is cleared, which
         // would refuse a copy into it - the cost is that Core Animation keeps the pixels readable
@@ -97,7 +105,9 @@ namespace rhi
             metalDevice.Mtl4Queue().addResidencySet(layerResidency);
         }
 
-        return std::make_unique<metal::MetalPresentingTextureProvider>(metalDevice, std::move(layer), format);
+        // Showing the newest state at each refresh is what a display link is for.
+        return std::make_unique<metal::MetalPresentingTextureProvider>(metalDevice, std::move(layer), format,
+                                                                       timing == PresentTiming::AsSoonAsReady);
     }
 
     std::expected<SharedDevice, DeviceError> AcquireSharedDevice(const DeviceDesc &desc)
@@ -572,11 +582,15 @@ namespace rhi::metal
     // ============================================================================
 
     MetalPresentingTextureProvider::MetalPresentingTextureProvider(MetalDevice                  &device,
-                                                                   NS::SharedPtr<CA::MetalLayer> layer,
-                                                                   Format                        format) noexcept
+                                                                   NS::SharedPtr<CA::MetalLayer> layer, Format format,
+                                                                   const bool paced) noexcept
         : _device{device}, _layer{std::move(layer)}, _format{format},
           _handle{device.RegisterExternalTextureProvider(*this)}
     {
+        if (paced)
+        {
+            _pacer = LightRHIMetalDisplayLink::createMetalDisplayPacer(_layer.get());
+        }
     }
 
     MetalPresentingTextureProvider::~MetalPresentingTextureProvider()
@@ -584,6 +598,10 @@ namespace rhi::metal
         // Unregistered first: a present recorded against this handle must not resolve to a target
         // that is already giving its frame back.
         _device.UnregisterExternalTextureProvider(_handle);
+        if (_pacer != 0U)
+        {
+            LightRHIMetalDisplayLink::destroyMetalDisplayPacer(_pacer);
+        }
         // A frame taken and never shown still owns a texture slot and a drawable.
         if (_texture.Valid())
         {
@@ -600,6 +618,58 @@ namespace rhi::metal
     {
         return _handle;
     }
+
+#if METRICS_ENABLED
+    namespace
+    {
+        /**
+         * {brief} Keep one presented frame's fate, reported on whatever thread Core Animation uses.
+         *
+         * `presentedTime` counts seconds on the host clock Core Animation uses, which is not the
+         * steady clock callers measure with; both are read now, so the time is moved across exactly.
+         * Zero means the frame was replaced before the screen took it.
+         */
+        void RecordShown(MetalPresentingTextureProvider::ShownFrames &shown, const uint64_t present,
+                         const double presentedSeconds) noexcept
+        {
+            uint64_t shownNanoseconds{};
+            if (presentedSeconds > 0.0)
+            {
+                mach_timebase_info_data_t timebase{};
+                mach_timebase_info(&timebase);
+                const double hostNow{static_cast<double>(mach_absolute_time()) * timebase.numer / timebase.denom *
+                                     1e-9};
+                const auto   steadyNow{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count()};
+                const double ago{std::max(0.0, hostNow - presentedSeconds)};
+                shownNanoseconds = static_cast<uint64_t>(steadyNow) - static_cast<uint64_t>(ago * 1e9);
+            }
+            const std::scoped_lock lock{shown.Lock};
+            if (shown.Count == shown.Fates.size())
+            {
+                shown.First = (shown.First + 1U) % shown.Fates.size(); // the oldest goes first
+                --shown.Count;
+            }
+            shown.Fates.at((shown.First + shown.Count) % shown.Fates.size()) =
+                ShownFrame{.Present = present, .ShownNanoseconds = shownNanoseconds};
+            ++shown.Count;
+        }
+    } // namespace
+
+    std::size_t MetalPresentingTextureProvider::TakeShownFrames(const std::span<ShownFrame> frames) noexcept
+    {
+        const std::scoped_lock lock{_shown->Lock};
+        const std::size_t      taken{std::min(frames.size(), _shown->Count)};
+        for (std::size_t index{}; index < taken; ++index)
+        {
+            frames[index] = _shown->Fates.at((_shown->First + index) % _shown->Fates.size());
+        }
+        _shown->First = (_shown->First + taken) % _shown->Fates.size();
+        _shown->Count -= taken;
+        return taken;
+    }
+#endif // METRICS_ENABLED
 
     ExternalTextureProviderHandle MetalDevice::RegisterExternalTextureProvider(IFramePresenter &target)
     {
@@ -651,6 +721,30 @@ namespace rhi::metal
             return std::unexpected{ExternalTextureError::Unavailable}; // nothing to draw into without area
         }
 
+        // With a display link the system hands over the drawable for the coming refresh, at the
+        // moment a frame drawn into it now still reaches it, and never more than one per refresh.
+        if (_pacer != 0U)
+        {
+            const std::uintptr_t handedOver{LightRHIMetalDisplayLink::takeMetalDisplayPacerDrawable(_pacer)};
+            if (handedOver == 0U)
+            {
+                return std::unexpected{ExternalTextureError::Unavailable}; // not yet: the refresh is not near
+            }
+            // The pointer crossed from Swift as a number, so only a cast turns it back.
+            // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
+            _drawable = NS::TransferPtr(reinterpret_cast<CA::MetalDrawable *>(handedOver)); // retained for us
+            return _adoptHeldDrawable(extent);
+        }
+
+        // `nextDrawable` blocks until the display frees an image, which can be a whole refresh. One
+        // image is on screen and the rest may wait to be shown, so a frame is taken only while at
+        // least one is still free; then it is there without waiting. The caller retries later.
+        // Waiting for every frame to be shown first would halve the rate: the window server
+        // shows a frame about two refreshes after it is presented.
+        if (_framesWaiting->load(std::memory_order_acquire) + 1U >= _layer->maximumDrawableCount())
+        {
+            return std::unexpected{ExternalTextureError::Unavailable};
+        }
         auto *drawable{_layer->nextDrawable()};
         if (drawable == nullptr)
         {
@@ -658,6 +752,13 @@ namespace rhi::metal
             return std::unexpected{ExternalTextureError::Unavailable};
         }
         _drawable = NS::RetainPtr(drawable);
+        return _adoptHeldDrawable(extent);
+    }
+
+    std::expected<TextureHandle, ExternalTextureError>
+    MetalPresentingTextureProvider::_adoptHeldDrawable(const Extent2D extent)
+    {
+        auto *drawable{_drawable.get()};
         _device.Mtl4Queue().wait(drawable);
 
         const TextureDesc desc{
@@ -686,6 +787,19 @@ namespace rhi::metal
         // Metal 4 orders presentation on the queue: the drawable was waited for when it was taken
         // and is signalled after the work that drew it, so present() shows a finished frame.
         _device.Mtl4Queue().signalDrawable(_drawable.get());
+        // Counted until it reaches the screen, or is dropped, which also runs the handler.
+        _framesWaiting->fetch_add(1U, std::memory_order_acq_rel);
+#if METRICS_ENABLED
+        _drawable->addPresentedHandler(
+            [waiting = _framesWaiting, shown = _shown, present = ++_presents](MTL::Drawable *drawable)
+            {
+                RecordShown(*shown, present, drawable->presentedTime());
+                waiting->fetch_sub(1U, std::memory_order_acq_rel);
+            });
+#else
+        _drawable->addPresentedHandler([waiting = _framesWaiting](MTL::Drawable * /*drawable*/)
+                                       { waiting->fetch_sub(1U, std::memory_order_acq_rel); });
+#endif
         _drawable->present();
 
         // The texture named the drawable for this frame only. Releasing the slot here is what makes

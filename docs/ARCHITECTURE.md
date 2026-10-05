@@ -96,7 +96,7 @@ Resource lifecycle:
 Presentation:
 
 - backend surface descriptor — the application's own native surface, handed to a provider factory
-- `CreateExternalTextureProvider(device, surface)` → `IExternalTextureProvider` — textures this
+- `CreateExternalTextureProvider(device, surface, format, timing)` → `IExternalTextureProvider` — textures this
   library did not make, offered one at a time to be drawn and shown
 - `ITextureFormatProvider::TextureFormat()` — what to build pipelines against, before any frame exists
 - `ITextureProvider::NextTexture()` — the texture for this frame, borrowed until it is shown
