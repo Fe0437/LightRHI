@@ -1605,6 +1605,97 @@ TEST(explicit_barrier_before_copy)
     std::printf("  explicit barrier before CopyBuffer: %u words verified\n", kCount);
 }
 
+// ---------------------------------------------------------------------------
+// A submission given a WaitFence starts only after that fence's work. A queue
+// may overlap command lists submitted one after another, so a write submitted
+// right after a copy could overwrite the buffer before the copy has read it.
+// The copy is large enough to give it time; it must hold only the old value.
+// ---------------------------------------------------------------------------
+TEST(submission_waits_for_its_fence)
+{
+    auto device{rhitest::Required(rhi::CreateDevice({}))};
+
+    constexpr uint32_t kCount{1u << 21};
+    constexpr uint64_t kSize{uint64_t{kCount} * sizeof(uint32_t)};
+    constexpr uint32_t kRounds{8};
+
+    auto buf{rhitest::Required(device->CreateBuffer({
+        .Size       = kSize,
+        .Usage      = rhi::BufferUsage::Storage | rhi::BufferUsage::DeviceAddress | rhi::BufferUsage::TransferSrc,
+        .MemoryType = rhi::MemoryType::GpuOnly,
+        .DebugName  = "wait_fence_src",
+    }))};
+    auto staging{rhitest::Required(device->CreateBuffer({
+        .Size       = kSize,
+        .Usage      = rhi::BufferUsage::TransferDst,
+        .MemoryType = rhi::MemoryType::GpuToCpu,
+        .DebugName  = "wait_fence_dst",
+    }))};
+    auto pso{rhitest::Required(device->CreateComputePipeline({
+        .Shader    = rhitest::loadShaderArtifact("compute_fill_bda", "fill_via_bda", rhi::ShaderStage::Compute),
+        .DebugName = "wait_fence_pso",
+    }))};
+
+    struct alignas(8) PC
+    {
+        uint64_t addr{};
+        uint32_t value{};
+        uint32_t count{};
+    };
+    const uint64_t address{device->BufferAddress(buf).Address};
+
+    auto       fill{rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "wait_fence_fill"))};
+    auto       copy{rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "wait_fence_copy"))};
+    auto       overwrite{rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "wait_fence_overwrite"))};
+    const auto record{[&](rhi::ICommandList &commands, const uint32_t value)
+                      {
+                          commands.Begin();
+                          commands.SetPipeline(pso);
+                          commands.SetPushConstants(PC{address, value, kCount});
+                          commands.Dispatch(kCount / 64);
+                          commands.End();
+                      }};
+    uint32_t   errors{0};
+    for (uint32_t round{1}; round <= kRounds; ++round)
+    {
+        const uint32_t before{0xA0000000u + round};
+        record(*fill, before);
+        device->WaitForFence(device->Submit(*fill));
+
+        // Flushed inside the copy, the closing transition orders only this list; the next
+        // submission is held back by its WaitFence alone.
+        copy->Begin();
+        copy->Transition(buf, rhi::ResourceState::UnorderedAccess, rhi::ResourceState::TransferSrc);
+        copy->FlushBarriers();
+        copy->CopyBuffer(buf, staging, {.SrcOffset = 0, .DstOffset = 0, .Size = kSize});
+        copy->Transition(buf, rhi::ResourceState::TransferSrc, rhi::ResourceState::UnorderedAccess);
+        copy->FlushBarriers();
+        copy->End();
+        const auto copied{device->Submit(*copy)};
+        record(*overwrite, 0xB0000000u + round);
+        device->WaitForFence(device->Submit(*overwrite, {.WaitFence = copied}));
+        device->WaitForFence(copied);
+
+        auto mapped{device->MapBuffer(staging)};
+        REQUIRE(mapped.Data != nullptr);
+        const auto *words{static_cast<const uint32_t *>(mapped.Data)};
+        for (uint32_t i{0}; i < kCount; ++i)
+        {
+            if (words[i] != before)
+            {
+                ++errors;
+            }
+        }
+        device->UnmapBuffer(staging);
+    }
+    REQUIRE(errors == 0);
+
+    device->DestroyPipeline(pso);
+    device->DestroyBuffer(buf);
+    device->DestroyBuffer(staging);
+    std::printf("  submission waits for its fence: %u rounds of %u words verified\n", kRounds, kCount);
+}
+
 // Dome-light pixel/CDF uploads are several MiB. Keep this above the Metal 4
 // upload path's regression surface rather than validating only tiny buffers.
 TEST(large_buffer_upload_readback)
@@ -1778,6 +1869,7 @@ int main()
     test_compute_barrier();
     test_draw_indirect();
     test_explicit_barrier_before_copy();
+    test_submission_waits_for_its_fence();
     test_explicit_transition_then_readback();
     std::printf("\n");
 

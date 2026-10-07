@@ -1070,7 +1070,7 @@ namespace rhi::metal
                        { return std::unique_ptr<ICommandList>{std::move(commands)}; });
     }
 
-    FenceHandle MetalDevice::Submit(ICommandList &cmdList, const SubmitDesc & /*desc*/)
+    FenceHandle MetalDevice::Submit(ICommandList &cmdList, const SubmitDesc &desc)
     {
         // A device only receives command lists it created, and the build has no RTTI to check it.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
@@ -1081,6 +1081,12 @@ namespace rhi::metal
         if (captureScope != nullptr)
         {
             captureScope->beginScope();
+        }
+        // Metal 4 lets command buffers on one queue overlap, so a dependency is a wait on the
+        // timeline the earlier submission signals; it holds back everything committed after it.
+        if (desc.WaitFence.Valid())
+        {
+            Mtl4Queue().wait(&TimelineEvent(), desc.WaitValue > 0 ? desc.WaitValue : desc.WaitFence.Id);
         }
         Mtl4Queue().commit(buffers.data(), buffers.size());
         Mtl4Queue().signalEvent(&TimelineEvent(), fence.Id);

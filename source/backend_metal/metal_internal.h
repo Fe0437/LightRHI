@@ -444,7 +444,7 @@ namespace rhi::metal
         void BeginCaptureScope(std::string_view name) override;
         void EndCaptureScope() override;
 
-        [[nodiscard]] FenceHandle Submit(ICommandList &cmdList, const SubmitDesc &d = {}) override;
+        [[nodiscard]] FenceHandle Submit(ICommandList &cmdList, const SubmitDesc &desc = {}) override;
         void                      WaitForFence(FenceHandle fence) override;
         [[nodiscard]] bool        IsFenceComplete(FenceHandle fence) override;
         void                      WaitIdle() override;
