@@ -357,9 +357,13 @@ namespace rhi::metal
             if (p.IsCompute)
             {
                 auto &compute{_computeEncoder()};
-                if (auto *label{p.ComputePso->label()})
+                // Naming a pass takes over a microsecond, so only a device that can be captured does it.
+                if (_device.get().DebugCaptureEnabled())
                 {
-                    compute.setLabel(label);
+                    if (auto *label{p.ComputePso->label()})
+                    {
+                        compute.setLabel(label);
+                    }
                 }
                 compute.setComputePipelineState(p.ComputePso.get());
                 _tgX = p.ThreadGroupSizeX;

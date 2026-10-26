@@ -374,7 +374,7 @@ namespace rhi::metal
                     return (*device)->newMTL4CommandQueue();
                 }
                 auto queueDesc{AdoptRequired(MTL4::CommandQueueDescriptor::alloc()->init(),
-                                             "MTL4::CommandQueueDescriptor could not be created")};
+                                                  "MTL4::CommandQueueDescriptor could not be created")};
                 queueDesc->setLabel(NS::String::string("HdRestir / LightRHI compute queue", NS::UTF8StringEncoding));
                 return (*device)->newMTL4CommandQueue(queueDesc.get(), &queueError);
             }()};
@@ -640,8 +640,8 @@ namespace rhi::metal
                 const double hostNow{static_cast<double>(mach_absolute_time()) * timebase.numer / timebase.denom *
                                      1e-9};
                 const auto   steadyNow{std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now().time_since_epoch())
-                                           .count()};
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count()};
                 const double ago{std::max(0.0, hostNow - presentedSeconds)};
                 shownNanoseconds = static_cast<uint64_t>(steadyNow) - static_cast<uint64_t>(ago * 1e9);
             }
@@ -894,6 +894,7 @@ namespace rhi::metal
         }
 
         const uint64_t address{buf->gpuAddress()};
+        auto *const    mappedBytes{static_cast<std::byte *>(buf->contents())};
         const uint32_t idx{_buffers.Alloc()};
         if (idx == kInvalidIndex)
         {
@@ -906,8 +907,13 @@ namespace rhi::metal
             _addResident(*buf.get());
         }
         _heap.RegisterBuffer();
-        _buffers.Get(idx) = MetalBuffer{
-            .Buffer = std::move(buf), .Size = desc.Size, .Usage = desc.Usage, .Heap = heap, .Offset = offset};
+        _buffers.Get(idx) = MetalBuffer{.Buffer        = std::move(buf),
+                                        .MappedBytes   = mappedBytes,
+                                        .DeviceAddress = address,
+                                        .Size          = desc.Size,
+                                        .Usage         = desc.Usage,
+                                        .Heap          = heap,
+                                        .Offset        = offset};
 
         // Track base GPU address -> slot so acceleration-structure geometry
         // (addressed by GpuAddress/BDA) can be resolved back to an MTL::Buffer*
@@ -975,7 +981,7 @@ namespace rhi::metal
         auto &record{_buffers.Get(h.Index)};
         {
             const std::scoped_lock lk{_bufferAddrMutex};
-            _bufferAddrToIndex.erase(record.Buffer->gpuAddress());
+            _bufferAddrToIndex.erase(record.DeviceAddress);
         }
         if (record.Heap.Valid())
         {
@@ -995,7 +1001,7 @@ namespace rhi::metal
         {
             return {};
         }
-        return GpuAddress{.Address = _buffers.Get(h.Index).Buffer->gpuAddress()};
+        return GpuAddress{.Address = _buffers.Get(h.Index).DeviceAddress};
     }
 
     BufferInfo MetalDevice::GetBufferInfo(BufferHandle h) const
@@ -1005,8 +1011,7 @@ namespace rhi::metal
             return {};
         }
         const auto &b{_buffers.Get(h.Index)};
-        return BufferInfo{
-            .Size = b.Size, .Usage = b.Usage, .DeviceAddress = GpuAddress{.Address = b.Buffer->gpuAddress()}};
+        return BufferInfo{.Size = b.Size, .Usage = b.Usage, .DeviceAddress = GpuAddress{.Address = b.DeviceAddress}};
     }
 
     TextureInfo MetalDevice::GetTextureInfo(TextureHandle h) const
@@ -1034,7 +1039,7 @@ namespace rhi::metal
             return {};
         }
         auto &b{_buffers.Get(h.Index)};
-        return MappedBuffer{.Data = b.Buffer->contents(), .Size = b.Size};
+        return MappedBuffer{.Data = b.MappedBytes, .Size = b.Size};
     }
 
     void MetalDevice::UnmapBuffer(BufferHandle h)
@@ -1238,6 +1243,7 @@ namespace rhi::metal
         sd->setLodMinClamp(desc.MinLod);
         sd->setLodMaxClamp(desc.MaxLod);
         sd->setLodAverage(false);
+        sd->setSupportArgumentBuffers(true); // Without it the sampler has no gpuResourceID for a shader to hold.
 
         if (!desc.DebugName.empty())
         {
@@ -1275,18 +1281,12 @@ namespace rhi::metal
 
     GpuAddress MetalDevice::SamplerAddress(SamplerHandle h) const
     {
-        // Samplers bind via ICommandList::BindSampler -> MTL4::ArgumentTable::
-        // setSamplerState(handle-derived gpuResourceID, index) — see
-        // metal_internal.h's MetalDevice header comment. This method is kept
-        // for IDevice interface completeness; MTLSamplerState has no
-        // separately-embeddable address the way a buffer/texture does, so
-        // callers needing the underlying resource ID go through Sampler(h)
-        // internally rather than this method.
+        // The sampler's own gpuResourceID: store these bits in a Slang DescriptorHandle<SamplerState>.
         if (!h.Valid())
         {
             return {};
         }
-        return GpuAddress{.Address = h.Index};
+        return GpuAddress{.Address = _samplers.Get(h.Index).State->gpuResourceID()._impl};
     }
 
     // ============================================================================
@@ -1475,12 +1475,12 @@ namespace rhi::metal
             };
             blasObjs[i] = AccelStruct(inst.Blas).As.get();
             dst[i]      = MTL::AccelerationStructureUserIDInstanceDescriptor{
-                .transformationMatrix            = xform,
-                .options                         = static_cast<MTL::AccelerationStructureInstanceOptions>(inst.Flags),
-                .mask                            = inst.InstanceMask,
-                .intersectionFunctionTableOffset = 0,
-                .accelerationStructureIndex      = static_cast<uint32_t>(i),
-                .userID                          = inst.InstanceCustomIndex,
+                     .transformationMatrix            = xform,
+                     .options                         = static_cast<MTL::AccelerationStructureInstanceOptions>(inst.Flags),
+                     .mask                            = inst.InstanceMask,
+                     .intersectionFunctionTableOffset = 0,
+                     .accelerationStructureIndex      = static_cast<uint32_t>(i),
+                     .userID                          = inst.InstanceCustomIndex,
             };
         }
 
@@ -1934,7 +1934,7 @@ namespace rhi::metal
         auto &b{_buffers.Get(dst.Index)};
         if (b.Buffer->storageMode() == MTL::StorageModeShared)
         {
-            const std::span<std::byte> contents{static_cast<std::byte *>(b.Buffer->contents()), b.Buffer->length()};
+            const std::span<std::byte> contents{b.MappedBytes, b.Buffer->length()};
             std::memcpy(contents.subspan(dstOffset).data(), data.data(), size);
             return;
         }

@@ -163,8 +163,11 @@ namespace rhi::metal
     struct MetalBuffer
     {
         NS::SharedPtr<MTL::Buffer> Buffer{};
-        uint64_t                   Size{0};
-        BufferUsage                Usage{};
+        // Both are fixed for the buffer's life, and asking Metal for them made a graph run measurably slower.
+        std::byte  *MappedBytes{};    // Where the CPU reads and writes it; null for a GPU-only buffer.
+        uint64_t    DeviceAddress{0}; // Where a shader reads and writes it.
+        uint64_t    Size{0};
+        BufferUsage Usage{};
         // Invalid for a buffer that owns its allocation. A placed buffer keeps its heap and offset
         // so destruction can release the range without touching the heap's residency.
         MemoryHeapHandle Heap{};

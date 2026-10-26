@@ -1,9 +1,16 @@
 // rhi_bindless_tests.cpp — focused LightRHI bindless resource tests.
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <expected>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 import lightRHI;
 
@@ -153,12 +160,76 @@ namespace
         device->DestroyPipeline(pipeline);
         REQUIRE(device->BindlessHeap().UsedTextures() == texturesBefore);
     }
+
+    /** {brief} A kernel samples a texture through handles alone: linear between two texels, repeating past the edge. */
+    void TestSamplingThroughHandles()
+    {
+        auto              device{rhitest::Required(rhi::CreateDevice({}))};
+        auto              pipeline{rhitest::Required(device->CreateComputePipeline({
+                         .Shader = rhitest::loadShaderArtifact("bindless_sampler_test", "bindless_sampler_test_main",
+                                                               rhi::ShaderStage::Compute),
+                         .ThreadGroupSize = {4, 1, 1},
+                         .DebugName       = "bindless_sampler_test.pso",
+        }))};
+        auto              texture{rhitest::Required(device->CreateTexture(
+            rhi::Texture2D(2, 1, rhi::Format::R8Unorm, rhi::TextureUsage::Sampled | rhi::TextureUsage::TransferDst,
+                                        "bindless_sampler_test.texture")))};
+        auto              sampler{rhitest::Required(device->CreateSampler(rhi::LinearRepeat()))};
+        constexpr uint8_t pixels[2]{0, 255};
+        device->UploadTexture(texture, pixels, 2, 2, {.Extent = {2, 1, 1}});
+        auto output{rhitest::Required(device->CreateBuffer({
+            .Size       = 4 * sizeof(float),
+            .Usage      = rhi::BufferUsage::Storage | rhi::BufferUsage::DeviceAddress,
+            .MemoryType = rhi::MemoryType::GpuToCpu,
+            .DebugName  = "bindless_sampler_test.output",
+        }))};
+
+        struct alignas(8) PushConstants
+        {
+            uint64_t output{};
+            uint64_t texture{};
+            uint64_t sampler{};
+            float    firstU{};
+            float    stepU{};
+        };
+        auto command{
+            rhitest::Required(device->CreateCommandList(rhi::QueueType::Compute, "bindless_sampler_test.cmd"))};
+        command->Begin();
+        command->Transition(texture, rhi::ResourceState::TransferDst, rhi::ResourceState::ShaderRead);
+        command->FlushBarriers();
+        command->SetPipeline(pipeline);
+        command->SetPushConstants(PushConstants{.output  = device->BufferAddress(output).Address,
+                                                .texture = device->TextureAddress(texture).Address,
+                                                .sampler = device->SamplerAddress(sampler).Address,
+                                                .firstU  = 0.25F,
+                                                .stepU   = 0.25F});
+        command->Dispatch(1, 1, 1);
+        command->End();
+        device->WaitForFence(device->Submit(*command));
+
+        // At the first texel's centre, halfway, at the second's centre, then past the edge halfway back.
+        constexpr float expected[4]{0.F, 0.5F, 1.F, 0.5F};
+        const auto      mapped{device->MapBuffer(output)};
+        REQUIRE(mapped.Data != nullptr);
+        const auto *actual{static_cast<const float *>(mapped.Data)};
+        for (uint32_t i{0}; i < 4; ++i)
+        {
+            REQUIRE(std::abs(actual[i] - expected[i]) < 1e-2F);
+        }
+        device->UnmapBuffer(output);
+
+        device->DestroyBuffer(output);
+        device->DestroySampler(sampler);
+        device->DestroyTexture(texture);
+        device->DestroyPipeline(pipeline);
+    }
 } // namespace
 
 int main()
 {
     TestResourceLifetimeAccounting();
     TestTextureSelectionAndSampling();
+    TestSamplingThroughHandles();
     std::printf("LightRHI bindless tests passed.\n");
     return 0;
 }

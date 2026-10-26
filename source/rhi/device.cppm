@@ -266,9 +266,8 @@ export namespace rhi
         /**
          * {brief} Returns the shader-visible value for a bindless sampler.
          *
-         * Prefer placing `SamplerHandle::Index` in a reflected Slang
-         * `DescriptorHandle<SamplerState>` field. Use this method only when a
-         * shared GPU structure represents all bindless values as GpuAddress.
+         * Store the returned value in root or scene data consumed as a Slang
+         * `DescriptorHandle<SamplerState>`. It remains valid until the sampler is destroyed.
          */
         [[nodiscard]] virtual GpuAddress SamplerAddress(SamplerHandle handle) const = 0;
 

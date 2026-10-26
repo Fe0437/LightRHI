@@ -77,6 +77,31 @@ TEST(mapped_buffer_views_its_bytes)
     REQUIRE(rhi::MappedBuffer{}.Bytes().empty());
 }
 
+// A layout names each field of a parameter struct where the compiler placed it, and refuses text that
+// is not one, rather than reading a wrong offset.
+TEST(shader_layout_reads_fields_by_name)
+{
+    const auto layout{rhi::ShaderLayout::Parse("lightrhi shader layout 1\n"
+                                               "parameter g_pc\n"
+                                               "field Coverage 0 8 pointer float\n"
+                                               "field Count 8 4 uint32\n"
+                                               "field position 16 8 pointer vector\n")};
+    REQUIRE(layout.has_value());
+    REQUIRE(layout->Fields("g_pc").size() == 3U);
+    const auto *const position{layout->Field("g_pc", "position")};
+    REQUIRE(position != nullptr && position->Offset == 16U && position->Size == 8U &&
+            position->Type == "pointer vector");
+    REQUIRE(layout->Field("g_pc", "radius") == nullptr);
+    REQUIRE(layout->Fields("other").empty());
+
+    REQUIRE(rhi::ShaderLayout::Parse("not a layout\n").error() == rhi::ShaderArtifactError::MalformedLayout);
+    REQUIRE(rhi::ShaderLayout::Parse("lightrhi shader layout 1\nfield Count 8 4 uint32\n").error() ==
+            rhi::ShaderArtifactError::MalformedLayout);
+    REQUIRE(
+        rhi::ShaderLayout::Parse("lightrhi shader layout 1\nparameter g_pc\nfield Count eight 4 uint32\n").error() ==
+        rhi::ShaderArtifactError::MalformedLayout);
+}
+
 // A value template that accepted a span would upload the span's own pointer and size instead of the
 // bytes it names, so spans must only ever reach the byte overload.
 template <typename T>
@@ -1831,6 +1856,7 @@ int main()
     // --- Smoke tests (no GPU needed) ---
     test_handles_are_invalid_by_default();
     test_mapped_buffer_views_its_bytes();
+    test_shader_layout_reads_fields_by_name();
     test_format_helpers();
     test_resource_state_bitmask();
     test_buffer_usage_bitmask();
