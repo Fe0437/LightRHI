@@ -20,6 +20,7 @@ export import :descriptors;
 export import :externalTextures;
 export import :pipeline;
 export import :shaderLibrary;
+export import :shaderLayout;
 export import :resources;
 export import :bindless;
 export import :raytracing;

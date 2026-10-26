@@ -11,6 +11,11 @@ is how Metal libraries and multi-entry SPIR-V modules are addressed at run time.
 MSL is compiled ahead of time by Apple's toolchain for that SDK; the MSL and AIR it went through are
 kept under <output-dir>/intermediate/ for reading and debugging, and are not part of the output.
 
+Beside each library it writes <source>.layout: the fields of every struct the shader takes as a
+parameter, such as its push constants, with each field's name, offset, size and type, read from
+slangc's reflection. A caller fills a parameter by field name with rhi::ShaderLayout instead of
+repeating the struct in C++.
+
 It never emits C++: an application ships the output directory and reads libraries from it (see
 rhi::ReadShaderArtifact). Slang is a tooling concern only; the RHI core and backends do not know
 about it.
@@ -194,6 +199,43 @@ def postprocess_metal_file(path: pathlib.Path) -> None:
                   f"argument-buffer annotations (slang metal codegen workaround)")
 
 
+LAYOUT_HEADER = "lightrhi shader layout 1"
+
+
+def field_type(reflected: dict) -> str | None:
+    """A field's type as a layout names it: a scalar type ("float32"), a vector of one ("float32x2"),
+    or a pointer to a type, as Slang names that type ("pointer float2"); None for any other kind."""
+    kind = reflected.get("kind")
+    if kind == "scalar":
+        return reflected["scalarType"]
+    if kind == "vector":
+        return f"{reflected['elementType']['scalarType']}x{reflected['elementCount']}"
+    if kind == "pointer":
+        return f"pointer {reflected['valueType']}"
+    return None
+
+
+def write_layout(reflection: pathlib.Path, layout: pathlib.Path) -> None:
+    """Writes the fields of every struct parameter in `reflection`, one line each, to `layout`:
+
+        parameter <name>
+        field <name> <offset> <size> <type>
+    """
+    lines = [LAYOUT_HEADER]
+    for parameter in json.loads(reflection.read_text()).get("parameters", []):
+        element = parameter.get("type", {}).get("elementType", parameter.get("type", {}))
+        if element.get("kind") != "struct":
+            continue
+        lines.append(f"parameter {parameter['name']}")
+        for field in element.get("fields", []):
+            binding = field.get("binding", {})
+            typed = field_type(field.get("type", {}))
+            if typed is None or binding.get("kind") != "uniform":
+                continue
+            lines.append(f"field {field['name']} {binding['offset']} {binding['size']} {typed}")
+    layout.write_text("\n".join(lines) + "\n")
+
+
 def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pathlib.Path,
                     include_dirs: list[pathlib.Path], defines: list[str], metal_sdk: str | None) -> pathlib.Path:
     """Compiles every entry point in `source` into one library, and returns its path."""
@@ -220,10 +262,14 @@ def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pa
         cmd += ["-I", str(include_dir)]
     for define in defines:
         cmd += ["-D", define]
+    reflection = out_dir / "intermediate" / f"{library}.reflection.json"
+    reflection.parent.mkdir(parents=True, exist_ok=True)
+    cmd += ["-reflection-json", str(reflection)]
     # No -entry: slangc takes every [shader(...)] entry point the source declares.
     cmd += ["-o", str(msl if backend == "metal" else output), str(source)]
     print(f"[compile_shaders] {source.name} -> {output.name}")
     subprocess.run(cmd, check=True)
+    write_layout(reflection, out_dir / f"{library}.layout")
 
     if backend == "metal":
         postprocess_metal_file(msl)

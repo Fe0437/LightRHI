@@ -287,6 +287,7 @@ The RHI core does not invoke Slang, and shader libraries are never turned into C
 
 - `light_rhi_ship_shaders(TARGET app ARTIFACTS ...)` copies the libraries into a `shaders` folder beside the executable, or into the bundle's resources for an Apple app bundle, refreshed on every build.
 - `rhi::ReadShaderLibrary(folder, library)` reads one library back, and `ShaderLibrary::Describe(entryPoint, stage)` describes the function wanted from it; keep the library while any `ShaderDesc` made from it is used. Each backend module implements `ReadShaderLibrary` for its own files, so the backend-neutral interface names no file extension and no format a backend chose. A new backend adds its reader beside its device.
+- `rhi::ReadShaderLayout(folder, library)` reads `<library>.layout`, which `tools/compile_shaders.py` writes beside each library from slangc's reflection: the fields of every parameter struct, such as push constants, with each field's name, offset, size and type. A caller fills those parameters by field name at the offsets the compiler chose, so no struct is repeated in C++. Slang reflects a pointer to a vector only as `pointer vector`, without its element type.
 
 ### Binding layout
 

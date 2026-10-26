@@ -199,8 +199,10 @@ function(light_rhi_compile_shaders)
     foreach(_shader_source IN LISTS _sources)
         get_filename_component(_library "${_shader_source}" NAME_WE)
         set(_shader_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_library}${_extension}")
+        # The fields of the library's parameter structs, which rhi::ShaderLayout reads.
+        set(_layout_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_library}.layout")
         add_custom_command(
-            OUTPUT "${_shader_out}"
+            OUTPUT "${_shader_out}" "${_layout_out}"
             COMMAND "${Python3_EXECUTABLE}"
                     "${_compile_shaders_py}"
                     --shaders-json "${LIGHT_RHI_SHADER_SHADERS_JSON}"
@@ -216,7 +218,7 @@ function(light_rhi_compile_shaders)
             COMMENT "Slang -> ${_backend}: ${_library}${_extension}"
             VERBATIM
         )
-        list(APPEND _artifacts "${_shader_out}")
+        list(APPEND _artifacts "${_shader_out}" "${_layout_out}")
     endforeach()
 
     if(LIGHT_RHI_SHADER_NAME_PREFIX)

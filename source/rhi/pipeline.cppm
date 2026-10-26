@@ -81,6 +81,7 @@ export namespace rhi
         NotFound,                ///< No shader library has the requested name.
         Unreadable,              ///< The library file exists but could not be read.
         InvalidSize,             ///< The library file is empty, or larger than the bound it was read with.
+        MalformedLayout,         ///< A layout file does not read as one.
     };
 
     /**
