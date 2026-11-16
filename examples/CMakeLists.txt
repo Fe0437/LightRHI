@@ -1,5 +1,5 @@
 function(add_rhi_example name)
-    add_executable(${name} ${name}/main.cpp)
+    light_rhi_add_program(${name} ${name})
     target_compile_features(${name} PRIVATE cxx_std_23)
     target_link_libraries(${name} PRIVATE LightRHI::LightRHI LightRHI::Backend)
     target_warnings(${name})

@@ -39,6 +39,11 @@ HeaderFileExtensions: ['', h, hh, hpp, hxx]
 ImplementationFileExtensions: [c, cc, cpp, cppm, cxx]
 
 CheckOptions:
+  # One-line lists are left alone: that rule takes the comma after an empty `{}` argument for a trailing one.
+  readability-trailing-comma.SingleLineCommaPolicy: Ignore
+  # std::span has no .at() before C++26, and a debug build's standard library hardening checks its [].
+  # The check matches the class as the library spells it, such as libc++'s std::__1::span.
+  cppcoreguidelines-pro-bounds-avoid-unchecked-container-access.ExcludeClasses: '::std::map;::std::unordered_map;::std::flat_map;::std::(__1::)?span'
   # Handles, timeline points and mapped views are plain aggregates whose data is the interface; a
   # member function beside that data (Valid(), As<T>()) does not make them classes with invariants.
   misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: true

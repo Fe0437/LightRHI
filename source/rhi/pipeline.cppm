@@ -38,6 +38,12 @@ export namespace rhi
         std::string_view Source{}; ///< Complete source text containing the requested entry point.
     };
 
+    /** {brief} Non-owning view of a trusted native compute library supplied to pipeline creation. */
+    struct HostCallableBytecode
+    {
+        std::span<const uint8_t> Bytes{}; ///< Complete `.lrcpu` file contents, native code built for this host.
+    };
+
     /**
      * {brief} Discriminated union of the shader artifact encodings accepted by pipeline creation.
      * {note} A default-constructed value is `std::monostate`, meaning no shader was supplied.
@@ -47,7 +53,8 @@ export namespace rhi
      * assets can use ShaderArtifactView and ToShaderDesc() instead of constructing
      * the alternative directly.
      */
-    using ShaderBytecode = std::variant<std::monostate, SpirvBytecode, MetalLibBytecode, MslSource>;
+    using ShaderBytecode =
+        std::variant<std::monostate, SpirvBytecode, MetalLibBytecode, MslSource, HostCallableBytecode>;
 
     /**
      * {brief} Selects one compiled shader entry point for pipeline creation.
@@ -116,21 +123,33 @@ export namespace rhi
                 desc.Bytecode = SpirvBytecode{
                     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                     .Words = std::span<const uint32_t>{reinterpret_cast<const uint32_t *>(artifact.Data.data()),
-                                                       artifact.Data.size() / 4}};
+                                                       artifact.Data.size() / 4},
+                };
                 break;
             case ShaderFormat::MslSource:
                 // char may view any object's bytes: MSL source is text, read as the characters it holds.
                 desc.Bytecode =
                     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                    MslSource{.Source = std::string_view{reinterpret_cast<const char *>(artifact.Data.data()),
-                                                         artifact.Data.size()}};
+                    MslSource{
+                        .Source = std::string_view{reinterpret_cast<const char *>(artifact.Data.data()),
+                                                   artifact.Data.size()},
+                };
                 break;
             case ShaderFormat::MetalLib:
                 // unsigned char may view any object's bytes: the library is handed on byte for byte.
                 desc.Bytecode = MetalLibBytecode{
                     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                     .Bytes = std::span<const uint8_t>{reinterpret_cast<const uint8_t *>(artifact.Data.data()),
-                                                      artifact.Data.size()}};
+                                                      artifact.Data.size()},
+                };
+                break;
+            case ShaderFormat::HostCallable:
+                // unsigned char may view any object's bytes: the library is handed on byte for byte.
+                desc.Bytecode = HostCallableBytecode{
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                    .Bytes = std::span<const uint8_t>{reinterpret_cast<const uint8_t *>(artifact.Data.data()),
+                                                      artifact.Data.size()},
+                };
                 break;
         }
         return desc;

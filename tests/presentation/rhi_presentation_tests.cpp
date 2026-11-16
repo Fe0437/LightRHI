@@ -21,12 +21,10 @@
 #include <new>
 #include <string>
 
-
 import lightRHI;
 
+#include "../device_result.h"
 #include "test_texture_owner.generated.h"
-
-#include "device_result.h"
 
 #define REQUIRE(expr)                                                                                                  \
     do                                                                                                                 \
@@ -151,7 +149,10 @@ namespace
         HarnessTextureOwner &operator=(const HarnessTextureOwner &) = delete;
         HarnessTextureOwner &operator=(HarnessTextureOwner &&)      = delete;
 
-        ~HarnessTextureOwner() { rhitest::ReleaseTestTextureOwner(_owner); }
+        ~HarnessTextureOwner()
+        {
+            rhitest::ReleaseTestTextureOwner(_owner);
+        }
 
         /** {brief} Resizes what the textures come from, or says this one cannot be driven. */
         [[nodiscard]] bool Resize(uint32_t width, uint32_t height)
@@ -199,7 +200,7 @@ namespace
 
     /** {brief} Opens a provider on what this harness owns. */
     std::unique_ptr<rhi::IExternalTextureProvider> MakeProvider(rhi::IDevice &device, const HarnessTextureOwner &owner,
-                                                               rhi::Format format = rhi::Format::Undefined)
+                                                                rhi::Format format = rhi::Format::Undefined)
     {
         // No cast and no callback: the owner is already the type this build's factory takes.
         return rhitest::Required(rhitest::MakeProviderFor(device, owner.Get(), format));
@@ -208,9 +209,9 @@ namespace
 
 TEST(a_provider_hands_out_frames_and_shows_them)
 {
-    auto device{rhitest::Required(rhi::CreateDevice({}))};
+    auto                device{rhitest::Required(rhi::CreateDevice({}))};
     HarnessTextureOwner surface{*device, kWidth, kHeight};
-    auto        target{MakeProvider(*device, surface, rhi::Format::BGRA8Unorm)};
+    auto                target{MakeProvider(*device, surface, rhi::Format::BGRA8Unorm)};
     REQUIRE(target != nullptr);
     REQUIRE(target->TextureFormat() == rhi::Format::BGRA8Unorm);
 
@@ -237,7 +238,7 @@ TEST(a_provider_hands_out_frames_and_shows_them)
 
 TEST(one_device_serves_several_providers)
 {
-    auto device{rhitest::Required(rhi::CreateDevice({}))};
+    auto                device{rhitest::Required(rhi::CreateDevice({}))};
     HarnessTextureOwner firstSurface{*device, kWidth, kHeight};
     HarnessTextureOwner secondSurface{*device, kWidth / 2, kHeight / 2};
 
@@ -270,9 +271,9 @@ TEST(one_device_serves_several_providers)
 
 TEST(a_resized_source_hands_out_resized_frames)
 {
-    auto device{rhitest::Required(rhi::CreateDevice({}))};
+    auto                device{rhitest::Required(rhi::CreateDevice({}))};
     HarnessTextureOwner surface{*device, kWidth, kHeight};
-    auto        target{MakeProvider(*device, surface)};
+    auto                target{MakeProvider(*device, surface)};
 
     const auto before{target->NextTexture()};
     REQUIRE(before.has_value());
@@ -311,9 +312,9 @@ TEST(a_steady_frame_loop_allocates_nothing)
 {
     // Validation off: this measures the configuration a realtime application ships. With validation
     // on, each submission looks its capture scope up by name, which allocates deliberately.
-    auto device{rhitest::Required(rhi::CreateDevice(rhi::DeviceDesc{.EnableValidation = false}))};
+    auto                device{rhitest::Required(rhi::CreateDevice(rhi::DeviceDesc{.EnableValidation = false}))};
     HarnessTextureOwner surface{*device, kWidth, kHeight};
-    auto        target{MakeProvider(*device, surface)};
+    auto                target{MakeProvider(*device, surface)};
 
     // Warm up so first-use allocations inside the device are not counted as steady state.
     for (uint32_t i{0}; i < 4; ++i)

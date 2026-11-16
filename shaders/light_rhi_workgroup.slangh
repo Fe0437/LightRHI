@@ -1,0 +1,53 @@
+/**
+ * {file}
+ * {brief} Workgroup synchronization for shaders compiled to GPU code or Slang C++.
+ * Dispatch-to-dispatch visibility is still recorded through the command list.
+ */
+#pragma once
+
+void LightRhiAllMemoryBarrier()
+{
+    __target_switch
+    {
+    case cpp:
+        __intrinsic_asm "LightRhiCpuGroupSync()";
+    default:
+        AllMemoryBarrierWithGroupSync();
+    }
+}
+
+void LightRhiDeviceMemoryBarrier()
+{
+    __target_switch
+    {
+    case cpp:
+        __intrinsic_asm "LightRhiCpuGroupSync()";
+    default:
+        DeviceMemoryBarrierWithGroupSync();
+    }
+}
+
+void LightRhiGroupMemoryBarrier()
+{
+    __target_switch
+    {
+    case cpp:
+        __intrinsic_asm "LightRhiCpuGroupSync()";
+    default:
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+#ifdef LIGHTRHI_CPU
+// Slang's C++ emitter gives a plain groupshared variable to each lane separately.
+// Declare a pointer at the use site with LIGHTRHI_GROUP_ARRAY_VIEW instead.
+uint64_t LightRhiGroupAddress(uint offset, uint bytes)
+{
+    __intrinsic_asm "LightRhiCpuGroupAddress($0, $1)";
+}
+#define LIGHTRHI_GROUP_ARRAY(type, name, count)
+#define LIGHTRHI_GROUP_ARRAY_VIEW(type, name, offset, count) type *name = (type *)LightRhiGroupAddress(offset, sizeof(type) * count)
+#else
+#define LIGHTRHI_GROUP_ARRAY(type, name, count) groupshared type name[count]
+#define LIGHTRHI_GROUP_ARRAY_VIEW(type, name, offset, count)
+#endif

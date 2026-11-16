@@ -14,8 +14,8 @@
 
 import lightRHI;
 
-#include "device_result.h"
-#include "shader_artifact_loader.h"
+#include "../device_result.h"
+#include "../shader_artifact_loader.h"
 
 #define REQUIRE(expr)                                                                                                  \
     do                                                                                                                 \
@@ -166,14 +166,14 @@ namespace
     {
         auto              device{rhitest::Required(rhi::CreateDevice({}))};
         auto              pipeline{rhitest::Required(device->CreateComputePipeline({
-                         .Shader = rhitest::loadShaderArtifact("bindless_sampler_test", "bindless_sampler_test_main",
-                                                               rhi::ShaderStage::Compute),
-                         .ThreadGroupSize = {4, 1, 1},
-                         .DebugName       = "bindless_sampler_test.pso",
+            .Shader          = rhitest::loadShaderArtifact("bindless_sampler_test", "bindless_sampler_test_main",
+                                                           rhi::ShaderStage::Compute),
+            .ThreadGroupSize = {4, 1, 1},
+            .DebugName       = "bindless_sampler_test.pso",
         }))};
         auto              texture{rhitest::Required(device->CreateTexture(
             rhi::Texture2D(2, 1, rhi::Format::R8Unorm, rhi::TextureUsage::Sampled | rhi::TextureUsage::TransferDst,
-                                        "bindless_sampler_test.texture")))};
+                           "bindless_sampler_test.texture")))};
         auto              sampler{rhitest::Required(device->CreateSampler(rhi::LinearRepeat()))};
         constexpr uint8_t pixels[2]{0, 255};
         device->UploadTexture(texture, pixels, 2, 2, {.Extent = {2, 1, 1}});

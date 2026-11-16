@@ -33,9 +33,10 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Warnings)
 include(Sanitizers)
+include(Programs)
 
 # -------------------------------------------------------------------
-# Backend selection — driven by target OS, not by user option.
+# Native GPU backend selection — driven by target OS, not by user option.
 
 # A development build also compiles the backend this platform does not build, so a change to it
 # fails here rather than on someone else's machine. Shipping builds compile only what they ship.
@@ -47,7 +48,7 @@ endif()
 option(LIGHT_RHI_CHECK_INACTIVE_BACKEND "Compile the backend this platform does not build"
        ${_light_rhi_check_default})
 
-# One backend per platform; the selection is not a knob.
+# One GPU backend per platform; the CPU backend is available separately.
 # -------------------------------------------------------------------
 if(APPLE)
     set(LIGHT_RHI_BACKEND "Metal" CACHE INTERNAL "Active LightRHI backend (Metal/Vulkan) — not user-settable")
@@ -90,6 +91,7 @@ endif()
 include(Dependencies)
 include(Slang)
 include(Shaders)
+include(TestTextureOwner)
 
 # -------------------------------------------------------------------
 # Shared-library RPATH setup (macOS)
@@ -139,6 +141,45 @@ target_sources(LightRHI
 )
 
 target_warnings(LightRHI)
+
+# Headless compute backend, linked explicitly by compositions that want it, such as tests that check
+# GPU kernels on the CPU. A build that ships only a GPU backend leaves it out and needs no Slang prelude.
+option(LIGHT_RHI_BUILD_CPU_BACKEND "Build the headless CPU compute backend (LightRHI::CpuBackend)" ON)
+if(LIGHT_RHI_BUILD_CPU_BACKEND)
+    get_filename_component(_slang_bin "${SLANGC}" DIRECTORY)
+    find_path(LIGHT_RHI_SLANG_PRELUDE_DIR slang-cpp-prelude.h HINTS "${_slang_bin}/../include" NO_DEFAULT_PATH)
+    if(NOT LIGHT_RHI_SLANG_PRELUDE_DIR)
+        message(FATAL_ERROR "[LightRHI] the CPU backend needs Slang's C++ prelude headers, which the Slang "
+                            "installation at ${SLANGC} lacks; set LIGHT_RHI_BUILD_CPU_BACKEND=OFF to build without it")
+    endif()
+    find_package(Threads REQUIRED)
+    include(CheckIncludeFileCXX)
+    check_include_file_cxx(stdfloat LIGHT_RHI_HAS_STDFLOAT)
+    if(NOT LIGHT_RHI_HAS_STDFLOAT)
+        set(LIGHT_RHI_SLANG_COMPAT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_cpu/slang_compat"
+            CACHE INTERNAL "Slang prelude compatibility include directory")
+    else()
+        unset(LIGHT_RHI_SLANG_COMPAT_DIR CACHE)
+    endif()
+
+    add_library(LightRHICpuBackend STATIC)
+    add_library(LightRHI::CpuBackend ALIAS LightRHICpuBackend)
+    set_target_properties(LightRHICpuBackend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    file(GLOB _cpu_modules CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_cpu/*.cppm")
+    file(GLOB_RECURSE _cpu_sources CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_cpu/*.cpp")
+    target_sources(LightRHICpuBackend
+        PUBLIC
+        FILE_SET CXX_MODULES
+        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/source"
+        FILES ${_cpu_modules}
+        PRIVATE ${_cpu_sources}
+    )
+    target_include_directories(LightRHICpuBackend SYSTEM PRIVATE "${LIGHT_RHI_SLANG_PRELUDE_DIR}" ${LIGHT_RHI_SLANG_COMPAT_DIR})
+    target_link_libraries(LightRHICpuBackend PUBLIC LightRHI::LightRHI PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    target_warnings(LightRHICpuBackend)
+endif()
 
 # -------------------------------------------------------------------
 # Vulkan backend  (Linux / Windows)
@@ -221,8 +262,8 @@ endif()
 # Metal backend  (macOS)
 # -------------------------------------------------------------------
 if(LIGHT_RHI_BACKEND STREQUAL "Metal")
-    # CAMetalDisplayLink, which paces a surface to the display, exists only in Objective-C and
-    # Swift. A small Swift library reaches it and exposes plain functions to the C++ backend.
+    # Swift reaches CAMetalDisplayLink and claims Metal's autoreleased encoder returns. The C++
+    # backend calls these private bridges through the generated header.
     if(POLICY CMP0157)
         cmake_policy(SET CMP0157 NEW) # compile and link Swift as separate steps
     endif()
@@ -235,15 +276,20 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
     set(_light_rhi_swift_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${_light_rhi_swift_generated_dir}")
     file(GLOB _light_rhi_swift_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/backend_metal/*.swift")
-    add_library(LightRHIMetalDisplayLink STATIC ${_light_rhi_swift_sources})
-    set_target_properties(LightRHIMetalDisplayLink PROPERTIES
-        Swift_MODULE_NAME LightRHIMetalDisplayLink
+    add_library(LightRHIMetalBridge STATIC ${_light_rhi_swift_sources})
+    set_target_properties(LightRHIMetalBridge PROPERTIES
+        Swift_MODULE_NAME LightRHIMetalBridge
         Swift_MODULE_DIRECTORY "${_light_rhi_swift_generated_dir}")
-    target_compile_options(LightRHIMetalDisplayLink PRIVATE
+    # -O in every build type, Debug too: it is what makes Swift claim each autoreleased encoder at
+    # once on recording threads that have no pool. Without it, every dispatch leaks an encoder.
+    # Do not remove it or replace it with a pool: see "Metal encoders on threads with no autorelease
+    # pool" in docs/ARCHITECTURE.md. tests/encoder_ownership fails if the claim breaks.
+    target_compile_options(LightRHIMetalBridge PRIVATE
+        -O
         -cxx-interoperability-mode=default
         "SHELL:-Xfrontend -clang-header-expose-decls=has-expose-attr"
-        -emit-objc-header-path "${_light_rhi_swift_generated_dir}/LightRHIMetalDisplayLink-Swift.h")
-    target_link_libraries(LightRHIMetalDisplayLink PRIVATE "-framework QuartzCore")
+        -emit-objc-header-path "${_light_rhi_swift_generated_dir}/LightRHIMetalBridge-Swift.h")
+    target_link_libraries(LightRHIMetalBridge PRIVATE "-framework QuartzCore")
 
     add_library(LightRHIBackend SHARED)
     add_library(LightRHI::Backend ALIAS LightRHIBackend)
@@ -281,17 +327,17 @@ if(LIGHT_RHI_BACKEND STREQUAL "Metal")
         PUBLIC  LightRHI::LightRHI
         PRIVATE
             metal-cpp::metal-cpp
-            LightRHIMetalDisplayLink
+            LightRHIMetalBridge
             ${METAL_FRAMEWORK}
             ${FOUNDATION_FRAMEWORK}
             ${QUARTZCORE_FRAMEWORK}
     )
-    add_dependencies(LightRHIBackend LightRHIMetalDisplayLink)
+    add_dependencies(LightRHIBackend LightRHIMetalBridge)
     # The generated header, and the Swift runtime headers it includes.
     target_include_directories(LightRHIBackend SYSTEM PRIVATE
         "${_light_rhi_swift_generated_dir}" "${_light_rhi_swift_resource_path}")
     set_source_files_properties(${_mtl_sources} PROPERTIES OBJECT_DEPENDS
-        "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}LightRHIMetalDisplayLink${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}LightRHIMetalBridge${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
     # LightRHIBackend.dylib looks for LightRHI.dylib in the same directory at runtime
     set_target_properties(LightRHIBackend PROPERTIES
@@ -316,6 +362,9 @@ foreach(_san IN ITEMS asan ubsan tsan)
     if(LIGHT_RHI_ENABLE_${_SAN})
         enable_sanitizer(LightRHI ${_san})
         enable_sanitizer(LightRHIBackend ${_san})
+        if(TARGET LightRHICpuBackend)
+            enable_sanitizer(LightRHICpuBackend ${_san})
+        endif()
     endif()
 endforeach()
 

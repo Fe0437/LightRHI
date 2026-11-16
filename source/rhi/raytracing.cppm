@@ -4,6 +4,7 @@
  */
 module;
 #include "flag_enum.h"
+
 #include <cstdint>
 #include <string_view>
 #include <utility> // std::to_underlying
@@ -47,7 +48,7 @@ export namespace rhi
     // NOLINTNEXTLINE(performance-enum-size)
     enum class LIGHT_RHI_FLAG_ENUM AccelerationStructureInstanceFlags : uint32_t
     {
-        None                          = 0,      ///< Uses the geometry's default culling and opacity.
+        None                          = 0,        ///< Uses the geometry's default culling and opacity.
         TriangleCullDisable           = 1U << 0U, ///< Makes both triangle faces visible to ray queries.
         TriangleFrontCounterClockwise = 1U << 1U, ///< Treats counter-clockwise triangles as front-facing.
         ForceOpaque                   = 1U << 2U, ///< Treats all geometry in the instance as opaque.
@@ -79,7 +80,8 @@ export namespace rhi
         uint32_t                           InstanceCustomIndex{0}; ///< Application value returned by ray queries.
         uint32_t                           InstanceMask{0xFF};     ///< Eight-bit visibility mask tested by ray queries.
         AccelerationStructureInstanceFlags Flags{
-            AccelerationStructureInstanceFlags::None}; ///< Per-instance traversal flags.
+            AccelerationStructureInstanceFlags::None,
+        }; ///< Per-instance traversal flags.
     };
 
     /**
@@ -111,7 +113,8 @@ export namespace rhi
     struct AccelerationStructureDesc
     {
         AccelerationStructureType Type{
-            AccelerationStructureType::BottomLevel}; ///< Selects the active field group below.
+            AccelerationStructureType::BottomLevel,
+        }; ///< Selects the active field group below.
 
         // ---- BLAS fields (Type == BottomLevel) ----
         GpuAddress VertexBufferAddress{};        ///< Address of position data beginning with the first vertex.

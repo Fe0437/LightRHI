@@ -24,6 +24,7 @@ include_guard(GLOBAL)
 #   <OUTPUT_DIR>/<source>.spv        Vulkan
 #   <OUTPUT_DIR>/<source>.metallib   Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MetalLib (default)
 #   <OUTPUT_DIR>/<source>.metal      Metal, LIGHT_RHI_METAL_SHADER_FORMAT=MslSource
+#   <OUTPUT_DIR>/<source>.lrcpu      CPU, BACKEND cpu (compute-only libraries)
 # Anything else the compile goes through is kept under <OUTPUT_DIR>/intermediate/ and is not shipped.
 #
 # The backend reads them back with rhi::ReadShaderLibrary(directory, "<source>"): what the files are
@@ -131,6 +132,9 @@ function(light_rhi_compile_shaders)
         set(_format "rhi::ShaderFormat::MetalLib")
         _light_rhi_metal_sdk(_metal_sdk)
         set(_metal_sdk_args --metal-sdk "${_metal_sdk}")
+        if(DEBUG_ENABLED)
+            list(APPEND _metal_sdk_args --metal-debug-info)
+        endif()
     elseif(_backend STREQUAL "metal")
         set(_target metal)
         set(_extension ".metal")
@@ -139,6 +143,12 @@ function(light_rhi_compile_shaders)
         set(_target spirv)
         set(_extension ".spv")
         set(_format "rhi::ShaderFormat::Spirv")
+    elseif(_backend STREQUAL "cpu")
+        if(NOT TARGET LightRHICpuBackend)
+            message(FATAL_ERROR "light_rhi_compile_shaders: BACKEND cpu needs LIGHT_RHI_BUILD_CPU_BACKEND=ON")
+        endif()
+        set(_extension ".lrcpu")
+        set(_format "rhi::ShaderFormat::HostCallable")
     else()
         message(FATAL_ERROR "light_rhi_compile_shaders unsupported backend: ${_backend}")
     endif()
@@ -190,19 +200,46 @@ function(light_rhi_compile_shaders)
         math(EXPR _shader_last "${_shader_count} - 1")
         foreach(_i RANGE ${_shader_last})
             string(JSON _shader_source GET "${_manifest_content}" shaders ${_i} source)
-            list(APPEND _sources "${_shader_source}")
+            string(JSON _shader_stage GET "${_manifest_content}" shaders ${_i} stage)
+            if(NOT _backend STREQUAL "cpu" OR _shader_stage STREQUAL "compute")
+                list(APPEND _sources "${_shader_source}")
+            endif()
         endforeach()
         list(REMOVE_DUPLICATES _sources)
     endif()
 
+    if(LIGHT_RHI_SHADER_NAME_PREFIX)
+        set(_shader_target "${LIGHT_RHI_SHADER_NAME_PREFIX}_shaders")
+    else()
+        set(_shader_target "${LIGHT_RHI_SHADER_TARGET}_shaders")
+    endif()
     set(_artifacts "")
+    set(_cpu_libraries "")
     foreach(_shader_source IN LISTS _sources)
         get_filename_component(_library "${_shader_source}" NAME_WE)
         set(_shader_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_library}${_extension}")
+        set(_slang_out "${_shader_out}")
+        if(_backend STREQUAL "cpu")
+            set(_slang_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/intermediate/${_library}.cpp")
+            set(_cpu_target "${_shader_target}_${_library}")
+            add_library("${_cpu_target}" MODULE "${_slang_out}")
+            set_target_properties("${_cpu_target}" PROPERTIES
+                CXX_SCAN_FOR_MODULES OFF
+                CXX_VISIBILITY_PRESET hidden
+                PREFIX ""
+                OUTPUT_NAME "${_library}"
+                SUFFIX "${_extension}"
+                LIBRARY_OUTPUT_DIRECTORY "${LIGHT_RHI_SHADER_OUTPUT_DIR}"
+                RUNTIME_OUTPUT_DIRECTORY "${LIGHT_RHI_SHADER_OUTPUT_DIR}")
+            target_compile_features("${_cpu_target}" PRIVATE cxx_std_23)
+            target_include_directories("${_cpu_target}" PRIVATE "${_light_rhi_root}/source/backend_cpu")
+            target_include_directories("${_cpu_target}" SYSTEM PRIVATE ${LIGHT_RHI_SLANG_COMPAT_DIR})
+            list(APPEND _cpu_libraries "${_cpu_target}")
+        endif()
         # The fields of the library's parameter structs, which rhi::ShaderLayout reads.
         set(_layout_out "${LIGHT_RHI_SHADER_OUTPUT_DIR}/${_library}.layout")
         add_custom_command(
-            OUTPUT "${_shader_out}" "${_layout_out}"
+            OUTPUT "${_slang_out}" "${_layout_out}"
             COMMAND "${Python3_EXECUTABLE}"
                     "${_compile_shaders_py}"
                     --shaders-json "${LIGHT_RHI_SHADER_SHADERS_JSON}"
@@ -221,12 +258,14 @@ function(light_rhi_compile_shaders)
         list(APPEND _artifacts "${_shader_out}" "${_layout_out}")
     endforeach()
 
-    if(LIGHT_RHI_SHADER_NAME_PREFIX)
-        set(_shader_target "${LIGHT_RHI_SHADER_NAME_PREFIX}_shaders")
+    if(_backend STREQUAL "cpu")
+        add_custom_target("${_shader_target}")
+        if(_cpu_libraries)
+            add_dependencies("${_shader_target}" ${_cpu_libraries})
+        endif()
     else()
-        set(_shader_target "${LIGHT_RHI_SHADER_TARGET}_shaders")
+        add_custom_target("${_shader_target}" DEPENDS ${_artifacts})
     endif()
-    add_custom_target("${_shader_target}" DEPENDS ${_artifacts})
     add_dependencies("${LIGHT_RHI_SHADER_TARGET}" "${_shader_target}")
     # Which target builds each library, so light_rhi_ship_shaders can wait for it from any directory.
     foreach(_artifact IN LISTS _artifacts)

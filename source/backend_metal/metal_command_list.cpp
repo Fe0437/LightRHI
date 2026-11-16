@@ -25,9 +25,13 @@ module;
 // Global module fragment: all system + metal-cpp headers included before
 // "module rhi.metal;" to keep libc++ include-guard state consistent and
 // avoid __promote_t redefinition with Clang's C++23 module support.
+#include "metal_encoder_ownership.h"
+
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 #include <QuartzCore/QuartzCore.hpp>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -136,12 +140,14 @@ namespace rhi::metal
                 if (!debugName.empty())
                 {
                     const std::string label{std::string{debugName} + " / debug resource table"};
-                    tableDesc->setLabel(NS::String::string(label.c_str(), NS::UTF8StringEncoding));
+                    tableDesc->setLabel(MakeLabel(label).get());
                 }
             }
             NS::Error *err{nullptr};
-            auto       argTable{AdoptCreated(device.MtlDevice().newArgumentTable(tableDesc.get(), &err),
-                                             "MTLDevice::newArgumentTable refused the table", err)};
+            auto       argTable{
+                AdoptCreated(device.MtlDevice().newArgumentTable(tableDesc.get(), &err),
+                             "MTLDevice::newArgumentTable refused the table", err),
+            };
             if (!argTable)
             {
                 return std::unexpected{argTable.error()};
@@ -158,16 +164,16 @@ namespace rhi::metal
                                                       std::move(*argTable), *firstBlock, queueType, debugName);
         }
 
-        MetalCommandList(ConstructionToken /*unused*/, MetalDevice &device, MetalCommandResources resources,
-                         NS::SharedPtr<MTL4::ArgumentTable> argTable, BufferHandle firstPushConstantBlock,
+        MetalCommandList(ConstructionToken /*unused*/, MetalDevice &device, MetalCommandResources &&resources,
+                         NS::SharedPtr<MTL4::ArgumentTable> &&argTable, BufferHandle firstPushConstantBlock,
                          QueueType queueType, std::string_view debugName)
-            : _device{device}, _allocator{std::move(resources.Allocator)}, _cmd{std::move(resources.CommandBuffer)},
+            : _device{device}, _allocator{std::move(resources).Allocator}, _cmd{std::move(resources).CommandBuffer},
               _argTable{std::move(argTable)}, _pushConstantBlocks{firstPushConstantBlock}, _debugName{debugName},
               _queueType{queueType}
         {
             if (!_debugName.empty())
             {
-                _cmd->setLabel(NS::String::string(_debugName.c_str(), NS::UTF8StringEncoding));
+                _cmd->setLabel(MakeLabel(_debugName).get());
             }
             _allocator->reset();
             _cmd->beginCommandBuffer(_allocator.get());
@@ -287,6 +293,9 @@ namespace rhi::metal
 
             for (NS::UInteger i{0}; i < static_cast<NS::UInteger>(desc.Color.size()); ++i)
             {
+                // Recorded for every pass while drawing: the loop bound is the size, and debug builds check
+                // every `[]` through standard-library hardening, so release pays for no second check.
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
                 const auto &ca{desc.Color[i]};
                 auto       *att{rpd->colorAttachments()->object(i)};
                 att->setTexture(&_lookupTexture(ca.Texture));
@@ -310,7 +319,9 @@ namespace rhi::metal
                 d->setClearDepth((double)desc.Depth.ClearValue.Depth);
             }
 
-            const auto &render{_encoder.emplace<RenderEncoder>(NS::RetainPtr(_cmd->renderCommandEncoder(rpd.get())))};
+            const auto &render{
+                _encoder.emplace<RenderEncoder>(NS::TransferPtr(CreateOwnedRenderEncoder(*_cmd.get(), *rpd.get()))),
+            };
             // A barrier flushed outside a pass belongs to the first work that could see
             // what it orders, which is this pass.
             _recordPendingBarrier();
@@ -328,21 +339,25 @@ namespace rhi::metal
         void SetViewport(const Viewport &vp) override
         {
             _renderEncoder("SetViewport")
-                .setViewport(MTL::Viewport{.originX = (double)vp.X,
-                                           .originY = (double)vp.Y,
-                                           .width   = (double)vp.Width,
-                                           .height  = (double)vp.Height,
-                                           .znear   = (double)vp.MinDepth,
-                                           .zfar    = (double)vp.MaxDepth});
+                .setViewport(MTL::Viewport{
+                    .originX = (double)vp.X,
+                    .originY = (double)vp.Y,
+                    .width   = (double)vp.Width,
+                    .height  = (double)vp.Height,
+                    .znear   = (double)vp.MinDepth,
+                    .zfar    = (double)vp.MaxDepth,
+                });
         }
 
         void SetScissor(const Scissor &s) override
         {
             _renderEncoder("SetScissor")
-                .setScissorRect(MTL::ScissorRect{.x      = static_cast<NS::UInteger>(s.X),
-                                                 .y      = static_cast<NS::UInteger>(s.Y),
-                                                 .width  = s.Width,
-                                                 .height = s.Height});
+                .setScissorRect(MTL::ScissorRect{
+                    .x      = static_cast<NS::UInteger>(s.X),
+                    .y      = static_cast<NS::UInteger>(s.Y),
+                    .width  = s.Width,
+                    .height = s.Height,
+                });
         }
 
         // ---- Pipeline ----
@@ -360,7 +375,7 @@ namespace rhi::metal
                 // Naming a pass takes over a microsecond, so only a device that can be captured does it.
                 if (_device.get().DebugCaptureEnabled())
                 {
-                    if (auto *label{p.ComputePso->label()})
+                    if (const auto *label{p.ComputeLabel.get()})
                     {
                         compute.setLabel(label);
                     }
@@ -441,10 +456,16 @@ namespace rhi::metal
             }
             else if (_pushConstantBlocks.size() > 1)
             {
-                const std::span<std::byte> previous{_device.get()
-                                                        .MapBuffer(_pushConstantBlocks[_pushConstantBlocks.size() - 2])
-                                                        .Bytes()
-                                                        .last(kPushConstantSliceSize)};
+                const std::span<std::byte> previous{
+                    _device
+                        .get()
+                        // Recorded for every draw: the branch already holds two blocks, and debug builds check
+                        // every `[]` through standard-library hardening.
+                        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                        .MapBuffer(_pushConstantBlocks[_pushConstantBlocks.size() - 2])
+                        .Bytes()
+                        .last(kPushConstantSliceSize),
+                };
                 std::memcpy(slice.data(), previous.data(), kPushConstantSliceSize);
             }
             std::memcpy(slice.subspan(offset).data(), data.data(), data.size_bytes());
@@ -553,9 +574,9 @@ namespace rhi::metal
             auto *enc{legacyCmd->accelerationStructureCommandEncoder()};
             if (!desc.DebugName.empty())
             {
-                auto *label{MakeLabel(desc.DebugName)};
-                legacyCmd->setLabel(label);
-                enc->setLabel(label);
+                const auto label{MakeLabel(desc.DebugName)};
+                legacyCmd->setLabel(label.get());
+                enc->setLabel(label.get());
             }
             enc->buildAccelerationStructure(_device.get().AccelStruct(handle).As.get(), descriptor.get(),
                                             &_lookupBuffer(scratchBuffer), scratchOffset);
@@ -635,7 +656,7 @@ namespace rhi::metal
             att->setStoreAction(MTL::StoreActionStore);
             att->setClearColor(
                 MTL::ClearColor::Make((double)color.R, (double)color.G, (double)color.B, (double)color.A));
-            auto *enc{_cmd->renderCommandEncoder(rpd.get())};
+            const auto enc{NS::TransferPtr(CreateOwnedRenderEncoder(*_cmd.get(), *rpd.get()))};
             enc->endEncoding();
         }
 
@@ -649,7 +670,7 @@ namespace rhi::metal
             d->setLoadAction(MTL::LoadActionClear);
             d->setStoreAction(MTL::StoreActionStore);
             d->setClearDepth((double)clear.Depth);
-            auto *enc{_cmd->renderCommandEncoder(rpd.get())};
+            const auto enc{NS::TransferPtr(CreateOwnedRenderEncoder(*_cmd.get(), *rpd.get()))};
             enc->endEncoding();
         }
 
@@ -672,8 +693,8 @@ namespace rhi::metal
 
         void BeginDebugGroup(std::string_view name, float /*r*/, float /*g*/, float /*b*/) override
         {
-            auto *ns{MakeLabel(name)};
-            _pushDebugGroup(ns);
+            const auto ns{MakeLabel(name)};
+            _pushDebugGroup(ns.get());
         }
 
         void EndDebugGroup() override
@@ -683,10 +704,10 @@ namespace rhi::metal
 
         void InsertDebugLabel(std::string_view label) override
         {
-            auto *ns{MakeLabel(label)};
+            const auto ns{MakeLabel(label)};
             if (auto *encoder{_activeEncoder()})
             {
-                encoder->insertDebugSignpost(ns);
+                encoder->insertDebugSignpost(ns.get());
             }
         }
 
@@ -750,8 +771,13 @@ namespace rhi::metal
          */
         [[nodiscard]] static std::expected<BufferHandle, DeviceError> _createPushConstantBlock(MetalDevice &device)
         {
-            auto block{device.CreateBuffer(BufferDesc{
-                .Size = kPushConstantBlockSize, .Usage = BufferUsage::Storage, .MemoryType = MemoryType::CpuToGpu})};
+            auto block{
+                device.CreateBuffer(BufferDesc{
+                    .Size       = kPushConstantBlockSize,
+                    .Usage      = BufferUsage::Storage,
+                    .MemoryType = MemoryType::CpuToGpu,
+                }),
+            };
             if (!block)
             {
                 ReportRefusal("the device refused the root-data scratch for a command list");
@@ -888,12 +914,14 @@ namespace rhi::metal
             {
                 // Use the smallest scope for a dependency within one pass. Metal only accepts
                 // stages that the current encoder can execute for an intra-pass barrier.
-                const MTL::Stages supportedStages{std::holds_alternative<RenderEncoder>(_encoder)
-                                                      ? static_cast<MTL::Stages>(MTL::StageVertex | MTL::StageFragment)
-                                                      : static_cast<MTL::Stages>(MTL::StageDispatch | MTL::StageBlit |
-                                                                                 MTL::StageAccelerationStructure)};
-                const auto        intraAfter{static_cast<MTL::Stages>(_pendingAfterStages & supportedStages)};
-                const auto        intraBefore{static_cast<MTL::Stages>(_pendingBeforeStages & supportedStages)};
+                const MTL::Stages supportedStages{
+                    std::holds_alternative<RenderEncoder>(_encoder)
+                        ? static_cast<MTL::Stages>(MTL::StageVertex | MTL::StageFragment)
+                        : static_cast<MTL::Stages>(MTL::StageDispatch | MTL::StageBlit |
+                                                   MTL::StageAccelerationStructure),
+                };
+                const auto intraAfter{static_cast<MTL::Stages>(_pendingAfterStages & supportedStages)};
+                const auto intraBefore{static_cast<MTL::Stages>(_pendingBeforeStages & supportedStages)};
                 if (intraAfter != 0 && intraBefore != 0)
                 {
                     encoder->barrierAfterEncoderStages(intraAfter, intraBefore, MTL4::VisibilityOptionDevice);
@@ -961,7 +989,9 @@ namespace rhi::metal
                 return *compute->get();
             }
             _endActiveEncoder();
-            const auto &compute{_encoder.emplace<ComputeEncoder>(NS::RetainPtr(_cmd->computeCommandEncoder()))};
+            const auto &compute{
+                _encoder.emplace<ComputeEncoder>(NS::TransferPtr(CreateOwnedComputeEncoder(*_cmd.get()))),
+            };
             compute->setArgumentTable(_argTable.get());
             // A barrier flushed outside a pass belongs to the first work that could see
             // what it orders, which is this encoder.
@@ -1070,7 +1100,7 @@ namespace rhi::metal
                                                                                              std::string_view name)
     {
         return MetalCommandList::Create(*this, q, name)
-            .transform([](std::unique_ptr<MetalCommandList> commands)
+            .transform([](std::unique_ptr<MetalCommandList> &&commands)
                        { return std::unique_ptr<ICommandList>{std::move(commands)}; });
     }
 

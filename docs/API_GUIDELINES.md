@@ -53,9 +53,15 @@ assignment, aliases, default arguments, enum values, and deleted or defaulted
 functions. Use designated initializers for descriptor and schema aggregates.
 
 Use a value type when data has no hidden lifetime or invariant. Use a class when
-it protects an invariant, owns behavior, or manages a resource. Prefer one
-descriptor value to a long parameter list. Do not add a field without a concrete
-use.
+it protects an invariant, owns behavior, or manages a resource. A function takes
+at most three parameters; more go in one descriptor value, filled with designated
+initializers at the call. Do not add a field without a concrete use.
+
+A record that packs several values into one number is a bit-field struct whose
+name ends with `Packed`. When C++ and a shader both use it, it lives in one
+header both include, so its layout has one source. Code reads its fields by name.
+Pack only where room is scarce; elsewhere use a typed record. A field of
+independent yes/no bits ends with `Flags`.
 
 Use RAII and standard smart pointers for ownership. Do not use raw `new` or
 `delete`; make an owned object with `std::make_unique`. When a factory must be
@@ -64,9 +70,13 @@ public but takes a private `PassKey` type whose default constructor is
 `explicit`, so only the class can make one. Code built without exceptions that
 must report a failed allocation instead passes `new (std::nothrow)` straight
 into the `std::unique_ptr` and checks it. Use references for required borrowed objects and plain pointers only
-when null is meaningful. Use `gsl::not_null` when pointer syntax is required but
-null is not valid. Use `std::span` for synchronous borrowed contiguous sequences.
-Use `T&&` only when the callee takes ownership.
+when null is meaningful. A required borrowed object kept in a field is a
+`std::reference_wrapper`, never a pointer documented as never null. Use `std::span` for synchronous borrowed contiguous sequences.
+Use `T&&` only when the callee takes ownership. A parameter the callee keeps or
+moves from is `T&&`, never `T` by value, unless `T` is trivially copyable: moving
+such a type only copies it, so it is taken by value. A caller that keeps its own
+value copies it explicitly, as `T{value}` or `auto{value}`, so every copy shows
+where it is made.
 
 Return `std::expected<T, E>` for recoverable C++ failures. Use a domain
 `enum class` when one module owns the closed failure set, or a stable typed token
@@ -79,10 +89,15 @@ allocation, mapping, or copying.
 
 ### Keep contracts cohesive
 
-A package should have one reason to change. Split a responsibility when the new
-part has a different lifecycle, forms a useful contract, or keeps a volatile
-dependency from moving inward. Do not split cohesive implementation steps merely
-to shorten a file.
+A package should have one reason to change, and so should each file in it: one
+type, or one group of functions that change together. Split a responsibility when
+the new part has a different lifecycle, forms a useful contract, or keeps a
+volatile dependency from moving inward. Do not split cohesive implementation
+steps merely to shorten a file. Shared code is a module, not a header, unless a
+non-C++ consumer such as a shader must read it.
+
+A package's build takes every source file in its folder, so adding a file never
+changes the build. The build changes only when a package is added.
 
 An interface lives with the stable concept that owns the contract. Avoid generic
 packages named `types`, `interfaces`, `common`, `helpers`, `utilities`, or
@@ -101,7 +116,8 @@ enum value, aggregate field, function, and public method at its declaration.
 
 Write from the caller's point of view. State units, valid ranges, ownership,
 lifetime, mutation, call order, synchronization, and failure behavior when they
-matter. Use short sentences and ordinary words.
+matter. Use short sentences and ordinary words. Say what a thing does and what
+its caller must do, then stop: cut every sentence a reader would not miss.
 
 Use `{brief}`, `{param name}`, `{tparam name}`, `{returns}`, `{note}`,
 `{warning}`, `{pre}`, and `{post}`. A field description stays on the same line
@@ -111,6 +127,10 @@ after `///<` when it is short.
 
 Use the repository formatter and static-analysis configuration. Do not hand-format
 around them. Never edit generated files by hand.
+
+Choose between designs by the work each does in every use case: count reads,
+writes, passes and allocations first, and take the one that does least. Measure
+to confirm, or to decide only when counting leaves a real doubt.
 
 A public signature, exported value, error, ownership rule, or package-boundary
 change requires corresponding documentation and contract-test review. Add no

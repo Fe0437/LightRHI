@@ -18,7 +18,7 @@
 
 import lightRHI;
 
-#include "device_result.h"
+#include "../device_result.h"
 #include "gpu_flags.h"
 
 // ---------------------------------------------------------------------------
@@ -26,7 +26,7 @@ import lightRHI;
 // shaders.json, loaded at runtime by shader_artifact_loader.h). No shader
 // source is embedded in this translation unit.
 // ---------------------------------------------------------------------------
-#include "shader_artifact_loader.h"
+#include "../shader_artifact_loader.h"
 
 // ---------------------------------------------------------------------------
 // Minimal test harness

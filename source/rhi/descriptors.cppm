@@ -105,7 +105,7 @@ export namespace rhi
         OutOfRange,         ///< The offset and required size do not fit inside the heap.
         IncompatibleMemory, ///< The device cannot place this resource in the heap's memory type.
         Overlapping,        ///< Validation found a live placement covering the same bytes.
-        CreationFailed      ///< The backend could not query or create the resource.
+        CreationFailed,     ///< The backend could not query or create the resource.
     };
 
     /**

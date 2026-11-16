@@ -11,8 +11,8 @@
 
 import lightRHI;
 
-#include "device_result.h"
-#include "shader_artifact_loader.h"
+#include "../device_result.h"
+#include "../shader_artifact_loader.h"
 
 // ---------------------------------------------------------------------------
 // Minimal test harness (mirrors rhi_tests.cpp)

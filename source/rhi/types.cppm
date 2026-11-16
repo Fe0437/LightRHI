@@ -4,6 +4,7 @@
  */
 module;
 #include "flag_enum.h"
+
 #include <cstdint>
 #include <utility> // std::to_underlying
 
@@ -126,20 +127,20 @@ export namespace rhi
     enum class LIGHT_RHI_FLAG_ENUM ResourceState : uint32_t
     {
         Undefined                  = 0,           ///< Contents and previous access need not be preserved.
-        VertexBuffer               = 1U << 0U,      ///< Read as vertex input.
-        IndexBuffer                = 1U << 1U,      ///< Read as index input.
-        ConstantBuffer             = 1U << 2U,      ///< Read as constant or uniform data.
-        ShaderRead                 = 1U << 3U,      ///< Read-only shader access or texture sampling.
-        UnorderedAccess            = 1U << 4U,      ///< Shader read/write access.
-        RenderTarget               = 1U << 5U,      ///< Color-attachment write access.
-        DepthRead                  = 1U << 6U,      ///< Read-only depth/stencil attachment access.
-        DepthWrite                 = 1U << 7U,      ///< Writable depth/stencil attachment access.
-        TransferSrc                = 1U << 8U,      ///< Source of a copy or blit operation.
-        TransferDst                = 1U << 9U,      ///< Destination of a copy, blit, clear, or fill operation.
-        Present                    = 1U << 10U,     ///< Ready for presentation by a presentation owner.
-        IndirectArgument           = 1U << 11U,     ///< Read as draw or dispatch arguments.
-        AccelerationStructureWrite = 1U << 12U,     ///< Written by an acceleration-structure build.
-        AccelerationStructureRead  = 1U << 13U,     ///< Traversed by a shader ray query or TLAS build.
+        VertexBuffer               = 1U << 0U,    ///< Read as vertex input.
+        IndexBuffer                = 1U << 1U,    ///< Read as index input.
+        ConstantBuffer             = 1U << 2U,    ///< Read as constant or uniform data.
+        ShaderRead                 = 1U << 3U,    ///< Read-only shader access or texture sampling.
+        UnorderedAccess            = 1U << 4U,    ///< Shader read/write access.
+        RenderTarget               = 1U << 5U,    ///< Color-attachment write access.
+        DepthRead                  = 1U << 6U,    ///< Read-only depth/stencil attachment access.
+        DepthWrite                 = 1U << 7U,    ///< Writable depth/stencil attachment access.
+        TransferSrc                = 1U << 8U,    ///< Source of a copy or blit operation.
+        TransferDst                = 1U << 9U,    ///< Destination of a copy, blit, clear, or fill operation.
+        Present                    = 1U << 10U,   ///< Ready for presentation by a presentation owner.
+        IndirectArgument           = 1U << 11U,   ///< Read as draw or dispatch arguments.
+        AccelerationStructureWrite = 1U << 12U,   ///< Written by an acceleration-structure build.
+        AccelerationStructureRead  = 1U << 13U,   ///< Traversed by a shader ray query or TLAS build.
         CopySrc                    = TransferSrc, ///< Alias for TransferSrc.
         CopyDst                    = TransferDst, ///< Alias for TransferDst.
     };
@@ -168,7 +169,7 @@ export namespace rhi
     // NOLINTNEXTLINE(performance-enum-size)
     enum class LIGHT_RHI_FLAG_ENUM BufferUsage : uint32_t
     {
-        None          = 0,      ///< No GPU operation is declared.
+        None          = 0,        ///< No GPU operation is declared.
         Vertex        = 1U << 0U, ///< May be bound as vertex input.
         Index         = 1U << 1U, ///< May be bound as index input.
         Constant      = 1U << 2U, ///< May be read as constant or uniform data.
@@ -203,7 +204,7 @@ export namespace rhi
     // NOLINTNEXTLINE(performance-enum-size)
     enum class LIGHT_RHI_FLAG_ENUM TextureUsage : uint32_t
     {
-        None    = 0,      ///< No GPU operation is declared.
+        None    = 0,        ///< No GPU operation is declared.
         Sampled = 1U << 0U, ///< May be sampled or read by shaders.
         // Declares the intent on the resource, which every backend honours. Reaching a texture as
         // writable storage from a shader has no path in this API yet: shaders address buffers by
@@ -258,7 +259,7 @@ export namespace rhi
     enum class IndexType : uint8_t
     {
         Uint16,
-        Uint32
+        Uint32,
     };
 
     /** {brief} Selects how vertex or index sequences form primitives. */
@@ -276,19 +277,19 @@ export namespace rhi
     {
         None,
         Front,
-        Back
+        Back,
     };
     /** {brief} Selects solid or edge-only triangle rasterization. */
     enum class FillMode : uint8_t
     {
         Solid,
-        Wireframe
+        Wireframe,
     };
     /** {brief} Selects the winding order considered front-facing. */
     enum class FrontFace : uint8_t
     {
         CounterClockwise,
-        Clockwise
+        Clockwise,
     };
 
     // ---- Comparison and blending ----
@@ -331,7 +332,7 @@ export namespace rhi
         Subtract,
         ReverseSubtract,
         Min,
-        Max
+        Max,
     };
 
     // ---- Attachment operations ----
@@ -339,16 +340,16 @@ export namespace rhi
     /** {brief} Selects how an attachment's previous contents are treated at BeginRendering(). */
     enum class LoadOp : uint8_t
     {
-        Load,    ///< Preserves and exposes existing contents.
-        Clear,   ///< Initializes the attachment from its clear value.
-        DontCare ///< Existing contents need not be preserved.
+        Load,     ///< Preserves and exposes existing contents.
+        Clear,    ///< Initializes the attachment from its clear value.
+        DontCare, ///< Existing contents need not be preserved.
     };
 
     /** {brief} Selects whether attachment contents are preserved after EndRendering(). */
     enum class StoreOp : uint8_t
     {
-        Store,   ///< Preserves rendered contents for later use.
-        DontCare ///< Contents need not be preserved.
+        Store,    ///< Preserves rendered contents for later use.
+        DontCare, ///< Contents need not be preserved.
     };
 
     // ---- Sampling ----
@@ -357,13 +358,13 @@ export namespace rhi
     enum class SamplerFilter : uint8_t
     {
         Nearest,
-        Linear
+        Linear,
     };
     /** {brief} Selects nearest-neighbor or linear selection between mip levels. */
     enum class SamplerMipMode : uint8_t
     {
         Nearest,
-        Linear
+        Linear,
     };
     /** {brief} Selects how normalized texture coordinates outside `[0, 1]` are resolved. */
     enum class SamplerAddressMode : uint8_t
@@ -371,14 +372,14 @@ export namespace rhi
         Repeat,
         MirroredRepeat,
         ClampToEdge,
-        ClampToBorder
+        ClampToBorder,
     };
     /** {brief} Selects the fixed value returned by ClampToBorder addressing. */
     enum class BorderColor : uint8_t
     {
         TransparentBlack,
         OpaqueBlack,
-        OpaqueWhite
+        OpaqueWhite,
     };
 
     // ---- Shader stages and artifacts ----
@@ -405,9 +406,10 @@ export namespace rhi
     /** {brief} Identifies the encoding of an already-compiled shader artifact. */
     enum class ShaderFormat : uint8_t
     {
-        Spirv,     ///< SPIR-V words for a Vulkan device.
-        MslSource, ///< Metal Shading Language source accepted by a Metal device.
-        MetalLib,  ///< Precompiled Metal library bytes accepted by a Metal device.
+        Spirv,        ///< SPIR-V words for a Vulkan device.
+        MslSource,    ///< Metal Shading Language source accepted by a Metal device.
+        MetalLib,     ///< Precompiled Metal library bytes accepted by a Metal device.
+        HostCallable, ///< A trusted native compute library built for the host.
     };
 
     // ---- Geometry and clear values ----

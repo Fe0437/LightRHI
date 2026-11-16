@@ -59,7 +59,7 @@ export namespace rhi
     enum class ExternalTextureError : std::uint8_t
     {
         Unavailable, ///< Nothing is free this instant, or the source has no area; skip the frame.
-        Lost         ///< The source or its device is gone; build a new one.
+        Lost,        ///< The source or its device is gone; build a new one.
     };
 
     /**

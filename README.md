@@ -2,7 +2,8 @@
 
 LightRHI is a thin C++23 module-based rendering hardware interface. It exposes a
 backend-neutral `rhi` API and selects one platform backend at CMake configure
-time: Metal on Apple platforms, Vulkan elsewhere.
+time: Metal on Apple platforms, Vulkan elsewhere. Headless consumers can
+choose the CPU compute backend, which runs the same Slang kernels compiled to C++.
 
 The project is bindless-first and Slang-first. GPU resources are represented by
 small value handles, shaders address resources through bindless slots or GPU
@@ -20,6 +21,7 @@ submission, and synchronization are caller-visible.
 
 ```text
 source/rhi/             Public backend-neutral C++23 module partitions
+source/backend_cpu/     Headless compute implementation and lightRHI.cpu export
 source/backend_metal/   Metal implementation and lightRHI module export
 source/backend_vulkan/  Vulkan implementation and lightRHI module export
 examples/               Small executable examples

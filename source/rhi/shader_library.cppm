@@ -84,7 +84,7 @@ export namespace rhi
         }
 
       private:
-        ShaderLibrary(const ShaderFormat format, std::vector<std::byte> bytes)
+        ShaderLibrary(const ShaderFormat format, std::vector<std::byte> &&bytes)
             : _format{format}, _bytes{std::move(bytes)}
         {
         }

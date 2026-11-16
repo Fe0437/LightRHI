@@ -19,14 +19,47 @@ if(APPLE)
     # metal-cpp — Apple's official C++ wrapper for Metal
     find_package(metal-cpp CONFIG QUIET)
     if(NOT TARGET metal-cpp::metal-cpp)
-        if(EXISTS "${CMAKE_BINARY_DIR}/_deps/metal-cpp-src")
-            message(STATUS "[LightRHI] metal-cpp not found via find_package — reusing cached FetchContent fetch")
+        # metal-cpp follows a branch, so each configure asks GitHub where the branch is now. When GitHub
+        # cannot be reached, the copy already downloaded is used as it is, and the configure says so; with no
+        # copy yet, it stops and says what to do, instead of failing inside FetchContent.
+        set(_light_rhi_metal_cpp_repository https://github.com/bkaradzic/metal-cpp.git)
+        set(_light_rhi_metal_cpp_branch metal-cpp_27)
+        if(FETCHCONTENT_BASE_DIR)
+            set(_light_rhi_metal_cpp_source "${FETCHCONTENT_BASE_DIR}/metal-cpp-src")
         else()
-            message(STATUS "[LightRHI] metal-cpp not found via find_package — fetching via FetchContent")
+            set(_light_rhi_metal_cpp_source "${CMAKE_BINARY_DIR}/_deps/metal-cpp-src")
+        endif()
+        find_package(Git QUIET)
+        set(_light_rhi_metal_cpp_reachable 1)
+        if(GIT_EXECUTABLE)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" ls-remote --exit-code --heads
+                        "${_light_rhi_metal_cpp_repository}" "${_light_rhi_metal_cpp_branch}"
+                RESULT_VARIABLE _light_rhi_metal_cpp_reachable
+                OUTPUT_QUIET ERROR_QUIET
+                TIMEOUT 10)
+        endif()
+        if(NOT _light_rhi_metal_cpp_reachable EQUAL 0)
+            if(EXISTS "${_light_rhi_metal_cpp_source}/.git")
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" -C "${_light_rhi_metal_cpp_source}" rev-parse --short HEAD
+                    OUTPUT_VARIABLE _light_rhi_metal_cpp_commit
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+                message(WARNING
+                    "[LightRHI] ${_light_rhi_metal_cpp_repository} cannot be reached, so metal-cpp is not checked "
+                    "for updates: this build uses the copy already downloaded, commit ${_light_rhi_metal_cpp_commit} "
+                    "of branch ${_light_rhi_metal_cpp_branch}, in ${_light_rhi_metal_cpp_source}.")
+                set(FETCHCONTENT_UPDATES_DISCONNECTED_METAL-CPP ON)
+            else()
+                message(FATAL_ERROR
+                    "[LightRHI] metal-cpp has not been downloaded yet, and ${_light_rhi_metal_cpp_repository} cannot "
+                    "be reached. Connect to the network and configure again, or install metal-cpp where "
+                    "find_package(metal-cpp) finds it.")
+            endif()
         endif()
         FetchContent_Declare(metal-cpp
-            GIT_REPOSITORY https://github.com/bkaradzic/metal-cpp.git
-            GIT_TAG        metal-cpp_27
+            GIT_REPOSITORY ${_light_rhi_metal_cpp_repository}
+            GIT_TAG        ${_light_rhi_metal_cpp_branch}
             GIT_SHALLOW    TRUE
         )
         FetchContent_MakeAvailable(metal-cpp)

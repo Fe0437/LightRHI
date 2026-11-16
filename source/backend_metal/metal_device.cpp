@@ -20,11 +20,13 @@ module;
 // Metal.hpp only forward-declares MTL4::AccelerationStructureDescriptor
 // (via MTL4ComputeCommandEncoder.hpp) — pull in the concrete MTL4 AS
 // descriptor/geometry types here, in the global module fragment.
-#include "LightRHIMetalDisplayLink-Swift.h"
+#include "LightRHIMetalBridge-Swift.h"
 
 #include <Metal/MTL4AccelerationStructure.hpp>
 #include <QuartzCore/QuartzCore.hpp>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -58,7 +60,7 @@ namespace rhi
 {
     std::expected<std::unique_ptr<IDevice>, DeviceError> CreateDevice(const DeviceDesc &desc)
     {
-        return metal::MetalDevice::Create(desc).transform([](std::unique_ptr<metal::MetalDevice> device)
+        return metal::MetalDevice::Create(desc).transform([](std::unique_ptr<metal::MetalDevice> &&device)
                                                           { return std::unique_ptr<IDevice>{std::move(device)}; });
     }
 
@@ -102,7 +104,7 @@ namespace rhi
         // Metal 4 makes drawable textures reachable through the layer's own residency set.
         if (auto *layerResidency{layer->residencySet()})
         {
-            metalDevice.Mtl4Queue().addResidencySet(layerResidency);
+            metalDevice.RetainLayerResidency(*layerResidency);
         }
 
         // Showing the newest state at each refresh is what a display link is for.
@@ -280,8 +282,8 @@ namespace rhi::metal
         return _toPixFmt(f);
     }
 
-    std::expected<TextureHandle, DeviceError> MetalDevice::AdoptExternalTexture(NS::SharedPtr<MTL::Texture> tex,
-                                                                                const TextureDesc          &desc)
+    std::expected<TextureHandle, DeviceError> MetalDevice::AdoptExternalTexture(NS::SharedPtr<MTL::Texture> &&tex,
+                                                                                const TextureDesc            &desc)
     {
         return _adoptTexture(std::move(tex), desc, MemoryHeapHandle{}, 0, /*borrowed=*/true);
     }
@@ -291,24 +293,29 @@ namespace rhi::metal
         {
             const uint64_t         completedFence{_timelineEvent->signaledValue()};
             const std::scoped_lock lock{_commandResourcePoolMutex};
-            for (std::size_t i{0}; i < _commandResourcePool.size(); ++i)
+            const auto             completed{
+                std::ranges::find_if(_commandResourcePool,
+                                     [completedFence](const MetalCommandResources &pooled)
+                                     {
+                                         const auto fence{pooled.CompletionFence};
+                                         return !fence.Valid() || fence.Id <= completedFence;
+                                     }),
+            };
+            if (completed != _commandResourcePool.end())
             {
-                const auto fence{_commandResourcePool[i].CompletionFence};
-                if (!fence.Valid() || fence.Id <= completedFence)
+                MetalCommandResources resources{std::move(*completed)};
+                if (completed + 1 != _commandResourcePool.end())
                 {
-                    MetalCommandResources resources{std::move(_commandResourcePool[i])};
-                    if (i + 1 != _commandResourcePool.size())
-                    {
-                        _commandResourcePool[i] = std::move(_commandResourcePool.back());
-                    }
-                    _commandResourcePool.pop_back();
-                    return resources;
+                    *completed = std::move(_commandResourcePool.back());
                 }
+                _commandResourcePool.pop_back();
+                return resources;
             }
         }
 
         auto allocator{
-            AdoptCreated(_device->newCommandAllocator(), "MTLDevice::newCommandAllocator refused the allocator")};
+            AdoptCreated(_device->newCommandAllocator(), "MTLDevice::newCommandAllocator refused the allocator"),
+        };
         if (!allocator)
         {
             return std::unexpected{allocator.error()};
@@ -359,7 +366,8 @@ namespace rhi::metal
         constexpr DeviceError kNoDevice{DeviceError::NoDevice};
 
         auto device{
-            AdoptCreated(MTL::CreateSystemDefaultDevice(), "no Metal device on this system", nullptr, kNoDevice)};
+            AdoptCreated(MTL::CreateSystemDefaultDevice(), "no Metal device on this system", nullptr, kNoDevice),
+        };
         if (!device)
         {
             return std::unexpected{device.error()};
@@ -373,13 +381,17 @@ namespace rhi::metal
                 {
                     return (*device)->newMTL4CommandQueue();
                 }
-                auto queueDesc{AdoptRequired(MTL4::CommandQueueDescriptor::alloc()->init(),
-                                                  "MTL4::CommandQueueDescriptor could not be created")};
-                queueDesc->setLabel(NS::String::string("HdRestir / LightRHI compute queue", NS::UTF8StringEncoding));
+                auto queueDesc{
+                    AdoptRequired(MTL4::CommandQueueDescriptor::alloc()->init(),
+                                  "MTL4::CommandQueueDescriptor could not be created"),
+                };
+                queueDesc->setLabel(MakeLabel("HdRestir / LightRHI compute queue").get());
                 return (*device)->newMTL4CommandQueue(queueDesc.get(), &queueError);
-            }()};
+            }(),
+        };
         auto adoptedQueue{
-            AdoptCreated(queue, "MTLDevice::newMTL4CommandQueue refused the queue", queueError, kNoDevice)};
+            AdoptCreated(queue, "MTLDevice::newMTL4CommandQueue refused the queue", queueError, kNoDevice),
+        };
         if (!adoptedQueue)
         {
             return std::unexpected{adoptedQueue.error()};
@@ -387,51 +399,60 @@ namespace rhi::metal
 
         // Classic queue used only for the acceleration-structure build
         // exception — see LegacyQueue()'s doc comment in metal_internal.h.
-        auto legacyQueue{AdoptCreated((*device)->newCommandQueue(),
-                                      "MTLDevice::newCommandQueue refused the acceleration-structure queue", nullptr,
-                                      kNoDevice)};
+        auto legacyQueue{
+            AdoptCreated((*device)->newCommandQueue(),
+                         "MTLDevice::newCommandQueue refused the acceleration-structure queue", nullptr, kNoDevice),
+        };
         if (!legacyQueue)
         {
             return std::unexpected{legacyQueue.error()};
         }
         if (desc.EnableValidation)
         {
-            (*legacyQueue)
-                ->setLabel(NS::String::string("HdRestir / acceleration structure build queue", NS::UTF8StringEncoding));
+            (*legacyQueue)->setLabel(MakeLabel("HdRestir / acceleration structure build queue").get());
         }
 
         auto compilerDescCreated{
-            AdoptCreated(MTL4::CompilerDescriptor::alloc()->init(), "MTL4::CompilerDescriptor could not be created")};
+            AdoptCreated(MTL4::CompilerDescriptor::alloc()->init(), "MTL4::CompilerDescriptor could not be created"),
+        };
         if (!compilerDescCreated)
         {
             return std::unexpected{compilerDescCreated.error()};
         }
         auto       compilerDesc{std::move(*compilerDescCreated)};
         NS::Error *compilerError{nullptr};
-        auto       compiler{AdoptCreated((*device)->newCompiler(compilerDesc.get(), &compilerError),
-                                         "MTL4::Device::newCompiler refused the compiler", compilerError, kNoDevice)};
+        auto       compiler{
+            AdoptCreated((*device)->newCompiler(compilerDesc.get(), &compilerError),
+                         "MTL4::Device::newCompiler refused the compiler", compilerError, kNoDevice),
+        };
         if (!compiler)
         {
             return std::unexpected{compiler.error()};
         }
 
-        auto residencyDescCreated{AdoptCreated(MTL::ResidencySetDescriptor::alloc()->init(),
-                                               "MTL::ResidencySetDescriptor could not be created")};
+        auto residencyDescCreated{
+            AdoptCreated(MTL::ResidencySetDescriptor::alloc()->init(),
+                         "MTL::ResidencySetDescriptor could not be created"),
+        };
         if (!residencyDescCreated)
         {
             return std::unexpected{residencyDescCreated.error()};
         }
         auto       residencyDesc{std::move(*residencyDescCreated)};
         NS::Error *residencyError{nullptr};
-        auto       residencySet{AdoptCreated((*device)->newResidencySet(residencyDesc.get(), &residencyError),
-                                             "MTLDevice::newResidencySet refused the set", residencyError, kNoDevice)};
+        auto       residencySet{
+            AdoptCreated((*device)->newResidencySet(residencyDesc.get(), &residencyError),
+                         "MTLDevice::newResidencySet refused the set", residencyError, kNoDevice),
+        };
         if (!residencySet)
         {
             return std::unexpected{residencySet.error()};
         }
 
-        auto timelineEvent{AdoptCreated((*device)->newSharedEvent(),
-                                        "MTLDevice::newSharedEvent refused the timeline event", nullptr, kNoDevice)};
+        auto timelineEvent{
+            AdoptCreated((*device)->newSharedEvent(), "MTLDevice::newSharedEvent refused the timeline event", nullptr,
+                         kNoDevice),
+        };
         if (!timelineEvent)
         {
             return std::unexpected{timelineEvent.error()};
@@ -450,11 +471,11 @@ namespace rhi::metal
     std::expected<std::unique_ptr<MetalDevice>, DeviceError> MetalDevice::Create(const DeviceDesc &desc)
     {
         return _createRequiredObjects(desc).transform(
-            [&](RequiredObjects objects)
+            [&](RequiredObjects &&objects)
             { return std::make_unique<MetalDevice>(ConstructionToken{}, std::move(objects), desc); });
     }
 
-    MetalDevice::MetalDevice(ConstructionToken /*unused*/, RequiredObjects objects, const DeviceDesc &desc)
+    MetalDevice::MetalDevice(ConstructionToken /*unused*/, RequiredObjects &&objects, const DeviceDesc &desc)
         : _device{std::move(objects.Device)}, _queue{std::move(objects.Queue)},
           _legacyQueue{std::move(objects.LegacyQueue)}, _compiler{std::move(objects.Compiler)},
           _residencySet{std::move(objects.ResidencySet)}, _timelineEvent{std::move(objects.TimelineEvent)},
@@ -496,7 +517,7 @@ namespace rhi::metal
             it->second = NS::TransferPtr(manager->newCaptureScope(_queue.get()));
             if (it->second)
             {
-                it->second->setLabel(NS::String::string(key.c_str(), NS::UTF8StringEncoding));
+                it->second->setLabel(MakeLabel(key).get());
             }
         }
         return it->second.get();
@@ -531,7 +552,7 @@ namespace rhi::metal
             scope = NS::TransferPtr(manager->newCaptureScope(_queue.get()));
             if (scope)
             {
-                scope->setLabel(NS::String::string(key.c_str(), NS::UTF8StringEncoding));
+                scope->setLabel(MakeLabel(key).get());
             }
             _frameCaptureScope  = scope;
             _activeCaptureScope = scope.get();
@@ -581,15 +602,15 @@ namespace rhi::metal
     // drawable means no frame is being held.
     // ============================================================================
 
-    MetalPresentingTextureProvider::MetalPresentingTextureProvider(MetalDevice                  &device,
-                                                                   NS::SharedPtr<CA::MetalLayer> layer, Format format,
+    MetalPresentingTextureProvider::MetalPresentingTextureProvider(MetalDevice                    &device,
+                                                                   NS::SharedPtr<CA::MetalLayer> &&layer, Format format,
                                                                    const bool paced) noexcept
         : _device{device}, _layer{std::move(layer)}, _format{format},
           _handle{device.RegisterExternalTextureProvider(*this)}
     {
         if (paced)
         {
-            _pacer = LightRHIMetalDisplayLink::createMetalDisplayPacer(_layer.get());
+            _pacer = LightRHIMetalBridge::createMetalDisplayPacer(_layer.get());
         }
     }
 
@@ -600,12 +621,18 @@ namespace rhi::metal
         _device.UnregisterExternalTextureProvider(_handle);
         if (_pacer != 0U)
         {
-            LightRHIMetalDisplayLink::destroyMetalDisplayPacer(_pacer);
+            LightRHIMetalBridge::destroyMetalDisplayPacer(_pacer);
         }
         // A frame taken and never shown still owns a texture slot and a drawable.
         if (_texture.Valid())
         {
             _device.DestroyTexture(_texture);
+        }
+        // Creating the provider kept the layer's residency set on the queue; the last provider of the
+        // layer to go takes it off.
+        if (auto *layerResidency{_layer->residencySet()})
+        {
+            _device.ReleaseLayerResidency(*layerResidency);
         }
     }
 
@@ -629,23 +656,39 @@ namespace rhi::metal
          * steady clock callers measure with; both are read now, so the time is moved across exactly.
          * Zero means the frame was replaced before the screen took it.
          */
-        void RecordShown(MetalPresentingTextureProvider::ShownFrames &shown, const uint64_t present,
-                         const double presentedSeconds) noexcept
+        void RecordShown(MetalPresentingTextureProvider::ShownFrames &shown, const NS::UInteger drawable,
+                         const uint64_t lastPresent, const double presentedSeconds) noexcept
         {
             uint64_t shownNanoseconds{};
             if (presentedSeconds > 0.0)
             {
                 mach_timebase_info_data_t timebase{};
                 mach_timebase_info(&timebase);
-                const double hostNow{static_cast<double>(mach_absolute_time()) * timebase.numer / timebase.denom *
-                                     1e-9};
-                const auto   steadyNow{std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now().time_since_epoch())
-                                         .count()};
+                const double hostNow{
+                    static_cast<double>(mach_absolute_time()) * timebase.numer / timebase.denom * 1e-9,
+                };
+                const auto steadyNow{
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                };
                 const double ago{std::max(0.0, hostNow - presentedSeconds)};
                 shownNanoseconds = static_cast<uint64_t>(steadyNow) - static_cast<uint64_t>(ago * 1e9);
             }
             const std::scoped_lock lock{shown.Lock};
+            // The present this drawable was shown for: the most recent one that names it.
+            uint64_t present{};
+            for (std::size_t back{}; back < shown.Drawables.size() && back < lastPresent; ++back)
+            {
+                const uint64_t candidate{lastPresent - back};
+                // Every frame: the index is taken modulo the size, and debug builds check `[]` anyway.
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                if (shown.Drawables[candidate % shown.Drawables.size()] == drawable)
+                {
+                    present = candidate;
+                    break;
+                }
+            }
             if (shown.Count == shown.Fates.size())
             {
                 shown.First = (shown.First + 1U) % shown.Fates.size(); // the oldest goes first
@@ -659,14 +702,15 @@ namespace rhi::metal
 
     std::size_t MetalPresentingTextureProvider::TakeShownFrames(const std::span<ShownFrame> frames) noexcept
     {
-        const std::scoped_lock lock{_shown->Lock};
-        const std::size_t      taken{std::min(frames.size(), _shown->Count)};
+        auto                  &shown{_presented->Shown};
+        const std::scoped_lock lock{shown.Lock};
+        const std::size_t      taken{std::min(frames.size(), shown.Count)};
         for (std::size_t index{}; index < taken; ++index)
         {
-            frames[index] = _shown->Fates.at((_shown->First + index) % _shown->Fates.size());
+            frames[index] = shown.Fates.at((shown.First + index) % shown.Fates.size());
         }
-        _shown->First = (_shown->First + taken) % _shown->Fates.size();
-        _shown->Count -= taken;
+        shown.First = (shown.First + taken) % shown.Fates.size();
+        shown.Count -= taken;
         return taken;
     }
 #endif // METRICS_ENABLED
@@ -694,6 +738,35 @@ namespace rhi::metal
     IFramePresenter *MetalDevice::ResolveExternalTextureProvider(ExternalTextureProviderHandle handle) const noexcept
     {
         return handle.Valid() ? _externalTextureProviders.Get(handle.Index) : nullptr;
+    }
+
+    void MetalDevice::RetainLayerResidency(MTL::ResidencySet &residency)
+    {
+        const std::scoped_lock lock{_layerResidencyMutex};
+        const auto             held{
+            std::ranges::find(_layerResidencies, &residency, &std::pair<MTL::ResidencySet *, std::uint32_t>::first)};
+        if (held != _layerResidencies.end())
+        {
+            ++held->second;
+            return;
+        }
+        Mtl4Queue().addResidencySet(&residency);
+        _layerResidencies.emplace_back(&residency, 1U);
+    }
+
+    void MetalDevice::ReleaseLayerResidency(MTL::ResidencySet &residency)
+    {
+        const std::scoped_lock lock{_layerResidencyMutex};
+        const auto             held{
+            std::ranges::find(_layerResidencies, &residency, &std::pair<MTL::ResidencySet *, std::uint32_t>::first)};
+        if (held == _layerResidencies.end() || --held->second != 0U)
+        {
+            return;
+        }
+        // Work already submitted may still draw into this layer's drawables; it finishes first.
+        WaitIdle();
+        Mtl4Queue().removeResidencySet(&residency);
+        _layerResidencies.erase(held);
     }
 
     Extent2D MetalPresentingTextureProvider::_layerExtent() const noexcept
@@ -725,7 +798,7 @@ namespace rhi::metal
         // moment a frame drawn into it now still reaches it, and never more than one per refresh.
         if (_pacer != 0U)
         {
-            const std::uintptr_t handedOver{LightRHIMetalDisplayLink::takeMetalDisplayPacerDrawable(_pacer)};
+            const std::uintptr_t handedOver{LightRHIMetalBridge::takeMetalDisplayPacerDrawable(_pacer)};
             if (handedOver == 0U)
             {
                 return std::unexpected{ExternalTextureError::Unavailable}; // not yet: the refresh is not near
@@ -741,7 +814,7 @@ namespace rhi::metal
         // least one is still free; then it is there without waiting. The caller retries later.
         // Waiting for every frame to be shown first would halve the rate: the window server
         // shows a frame about two refreshes after it is presented.
-        if (_framesWaiting->load(std::memory_order_acquire) + 1U >= _layer->maximumDrawableCount())
+        if (_presented->Waiting.load(std::memory_order_acquire) + 1U >= _layer->maximumDrawableCount())
         {
             return std::unexpected{ExternalTextureError::Unavailable};
         }
@@ -788,17 +861,27 @@ namespace rhi::metal
         // and is signalled after the work that drew it, so present() shows a finished frame.
         _device.Mtl4Queue().signalDrawable(_drawable.get());
         // Counted until it reaches the screen, or is dropped, which also runs the handler.
-        _framesWaiting->fetch_add(1U, std::memory_order_acq_rel);
+        _presented->Waiting.fetch_add(1U, std::memory_order_acq_rel);
 #if METRICS_ENABLED
+        {
+            auto                  &shown{_presented->Shown};
+            const uint64_t         present{_presented->Presents.load(std::memory_order_relaxed) + 1U};
+            const std::scoped_lock lock{shown.Lock};
+            // Every present: the index is taken modulo the size, and debug builds check `[]` anyway.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+            shown.Drawables[present % shown.Drawables.size()] = _drawable->drawableID();
+            _presented->Presents.store(present, std::memory_order_release);
+        }
         _drawable->addPresentedHandler(
-            [waiting = _framesWaiting, shown = _shown, present = ++_presents](MTL::Drawable *drawable)
+            [presented = _presented](MTL::Drawable *drawable)
             {
-                RecordShown(*shown, present, drawable->presentedTime());
-                waiting->fetch_sub(1U, std::memory_order_acq_rel);
+                RecordShown(presented->Shown, drawable->drawableID(),
+                            presented->Presents.load(std::memory_order_acquire), drawable->presentedTime());
+                presented->Waiting.fetch_sub(1U, std::memory_order_acq_rel);
             });
 #else
-        _drawable->addPresentedHandler([waiting = _framesWaiting](MTL::Drawable * /*drawable*/)
-                                       { waiting->fetch_sub(1U, std::memory_order_acq_rel); });
+        _drawable->addPresentedHandler([presented = _presented](MTL::Drawable * /*drawable*/)
+                                       { presented->Waiting.fetch_sub(1U, std::memory_order_acq_rel); });
 #endif
         _drawable->present();
 
@@ -840,7 +923,7 @@ namespace rhi::metal
 
         if (!desc.DebugName.empty())
         {
-            (*heap)->setLabel(MakeLabel(desc.DebugName));
+            (*heap)->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         const uint32_t idx{_memoryHeaps.Alloc()};
@@ -884,13 +967,13 @@ namespace rhi::metal
     // Buffer
     // ============================================================================
 
-    std::expected<BufferHandle, DeviceError> MetalDevice::_adoptBuffer(NS::SharedPtr<MTL::Buffer> buf,
+    std::expected<BufferHandle, DeviceError> MetalDevice::_adoptBuffer(NS::SharedPtr<MTL::Buffer> &&buf,
                                                                        const BufferDesc &desc, MemoryHeapHandle heap,
                                                                        uint64_t offset)
     {
         if (!desc.DebugName.empty())
         {
-            buf->setLabel(MakeLabel(desc.DebugName));
+            buf->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         const uint64_t address{buf->gpuAddress()};
@@ -907,13 +990,15 @@ namespace rhi::metal
             _addResident(*buf.get());
         }
         _heap.RegisterBuffer();
-        _buffers.Get(idx) = MetalBuffer{.Buffer        = std::move(buf),
-                                        .MappedBytes   = mappedBytes,
-                                        .DeviceAddress = address,
-                                        .Size          = desc.Size,
-                                        .Usage         = desc.Usage,
-                                        .Heap          = heap,
-                                        .Offset        = offset};
+        _buffers.Get(idx) = MetalBuffer{
+            .Buffer        = std::move(buf),
+            .MappedBytes   = mappedBytes,
+            .DeviceAddress = address,
+            .Size          = desc.Size,
+            .Usage         = desc.Usage,
+            .Heap          = heap,
+            .Offset        = offset,
+        };
 
         // Track base GPU address -> slot so acceleration-structure geometry
         // (addressed by GpuAddress/BDA) can be resolved back to an MTL::Buffer*
@@ -930,7 +1015,7 @@ namespace rhi::metal
     {
         return AdoptCreated(_device->newBuffer(desc.Size, _toOptions(desc.MemoryType)),
                             "MTLDevice::newBuffer refused the allocation")
-            .and_then([&](NS::SharedPtr<MTL::Buffer> buf)
+            .and_then([&](NS::SharedPtr<MTL::Buffer> &&buf)
                       { return _adoptBuffer(std::move(buf), desc, MemoryHeapHandle{}, 0); });
     }
 
@@ -957,7 +1042,8 @@ namespace rhi::metal
         }
 
         auto buf{
-            NS::TransferPtr(reserved->get().Heap->newBuffer(desc.Size, _toOptions(desc.MemoryType), placement.Offset))};
+            NS::TransferPtr(reserved->get().Heap->newBuffer(desc.Size, _toOptions(desc.MemoryType), placement.Offset)),
+        };
         if (!buf)
         {
             reserved->get().LiveRanges.erase(placement.Offset);
@@ -1076,13 +1162,13 @@ namespace rhi::metal
         return mtd;
     }
 
-    std::expected<TextureHandle, DeviceError> MetalDevice::_adoptTexture(NS::SharedPtr<MTL::Texture> tex,
+    std::expected<TextureHandle, DeviceError> MetalDevice::_adoptTexture(NS::SharedPtr<MTL::Texture> &&tex,
                                                                          const TextureDesc &desc, MemoryHeapHandle heap,
                                                                          uint64_t offset, bool borrowed)
     {
         if (!desc.DebugName.empty())
         {
-            tex->setLabel(MakeLabel(desc.DebugName));
+            tex->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         const uint32_t idx{_textures.Alloc()};
@@ -1107,7 +1193,7 @@ namespace rhi::metal
     {
         return AdoptCreated(_device->newTexture(_makeTextureDescriptor(desc, MTL::StorageModePrivate).get()),
                             "MTLDevice::newTexture refused the allocation")
-            .and_then([&](NS::SharedPtr<MTL::Texture> tex)
+            .and_then([&](NS::SharedPtr<MTL::Texture> &&tex)
                       { return _adoptTexture(std::move(tex), desc, MemoryHeapHandle{}, 0); });
     }
 
@@ -1226,7 +1312,8 @@ namespace rhi::metal
     std::expected<SamplerHandle, DeviceError> MetalDevice::CreateSampler(const SamplerDesc &desc)
     {
         auto sdCreated{
-            AdoptCreated(MTL::SamplerDescriptor::alloc()->init(), "MTL::SamplerDescriptor could not be created")};
+            AdoptCreated(MTL::SamplerDescriptor::alloc()->init(), "MTL::SamplerDescriptor could not be created"),
+        };
         if (!sdCreated)
         {
             return std::unexpected{sdCreated.error()};
@@ -1247,7 +1334,7 @@ namespace rhi::metal
 
         if (!desc.DebugName.empty())
         {
-            sd->setLabel(MakeLabel(desc.DebugName));
+            sd->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         auto smp{AdoptCreated(_device->newSamplerState(sd.get()), "MTLDevice::newSamplerState refused the sampler")};
@@ -1311,8 +1398,10 @@ namespace rhi::metal
             return {};
         }
 
-        auto descriptorCreated{AdoptCreated(MTL4::CounterHeapDescriptor::alloc()->init(),
-                                            "MTL4::CounterHeapDescriptor could not be created")};
+        auto descriptorCreated{
+            AdoptCreated(MTL4::CounterHeapDescriptor::alloc()->init(),
+                         "MTL4::CounterHeapDescriptor could not be created"),
+        };
         if (!descriptorCreated)
         {
             return std::unexpected{descriptorCreated.error()};
@@ -1399,8 +1488,10 @@ namespace rhi::metal
     {
         if (desc.Type == AccelerationStructureType::BottomLevel)
         {
-            auto tri{AdoptRequired(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init(),
-                                   "MTL::AccelerationStructureTriangleGeometryDescriptor could not be created")};
+            auto tri{
+                AdoptRequired(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init(),
+                              "MTL::AccelerationStructureTriangleGeometryDescriptor could not be created"),
+            };
             tri->setVertexBuffer(
                 &_bufferAtAddress(desc.VertexBufferAddress, "BlasFromTriangleBuffer: VertexBufferAddress"));
             tri->setVertexBufferOffset(0);
@@ -1420,8 +1511,10 @@ namespace rhi::metal
             const std::array<const NS::Object *, 1> geometries{tri.get()};
             auto geoms{NS::RetainPtr(NS::Array::array(geometries.data(), geometries.size()))};
 
-            auto pd{AdoptRequired(MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init(),
-                                  "MTL::PrimitiveAccelerationStructureDescriptor could not be created")};
+            auto pd{
+                AdoptRequired(MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init(),
+                              "MTL::PrimitiveAccelerationStructureDescriptor could not be created"),
+            };
             pd->setGeometryDescriptors(geoms.get());
             pd->setUsage(desc.PreferFastTrace ? MTL::AccelerationStructureUsageNone
                                               : MTL::AccelerationStructureUsagePreferFastBuild);
@@ -1445,10 +1538,13 @@ namespace rhi::metal
         // dropped (every instance reads back as 0). Matches the Vulkan
         // backend, which maps InstanceCustomIndex to
         // VkAccelerationStructureInstanceKHR::instanceCustomIndex.
-        const uint64_t instanceBufBytes{sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) *
-                                        desc.Instances.size()};
-        auto           instanceBuf{NS::TransferPtr(
-            _device->newBuffer(std::max<uint64_t>(instanceBufBytes, 1), MTL::ResourceStorageModeShared))};
+        const uint64_t instanceBufBytes{
+            sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) * desc.Instances.size(),
+        };
+        auto instanceBuf{
+            NS::TransferPtr(
+                _device->newBuffer(std::max<uint64_t>(instanceBufBytes, 1), MTL::ResourceStorageModeShared)),
+        };
         if (!instanceBuf)
         {
             // Neither a size query nor a build has a way to report this, and both need the instances.
@@ -1460,7 +1556,7 @@ namespace rhi::metal
         std::vector<NS::Object *> blasObjs(desc.Instances.size());
         for (size_t i{0}; i < desc.Instances.size(); ++i)
         {
-            const auto &inst{desc.Instances[i]};
+            const auto &inst{desc.Instances.at(i)};
             if (!inst.Blas.Valid())
             {
                 FailContract(std::string{"TlasFromInstances: AccelerationStructureInstance.Blas is not "} +
@@ -1473,21 +1569,23 @@ namespace rhi::metal
                 MTL::PackedFloat3{inst.Transform[0][2], inst.Transform[1][2], inst.Transform[2][2]},
                 MTL::PackedFloat3{inst.Transform[0][3], inst.Transform[1][3], inst.Transform[2][3]},
             };
-            blasObjs[i] = AccelStruct(inst.Blas).As.get();
-            dst[i]      = MTL::AccelerationStructureUserIDInstanceDescriptor{
-                     .transformationMatrix            = xform,
-                     .options                         = static_cast<MTL::AccelerationStructureInstanceOptions>(inst.Flags),
-                     .mask                            = inst.InstanceMask,
-                     .intersectionFunctionTableOffset = 0,
-                     .accelerationStructureIndex      = static_cast<uint32_t>(i),
-                     .userID                          = inst.InstanceCustomIndex,
+            blasObjs.at(i) = AccelStruct(inst.Blas).As.get();
+            dst[i]         = MTL::AccelerationStructureUserIDInstanceDescriptor{
+                .transformationMatrix            = xform,
+                .options                         = static_cast<MTL::AccelerationStructureInstanceOptions>(inst.Flags),
+                .mask                            = inst.InstanceMask,
+                .intersectionFunctionTableOffset = 0,
+                .accelerationStructureIndex      = static_cast<uint32_t>(i),
+                .userID                          = inst.InstanceCustomIndex,
             };
         }
 
         auto blasArr{NS::RetainPtr(NS::Array::array(blasObjs.data(), blasObjs.size()))};
 
-        auto id{AdoptRequired(MTL::InstanceAccelerationStructureDescriptor::alloc()->init(),
-                              "MTL::InstanceAccelerationStructureDescriptor could not be created")};
+        auto id{
+            AdoptRequired(MTL::InstanceAccelerationStructureDescriptor::alloc()->init(),
+                          "MTL::InstanceAccelerationStructureDescriptor could not be created"),
+        };
         id->setInstanceCount(desc.Instances.size());
         id->setInstanceDescriptorBuffer(instanceBuf.get());
         id->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
@@ -1534,15 +1632,17 @@ namespace rhi::metal
         }
 
         auto sizes{QueryAccelerationStructureBuildSizes(desc)};
-        auto as{AdoptCreated(_device->newAccelerationStructure(sizes.AccelerationStructureSize),
-                             "MTLDevice::newAccelerationStructure refused the allocation")};
+        auto as{
+            AdoptCreated(_device->newAccelerationStructure(sizes.AccelerationStructureSize),
+                         "MTLDevice::newAccelerationStructure refused the allocation"),
+        };
         if (!as)
         {
             return std::unexpected{as.error()};
         }
         if (!desc.DebugName.empty())
         {
-            (*as)->setLabel(MakeLabel(desc.DebugName));
+            (*as)->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         const uint32_t idx{_accelStructs.Alloc()};
@@ -1553,7 +1653,10 @@ namespace rhi::metal
         }
         _addResident(*as->get());
         _accelStructs.Get(idx) = MetalAccelerationStructure{
-            .As = std::move(*as), .Type = desc.Type, .Size = sizes.AccelerationStructureSize};
+            .As   = std::move(*as),
+            .Type = desc.Type,
+            .Size = sizes.AccelerationStructureSize,
+        };
         return AccelerationStructureHandle{.Index = idx};
     }
 
@@ -1606,12 +1709,18 @@ namespace rhi::metal
                 {
                     FailContract("_loadLibrary: Metal backend received SPIR-V ShaderDesc");
                 }
+                else if constexpr (std::is_same_v<T, HostCallableBytecode>)
+                {
+                    FailContract("_loadLibrary: Metal backend received a CPU ShaderDesc");
+                }
                 else if constexpr (std::is_same_v<T, MetalLibBytecode>)
                 {
                     // Pre-compiled .metallib bytes — fastest path (shipping builds).
-                    dispatch_data_t dd{dispatch_data_create(src.Bytes.data(), src.Bytes.size(), nullptr,
-                                                            DISPATCH_DATA_DESTRUCTOR_DEFAULT)};
-                    auto            lib{NS::TransferPtr(_device->newLibrary(dd, &err))};
+                    dispatch_data_t dd{
+                        dispatch_data_create(src.Bytes.data(), src.Bytes.size(), nullptr,
+                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT),
+                    };
+                    auto lib{NS::TransferPtr(_device->newLibrary(dd, &err))};
                     // dispatch_data_create returns a +1 reference; balance it.
                     dispatch_release(dd);
                     if (!lib)
@@ -1629,10 +1738,13 @@ namespace rhi::metal
                     // (NS::String::alloc() takes the +1 ref; init(...) is the
                     // designated initializer, not a second allocation), so
                     // this is a single object to transfer ownership of.
-                    auto str{NS::TransferPtr(NS::String::alloc()->init(
-                        const_cast<char *>(src.Source.data()), src.Source.size(), NS::UTF8StringEncoding, false))};
-                    auto opts{AdoptRequired(MTL::CompileOptions::alloc()->init(),
-                                            "MTL::CompileOptions could not be created")};
+                    auto str{
+                        NS::TransferPtr(NS::String::alloc()->init(const_cast<char *>(src.Source.data()),
+                                                                  src.Source.size(), NS::UTF8StringEncoding, false)),
+                    };
+                    auto opts{
+                        AdoptRequired(MTL::CompileOptions::alloc()->init(), "MTL::CompileOptions could not be created"),
+                    };
                     opts->setLanguageVersion(MTL::LanguageVersion3_0);
                     auto lib{NS::TransferPtr(_device->newLibrary(str.get(), opts.get(), &err))};
                     if (!lib)
@@ -1656,7 +1768,8 @@ namespace rhi::metal
             return;
         }
         auto options{
-            AdoptRequired(MTL4::PipelineOptions::alloc()->init(), "MTL4::PipelineOptions could not be created")};
+            AdoptRequired(MTL4::PipelineOptions::alloc()->init(), "MTL4::PipelineOptions could not be created"),
+        };
         if (_debugCaptureEnabled)
         {
             options->setShaderReflection(static_cast<MTL4::ShaderReflection>(MTL4::ShaderReflectionBindingInfo |
@@ -1681,8 +1794,15 @@ namespace rhi::metal
 
     std::expected<PipelineHandle, DeviceError> MetalDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc &desc)
     {
-        auto created{AdoptCreated(MTL4::RenderPipelineDescriptor::alloc()->init(),
-                                  "MTL4::RenderPipelineDescriptor could not be created")};
+        // Compilation creates autoreleased reflection and driver temporaries, even though the
+        // returned pipeline is owned. Their lifetime ends with this preparation call.
+        const auto compilationPool{
+            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created"),
+        };
+        auto created{
+            AdoptCreated(MTL4::RenderPipelineDescriptor::alloc()->init(),
+                         "MTL4::RenderPipelineDescriptor could not be created"),
+        };
         if (!created)
         {
             return std::unexpected{created.error()};
@@ -1693,34 +1813,38 @@ namespace rhi::metal
         // Vertex shader — skip if not provided (monostate = "no shader")
         if (!std::holds_alternative<std::monostate>(desc.VertexShader.Bytecode))
         {
-            auto  vsLib{_loadLibrary(desc.VertexShader)};
-            auto *name{MakeLabel(desc.VertexShader.EntryPoint)};
-            auto  vsDescCreated{AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
-                                             "MTL4::LibraryFunctionDescriptor could not be created")};
+            auto       vsLib{_loadLibrary(desc.VertexShader)};
+            const auto name{MakeLabel(desc.VertexShader.EntryPoint)};
+            auto       vsDescCreated{
+                AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
+                             "MTL4::LibraryFunctionDescriptor could not be created"),
+            };
             if (!vsDescCreated)
             {
                 return std::unexpected{vsDescCreated.error()};
             }
             auto vsDesc{std::move(*vsDescCreated)};
             vsDesc->setLibrary(vsLib.get());
-            vsDesc->setName(name);
+            vsDesc->setName(name.get());
             pd->setVertexFunctionDescriptor(vsDesc.get());
         }
 
         // Fragment shader — skip if not provided (monostate = "no shader")
         if (!std::holds_alternative<std::monostate>(desc.FragmentShader.Bytecode))
         {
-            auto  fsLib{_loadLibrary(desc.FragmentShader)};
-            auto *name{MakeLabel(desc.FragmentShader.EntryPoint)};
-            auto  fsDescCreated{AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
-                                             "MTL4::LibraryFunctionDescriptor could not be created")};
+            auto       fsLib{_loadLibrary(desc.FragmentShader)};
+            const auto name{MakeLabel(desc.FragmentShader.EntryPoint)};
+            auto       fsDescCreated{
+                AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
+                             "MTL4::LibraryFunctionDescriptor could not be created"),
+            };
             if (!fsDescCreated)
             {
                 return std::unexpected{fsDescCreated.error()};
             }
             auto fsDesc{std::move(*fsDescCreated)};
             fsDesc->setLibrary(fsLib.get());
-            fsDesc->setName(name);
+            fsDesc->setName(name.get());
             pd->setFragmentFunctionDescriptor(fsDesc.get());
         }
 
@@ -1731,10 +1855,10 @@ namespace rhi::metal
         for (size_t i{0}; i < desc.ColorFormats.size(); ++i)
         {
             auto *ca{pd->colorAttachments()->object(static_cast<NS::UInteger>(i))};
-            ca->setPixelFormat(_toPixFmt(desc.ColorFormats[i]));
-            if (i < desc.ColorBlend.size() && desc.ColorBlend[i].Enable)
+            ca->setPixelFormat(_toPixFmt(desc.ColorFormats.at(i)));
+            if (i < desc.ColorBlend.size() && desc.ColorBlend.at(i).Enable)
             {
-                const auto &bs{desc.ColorBlend[i]};
+                const auto &bs{desc.ColorBlend.at(i)};
                 ca->setBlendingState(MTL4::BlendStateEnabled);
                 ca->setSourceRGBBlendFactor(_toBlendF(bs.SrcColor));
                 ca->setDestinationRGBBlendFactor(_toBlendF(bs.DstColor));
@@ -1754,7 +1878,7 @@ namespace rhi::metal
 
         if (!desc.DebugName.empty())
         {
-            pd->setLabel(MakeLabel(desc.DebugName));
+            pd->setLabel(MakeLabel(desc.DebugName).get());
         }
 
         NS::Error *err{nullptr};
@@ -1768,7 +1892,8 @@ namespace rhi::metal
         // Depth-stencil state. SetPipeline() skips a missing one, so a refusal here leaves the
         // encoder's default depth state rather than failing the pipeline.
         NS::SharedPtr<MTL::DepthStencilState> dss{
-            NS::TransferPtr(_device->newDepthStencilState(_makeDepthStencilDesc(desc.DepthStencil).get()))};
+            NS::TransferPtr(_device->newDepthStencilState(_makeDepthStencilDesc(desc.DepthStencil).get())),
+        };
 
         const uint32_t idx{_pipelines.Alloc()};
         if (idx == kInvalidIndex)
@@ -1797,20 +1922,28 @@ namespace rhi::metal
 
     std::expected<PipelineHandle, DeviceError> MetalDevice::CreateComputePipeline(const ComputePipelineDesc &desc)
     {
-        auto  lib{_loadLibrary(desc.Shader)};
-        auto *name{MakeLabel(desc.Shader.EntryPoint)};
-        auto  fnDescCreated{AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
-                                         "MTL4::LibraryFunctionDescriptor could not be created")};
+        // Keep compilation's temporary objects off the caller's long-lived C++ thread.
+        const auto compilationPool{
+            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created"),
+        };
+        auto       lib{_loadLibrary(desc.Shader)};
+        const auto name{MakeLabel(desc.Shader.EntryPoint)};
+        auto       fnDescCreated{
+            AdoptCreated(MTL4::LibraryFunctionDescriptor::alloc()->init(),
+                         "MTL4::LibraryFunctionDescriptor could not be created"),
+        };
         if (!fnDescCreated)
         {
             return std::unexpected{fnDescCreated.error()};
         }
         auto fnDesc{std::move(*fnDescCreated)};
         fnDesc->setLibrary(lib.get());
-        fnDesc->setName(name);
+        fnDesc->setName(name.get());
 
-        auto pipelineDescCreated{AdoptCreated(MTL4::ComputePipelineDescriptor::alloc()->init(),
-                                              "MTL4::ComputePipelineDescriptor could not be created")};
+        auto pipelineDescCreated{
+            AdoptCreated(MTL4::ComputePipelineDescriptor::alloc()->init(),
+                         "MTL4::ComputePipelineDescriptor could not be created"),
+        };
         if (!pipelineDescCreated)
         {
             return std::unexpected{pipelineDescCreated.error()};
@@ -1818,17 +1951,21 @@ namespace rhi::metal
         auto pipelineDesc{std::move(*pipelineDescCreated)};
         pipelineDesc->setComputeFunctionDescriptor(fnDesc.get());
         _configurePipelineForDebugging(*pipelineDesc.get());
+        NS::SharedPtr<NS::String> label{};
         if (!desc.DebugName.empty())
         {
-            pipelineDesc->setLabel(MakeLabel(desc.DebugName));
+            label = MakeLabel(desc.DebugName);
+            pipelineDesc->setLabel(label.get());
         }
 
         // Resource binding needs no pipeline reflection. Bindless resources
         // travel as native addresses/resource IDs in root data; explicitly
         // slotted resources use the command list's MTL4 argument table.
         NS::Error *err{nullptr};
-        auto       pso{NS::TransferPtr(
-            _compiler->newComputePipelineState(pipelineDesc.get(), /*compilerTaskOptions*/ nullptr, &err))};
+        auto       pso{
+            NS::TransferPtr(
+                _compiler->newComputePipelineState(pipelineDesc.get(), /*compilerTaskOptions*/ nullptr, &err)),
+        };
 
         if (!pso)
         {
@@ -1839,9 +1976,10 @@ namespace rhi::metal
         // from the caller wins, a zero component (including the ComputePipelineDesc
         // default of {0,0,0}) falls back to 1 — except X, which falls back to
         // the shader's own [[max_total_threads_per_threadgroup]] annotation.
-        const uint32_t tgX{desc.ThreadGroupSize.Width != 0
-                               ? desc.ThreadGroupSize.Width
-                               : static_cast<uint32_t>(pso->maxTotalThreadsPerThreadgroup())};
+        const uint32_t tgX{
+            desc.ThreadGroupSize.Width != 0 ? desc.ThreadGroupSize.Width
+                                            : static_cast<uint32_t>(pso->maxTotalThreadsPerThreadgroup()),
+        };
         const uint32_t tgY{desc.ThreadGroupSize.Height != 0 ? desc.ThreadGroupSize.Height : 1};
         const uint32_t tgZ{desc.ThreadGroupSize.Depth != 0 ? desc.ThreadGroupSize.Depth : 1};
 
@@ -1854,6 +1992,7 @@ namespace rhi::metal
         _pipelines.Get(idx) = MetalPipeline{
             .RenderPso         = {},
             .ComputePso        = std::move(pso),
+            .ComputeLabel      = std::move(label),
             .DepthStencilState = {},
             .IsCompute         = true,
             .ThreadGroupSizeX  = tgX,
@@ -1930,7 +2069,8 @@ namespace rhi::metal
         }
         const uint64_t size{data.size_bytes()};
         auto           autoreleasePool{
-            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created")};
+            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created"),
+        };
         auto &b{_buffers.Get(dst.Index)};
         if (b.Buffer->storageMode() == MTL::StorageModeShared)
         {
@@ -1965,7 +2105,7 @@ namespace rhi::metal
         cmdBuffer->beginCommandBuffer(allocator.get());
         if (_debugCaptureEnabled)
         {
-            cmdBuffer->setLabel(NS::String::string("HdRestir / LightRHI UploadBuffer", NS::UTF8StringEncoding));
+            cmdBuffer->setLabel(MakeLabel("HdRestir / LightRHI UploadBuffer").get());
         }
         auto *enc{cmdBuffer->computeCommandEncoder()};
         enc->copyFromBuffer(staging.get(), 0, b.Buffer.get(), dstOffset, size);
@@ -1994,7 +2134,8 @@ namespace rhi::metal
                          " bytes but the region reads " + std::to_string(totalSize));
         }
         auto autoreleasePool{
-            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created")};
+            AdoptRequired(NS::AutoreleasePool::alloc()->init(), "NS::AutoreleasePool could not be created"),
+        };
         auto staging{NS::TransferPtr(_device->newBuffer(totalSize, MTL::ResourceStorageModeShared))};
         if (!staging)
         {
@@ -2011,7 +2152,7 @@ namespace rhi::metal
         cmdBuffer->beginCommandBuffer(allocator.get());
         if (_debugCaptureEnabled)
         {
-            cmdBuffer->setLabel(NS::String::string("HdRestir / LightRHI UploadTexture", NS::UTF8StringEncoding));
+            cmdBuffer->setLabel(MakeLabel("HdRestir / LightRHI UploadTexture").get());
         }
         auto *enc{cmdBuffer->computeCommandEncoder()};
         enc->copyFromBuffer(staging.get(), 0, rowPitch, slicePitch,
@@ -2307,8 +2448,10 @@ namespace rhi::metal
 
     NS::SharedPtr<MTL::DepthStencilDescriptor> MetalDevice::_makeDepthStencilDesc(const DepthStencilState &ds)
     {
-        auto dsd{AdoptRequired(MTL::DepthStencilDescriptor::alloc()->init(),
-                               "MTL::DepthStencilDescriptor could not be created")};
+        auto dsd{
+            AdoptRequired(MTL::DepthStencilDescriptor::alloc()->init(),
+                          "MTL::DepthStencilDescriptor could not be created"),
+        };
         dsd->setDepthWriteEnabled(ds.DepthWrite);
         dsd->setDepthCompareFunction(ds.DepthTest ? _toCompare(ds.DepthOp) : MTL::CompareFunctionAlways);
         return dsd;

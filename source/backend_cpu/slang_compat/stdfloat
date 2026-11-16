@@ -1,0 +1,10 @@
+/**
+ * {file}
+ * {brief} Lets Slang use Clang's native half type when libc++ lacks <stdfloat>.
+ * The prelude selects _Float16 when FLT16_MIN is available.
+ */
+#pragma once
+
+#if !defined(FLT16_MIN) && defined(__FLT16_MIN__)
+#define FLT16_MIN __FLT16_MIN__
+#endif

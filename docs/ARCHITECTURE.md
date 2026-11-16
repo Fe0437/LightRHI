@@ -2,7 +2,7 @@
 
 ## Overview
 
-LightRHI is a thin, bindless GPU abstraction layer written in [C++23 modules](https://en.cppreference.com/w/cpp/language/modules). It targets one backend per platform — Metal on macOS, Vulkan on Linux/Windows — selected automatically at CMake configure time with no user-facing knob.
+LightRHI is a thin, bindless GPU abstraction layer written in [C++23 modules](https://en.cppreference.com/w/cpp/language/modules). It builds a native graphics backend (Metal on Apple platforms, Vulkan on Linux and Windows) and a headless CPU compute backend. The application chooses the device and shader library reader when it composes its services.
 
 The design philosophy is **bindless-first**: every resource (buffer, texture, sampler) is accessed by a slot index that shaders read directly, with no per-draw descriptor binding. Push constants carry all per-draw root data. This maps cleanly to Metal Argument Buffers Tier 2 and Vulkan descriptor indexing.
 
@@ -12,6 +12,7 @@ The design philosophy is **bindless-first**: every resource (buffer, texture, sa
 | ------------------- | ------ | ---------------------- | ----------------------------------------- |
 | `LightRHI`        | SHARED | `LightRHI::LightRHI` | Backend-neutral interface (module`rhi`) |
 | `LightRHIBackend` | SHARED | `LightRHI::Backend`  | Platform backend (module`lightRHI`)     |
+| `LightRHICpuBackend` | STATIC | `LightRHI::CpuBackend` | Headless compute backend (module `lightRHI.cpu`) |
 
 Consumers link both:
 
@@ -64,6 +65,41 @@ rhi::BufferHandle buf = device->createBuffer({...});
 - Exports typed `CreateExternalTextureProvider` factories owned by the selected backend
 - Implements all pure-virtual interfaces from `rhi`
 - Keeps internal types in `rhi::metal::` / `rhi::vulkan::` (not exported)
+
+### `lightRHI.cpu` — headless compute
+
+It is built when `LIGHT_RHI_BUILD_CPU_BACKEND` is on, the default. It needs Slang's
+C++ prelude, so a build that ships only a GPU backend can turn it off.
+Link `LightRHI::CpuBackend` and import `lightRHI.cpu`. The composition pairs
+`rhi::cpu::CreateDevice()` with `rhi::cpu::ReadShaderLibrary()`. The device
+implements the same resource and command-list interfaces and opens no graphics API.
+It records commands between `Begin()` and `End()`, executes them in order on
+`Submit()`, and returns an already completed fence. Resource barriers need no
+extra work because each dispatch or copy finishes before the next command.
+
+Compile the same Slang compute sources with `light_rhi_compile_shaders(BACKEND cpu ...)`.
+Slang emits C++ and the project's C++ compiler builds a native `.lrcpu` module.
+The build also writes CPU parameter layouts using Slang reflection. Use only
+trusted libraries built with the same LightRHI and Slang toolchain: the
+CPU device loads native code when it prepares a pipeline. It is handed the library's
+bytes, as every backend is; the system loads native code only from a file, so the device
+writes them to a temporary file of its own and removes it when the library is closed.
+
+Shaders use one root constant block for plain values, buffer addresses, and
+bindless textures and samplers. A buffer address is a host address on this
+backend. Use `light_rhi_workgroup.slangh` for workgroup barriers and shared
+arrays; Slang's standard C++ emitter does not synchronize lanes or share
+a GPU-style `groupshared` declaration. Dispatches that need those operations
+run the lanes of each workgroup concurrently. Other dispatches use Slang's
+serial grid loop.
+
+The CPU backend supports direct and indirect compute, copies, fills, and
+single-level 2D textures. Floating-point storage texture writes are limited
+to matching 32-bit scalar, two-channel, and four-channel types. Explicit
+shader registers (other than the root constants), raster pipelines,
+presentation, ray tracing, and GPU timestamps are unsupported. This is a
+correctness backend; it does not model GPU performance or validate resource
+transitions.
 
 ## Bindless resource model
 
@@ -258,6 +294,41 @@ endif()
 
 The same `LightRHIBackend` target name and `LightRHI::Backend` alias are used on all platforms. No `#ifdef` is needed in consumer code.
 
+### Metal encoders on threads with no autorelease pool
+
+Read this before changing how Metal encoders are created, or the Swift bridge's compile options.
+This has been reconsidered twice; the measurements below are why it stays as it is.
+
+**The problem.** Metal returns each new command encoder *autoreleased*. The threads that record
+LightRHI commands, such as a painting thread, have no autorelease pool. An autoreleased object on
+such a thread waits for a pool that never drains, so every encoder created there would stay alive
+until the thread ends.
+
+**What LightRHI does.** `source/backend_metal/MetalEncoderOwnership.swift` creates the encoder and
+hands C++ an owned reference. Optimized Swift claims the autoreleased return value at once, right
+after the Objective-C call, so nothing is left in any pool. This costs nothing per encoder.
+
+**Why the Swift bridge is compiled with `-O`, in every build type.** Unoptimized Swift first stores
+the returned encoder, and only then retains it, so the autorelease is no longer claimed and stays
+pending. Without `-O` a Debug build leaks one encoder, about 170 bytes, per dispatch. Debug symbols stay on.
+
+**What was tried, and why it was dropped.**
+
+- *An autorelease pool around each encoder.* It is correct at any optimization level, but costs
+  about 120 CPU instructions per published batch (+0.1% of `graph_publish`) on the painting path,
+  with no gain in time. The render encoder keeps its pool, because Metal also autoreleases an
+  internal render context there.
+- *A pool only above some amount of work.* The cost and the risk are both per encoder, so small
+  batches would still leak.
+- *One long-lived pool per thread, drained every N encoders.* Pools must be popped in the reverse order
+  they were pushed. On a thread with a run loop, the loop's own pool would pop ours first, and the next
+  drain would crash.
+
+**What guards it.** `tests/encoder_ownership` records 20,000 dispatches on a `std::thread` with no pool,
+and fails if the process grows by more than 1 MB. With the claim working it grows by 16–64 KB; built
+without `-O` it grows by about 3.4 MB and the test fails. If this test fails, fix the claim. Do not
+add a pool on the compute path.
+
 ## Shader pipeline
 
 Shaders are authored in [Slang](https://shader-slang.com) and compiled at build time by `slangc`.
@@ -282,6 +353,8 @@ The CMake helper `light_rhi_compile_shaders(...)` (defined in `cmake/Shaders.cma
 ```
 
 A `.metallib` is compiled for the SDK the build targets (`macosx`, `iphoneos`, `iphonesimulator`, ...), so an iOS build ships an iOS library; the MSL and AIR it went through stay under `<output-dir>/intermediate/`.
+
+When `DEBUG_ENABLED` is on, the offline Metal compiler records shader sources and line tables in the `.metallib` for Xcode. This leaves shader optimization enabled. Use `MetalLib` for source profiling; the `MslSource` fallback does not use the offline compiler or its debug flags. Capture again after rebuilding: a saved trace keeps the libraries from the original run.
 
 The RHI core does not invoke Slang, and shader libraries are never turned into C++ source. An application ships them as files:
 

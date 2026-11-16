@@ -57,7 +57,7 @@ export namespace rhi
         };
 
         /** {brief} Takes ownership of `device` and records the descriptor used to create it. */
-        SynchronizedDevice(std::unique_ptr<IDevice> device, const DeviceDesc &desc)
+        SynchronizedDevice(std::unique_ptr<IDevice> &&device, const DeviceDesc &desc)
             : _device{std::move(device)}, _desc{desc}
         {
         }

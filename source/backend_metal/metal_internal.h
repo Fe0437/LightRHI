@@ -91,18 +91,17 @@ namespace rhi::metal
     }
 
     // ============================================================================
-    // MakeLabel — a Metal label from a view that need not be null-terminated.
+    // MakeLabel — an owned Metal label from a view that need not be null-terminated.
     //
-    // NS::String::string reads a C string up to its terminator, and a std::string_view promises
-    // no terminator: a caller may hand over a window into a larger buffer, and reading past the
-    // length it gave is then out of bounds. The bytes are copied through a terminated temporary,
-    // so the length the caller gave is the length that is read. NS::String copies them again, so
-    // the temporary dying here is fine.
+    // Metal copies labels. Release this temporary after the setter, rather than autoreleasing it:
+    // callers on a C++ control thread have no Cocoa event loop to drain autoreleased strings.
+    // The terminated copy keeps a substring from reading past its end.
     // ============================================================================
-    [[nodiscard]] inline NS::String *MakeLabel(const std::string_view text)
+    [[nodiscard]] inline NS::SharedPtr<NS::String> MakeLabel(const std::string_view text)
     {
         const std::string terminated{text};
-        return NS::String::string(terminated.c_str(), NS::UTF8StringEncoding);
+        return AdoptRequired(NS::String::alloc()->init(terminated.c_str(), NS::UTF8StringEncoding),
+                             "NS::String could not be created");
     }
 
     // ============================================================================
@@ -141,17 +140,23 @@ namespace rhi::metal
         {
             const std::scoped_lock lk{_mutex};
             assert(idx < _slots.size());
+            // A handle names a slot this pool handed out; the assert above checks it in debug.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             _slots[idx] = {};
             _freeList.push_back(idx);
         }
         [[nodiscard]] T &Get(uint32_t idx) noexcept
         {
             assert(idx < _slots.size());
+            // A handle names a slot this pool handed out; the assert above checks it in debug.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             return _slots[idx];
         }
         [[nodiscard]] const T &Get(uint32_t idx) const noexcept
         {
             assert(idx < _slots.size());
+            // A handle names a slot this pool handed out; the assert above checks it in debug.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             return _slots[idx];
         }
     };
@@ -220,6 +225,8 @@ namespace rhi::metal
     {
         NS::SharedPtr<MTL::RenderPipelineState>  RenderPso{};
         NS::SharedPtr<MTL::ComputePipelineState> ComputePso{};
+        // Borrow this for capture labels: Metal's label getter autoreleases on C++ recording threads.
+        NS::SharedPtr<NS::String> ComputeLabel{};
         // Rasterizer/depth state applied to the encoder when this pipeline is set
         NS::SharedPtr<MTL::DepthStencilState> DepthStencilState{};
         MTL::Winding                          Winding{MTL::WindingCounterClockwise};
@@ -374,7 +381,7 @@ namespace rhi::metal
          */
         [[nodiscard]] static std::expected<std::unique_ptr<MetalDevice>, DeviceError> Create(const DeviceDesc &desc);
 
-        MetalDevice(ConstructionToken /*unused*/, RequiredObjects objects, const DeviceDesc &desc);
+        MetalDevice(ConstructionToken /*unused*/, RequiredObjects &&objects, const DeviceDesc &desc);
 
         // Defined out-of-line in metal_device.cpp for the reason given on MetalBindlessHeap above:
         // this header reaches more than one translation unit of the same named module.
@@ -476,8 +483,8 @@ namespace rhi::metal
         /** The Metal pixel format a surface layer must carry to hand out textures of `f`. */
         [[nodiscard]] static MTL::PixelFormat ExternalTexturePixelFormat(Format f) noexcept;
         /** Names a drawable's texture for one frame; released by DestroyTexture() once presented. */
-        [[nodiscard]] std::expected<TextureHandle, DeviceError> AdoptExternalTexture(NS::SharedPtr<MTL::Texture> tex,
-                                                                                     const TextureDesc          &desc);
+        [[nodiscard]] std::expected<TextureHandle, DeviceError> AdoptExternalTexture(NS::SharedPtr<MTL::Texture> &&tex,
+                                                                                     const TextureDesc &desc);
         /** Reuses resources a completed submission released, or creates new ones. */
         [[nodiscard]] std::expected<MetalCommandResources, DeviceError> AcquireCommandResources();
         void RecycleCommandResources(MetalCommandResources &&resources);
@@ -493,6 +500,18 @@ namespace rhi::metal
         /** Resolves a recorded present's handle, or null when it names nothing on this device. */
         [[nodiscard]] IFramePresenter *
         ResolveExternalTextureProvider(ExternalTextureProviderHandle handle) const noexcept;
+        /**
+         * Makes a layer's drawables reachable by this device's queue, for one more provider of that layer.
+         * Several providers may lend one layer's textures, one after another or for a while together, so
+         * the queue holds the layer's residency set once, while any of them lives.
+         */
+        void RetainLayerResidency(MTL::ResidencySet &residency);
+        /**
+         * The provider of a layer is gone; the last one to go waits for the work already submitted, which
+         * may still draw into that layer's drawables, then takes the residency set off the queue. A queue
+         * holds only a few residency sets, so a canvas made again and again would otherwise run out.
+         */
+        void ReleaseLayerResidency(MTL::ResidencySet &residency);
 
         // Acceleration structures deliberately stay on the CLASSIC (non-MTL4)
         // Metal raytracing API — everything else in this backend targets
@@ -568,6 +587,10 @@ namespace rhi::metal
         SlotPool<MetalAccelerationStructure> _accelStructs{kMaxAccelerationStructures};
         SlotPool<MetalTimestampQueryPool>    _timestampQueryPools{kMaxTimestampQueryPools};
         SlotPool<IFramePresenter *>          _externalTextureProviders{kMaxExternalTextureProviders};
+        /// Each layer residency set on the queue, with how many live providers use it. Touched only when a
+        /// provider is made or destroyed, never while drawing, so a lock costs nothing that matters.
+        std::vector<std::pair<MTL::ResidencySet *, std::uint32_t>> _layerResidencies{};
+        std::mutex                                                 _layerResidencyMutex{};
 
         // Reverse lookup: base GPU address of a live buffer -> its slot index.
         // Needed because AccelerationStructureDesc addresses vertex/index data
@@ -604,11 +627,11 @@ namespace rhi::metal
 
         /** Registers the finished buffer in a slot, indexes its address and reports its handle. */
         [[nodiscard]] std::expected<BufferHandle, DeviceError>
-        _adoptBuffer(NS::SharedPtr<MTL::Buffer> buf, const BufferDesc &desc, MemoryHeapHandle heap, uint64_t offset);
+        _adoptBuffer(NS::SharedPtr<MTL::Buffer> &&buf, const BufferDesc &desc, MemoryHeapHandle heap, uint64_t offset);
 
         /** Registers the finished texture in a slot and reports its handle. */
-        [[nodiscard]] std::expected<TextureHandle, DeviceError> _adoptTexture(NS::SharedPtr<MTL::Texture> tex,
-                                                                              const TextureDesc          &desc,
+        [[nodiscard]] std::expected<TextureHandle, DeviceError> _adoptTexture(NS::SharedPtr<MTL::Texture> &&tex,
+                                                                              const TextureDesc            &desc,
                                                                               MemoryHeapHandle heap, uint64_t offset,
                                                                               bool borrowed = false);
 
@@ -652,7 +675,7 @@ namespace rhi::metal
          * {param paced} Take drawables from the layer's display link, one per refresh, instead of
          * asking the layer; ignored where CAMetalDisplayLink does not exist.
          */
-        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> layer, Format format,
+        MetalPresentingTextureProvider(MetalDevice &device, NS::SharedPtr<CA::MetalLayer> &&layer, Format format,
                                        bool paced) noexcept;
         MetalPresentingTextureProvider(const MetalPresentingTextureProvider &)            = delete;
         MetalPresentingTextureProvider(MetalPresentingTextureProvider &&)                 = delete;
@@ -682,8 +705,29 @@ namespace rhi::metal
             std::array<ShownFrame, 64> Fates{};
             std::size_t                First{};
             std::size_t                Count{};
+            /// Each recent present's drawable, by the present's number modulo the size, so a handler that
+            /// is given only its drawable finds which present it reports.
+            std::array<NS::UInteger, 64> Drawables{};
         };
 #endif // METRICS_ENABLED
+
+        /**
+         * {brief} What the presented handlers report, shared with them, as they may run after this provider is
+         * gone: how many frames wait to reach the screen and, with metrics, each frame's fate.
+         *
+         * Everything is in one object so that the handler captures a single pointer. A std::function keeps a
+         * small capture inside itself and allocates for a bigger one, so a single pointer means a present
+         * allocates nothing. With metrics, the handler needs the present's number too; capturing it would no
+         * longer fit, so the handler looks the number up from its drawable instead.
+         */
+        struct PresentedFrames
+        {
+            std::atomic<uint32_t> Waiting{}; ///< Frames presented and not yet on screen.
+#if METRICS_ENABLED
+            ShownFrames           Shown;      ///< The fates reported, waiting to be taken.
+            std::atomic<uint64_t> Presents{}; ///< Presents made so far; the newest one's number.
+#endif
+        };
 
       private:
         /** Waits for the held drawable on the queue and names its texture for this frame. */
@@ -694,13 +738,8 @@ namespace rhi::metal
         MetalDevice                     &_device;
         NS::SharedPtr<CA::MetalLayer>    _layer{};
         NS::SharedPtr<CA::MetalDrawable> _drawable{}; ///< Held between NextTexture() and the present.
-        /// Frames presented and not yet on screen. Shared with the presented handlers, which may run
-        /// after this provider is gone.
-        std::shared_ptr<std::atomic<uint32_t>> _framesWaiting{std::make_shared<std::atomic<uint32_t>>(0U)};
-#if METRICS_ENABLED
-        std::shared_ptr<ShownFrames> _shown{std::make_shared<ShownFrames>()};
-        uint64_t                     _presents{}; ///< Presents made so far.
-#endif
+        /// Shared with the presented handlers, which may run after this provider is gone.
+        std::shared_ptr<PresentedFrames> _presented{std::make_shared<PresentedFrames>()};
         /// The layer's display link, which hands over a drawable once per refresh; 0 when unpaced.
         std::uintptr_t                _pacer{};
         TextureHandle                 _texture{}; ///< The drawable's texture, named for this frame only.

@@ -16,10 +16,10 @@ parameter, such as its push constants, with each field's name, offset, size and 
 slangc's reflection. A caller fills a parameter by field name with rhi::ShaderLayout instead of
 repeating the struct in C++.
 
-It never emits C++: an application ships the output directory and reads libraries from it (see
-rhi::ReadShaderArtifact). Slang is a tooling concern only; the RHI core and backends do not know
-about it.
+For CPU, Slang emits C++ and CMake builds it into a native compute library. The generated bridge
+adapts the reflected parameter block and dispatch entry points to LightRHI.
 """
+
 import argparse
 import json
 import pathlib
@@ -87,15 +87,7 @@ def validate_manifest(manifest_path: pathlib.Path, manifest: dict) -> None:
 # ---------------------------------------------------------------------------
 
 _METAL_MISSING_STRUCT_DEFS = {
-    "RayDesc": (
-        "struct RayDesc\n"
-        "{\n"
-        "    float3 Origin;\n"
-        "    float TMin;\n"
-        "    float3 Direction;\n"
-        "    float TMax;\n"
-        "};\n"
-    ),
+    "RayDesc": ("struct RayDesc\n{\n    float3 Origin;\n    float TMin;\n    float3 Direction;\n    float TMax;\n};\n"),
 }
 
 _METAL_INJECT_ANCHOR = "using namespace metal;"
@@ -180,7 +172,7 @@ def _inject_ids_for_struct(text: str, struct_name: str) -> tuple[str, bool]:
             next_id += 1
         out_lines.append(line)
 
-    text = text[:sm.start()] + sm.group(1) + "\n".join(out_lines) + sm.group(3) + text[sm.end():]
+    text = text[: sm.start()] + sm.group(1) + "\n".join(out_lines) + sm.group(3) + text[sm.end() :]
     return text, True
 
 
@@ -192,11 +184,15 @@ def postprocess_metal_file(path: pathlib.Path) -> None:
     if injected or ids_injected:
         path.write_text(text)
         if injected:
-            print(f"[compile_shaders]   postprocessed {path.name}: injected missing struct definition(s): "
-                  f"{', '.join(injected)} (slang metal codegen workaround)")
+            print(
+                f"[compile_shaders]   postprocessed {path.name}: injected missing struct definition(s): "
+                f"{', '.join(injected)} (slang metal codegen workaround)"
+            )
         if ids_injected:
-            print(f"[compile_shaders]   postprocessed {path.name}: injected [[id(n)]] "
-                  f"argument-buffer annotations (slang metal codegen workaround)")
+            print(
+                f"[compile_shaders]   postprocessed {path.name}: injected [[id(n)]] "
+                f"argument-buffer annotations (slang metal codegen workaround)"
+            )
 
 
 LAYOUT_HEADER = "lightrhi shader layout 1"
@@ -205,8 +201,11 @@ DESCRIPTOR_BYTES = 8  # a DescriptorHandle in a struct, on every backend
 
 def field_type(reflected: dict) -> str | None:
     """A field's type as a layout names it: a scalar type ("float32"), a vector of one ("float32x2"),
-    or a pointer to a type, as Slang names that type ("pointer float2"); None for any other kind."""
+    a pointer to a type, as Slang names that type ("pointer float2"), or a struct by its name, such as
+    a record of bit-fields packed in one word ("struct ChannelRulesPacked"); None for any other kind."""
     kind = reflected.get("kind")
+    if kind == "struct":
+        return f"struct {reflected.get('name', '')}".rstrip()
     if kind == "scalar":
         return reflected["scalarType"]
     if kind == "vector":
@@ -219,8 +218,8 @@ def field_type(reflected: dict) -> str | None:
 def write_layout(reflection: pathlib.Path, layout: pathlib.Path) -> None:
     """Writes the fields of every struct parameter in `reflection`, one line each, to `layout`:
 
-        parameter <name>
-        field <name> <offset> <size> <type>
+    parameter <name>
+    field <name> <offset> <size> <type>
     """
     lines = [LAYOUT_HEADER]
     for parameter in json.loads(reflection.read_text()).get("parameters", []):
@@ -245,20 +244,135 @@ def write_layout(reflection: pathlib.Path, layout: pathlib.Path) -> None:
                 continue
             offset = binding["offset"] + descriptors * DESCRIPTOR_BYTES
             end = offset + binding["size"]
-            typed = field_type(field.get("type", {}))
+            type_desc = field.get("type", {})
+            typed = "descriptor" if type_desc.get("kind") in ("resource", "samplerState") else field_type(type_desc)
             if typed is not None:
                 lines.append(f"field {field['name']} {offset} {binding['size']} {typed}")
     layout.write_text("\n".join(lines) + "\n")
 
 
-def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pathlib.Path,
-                    include_dirs: list[pathlib.Path], defines: list[str], metal_sdk: str | None) -> pathlib.Path:
-    """Compiles every entry point in `source` into one library, and returns its path."""
+GROUP_INTRINSIC = re.compile(r"LightRhiCpuGroup(?:Sync|Address)\(")
+
+
+def write_cpu_bridge(generated: pathlib.Path, reflection: pathlib.Path, group_entries: set[str]) -> None:
+    """Adapts the Slang dispatch ABI to the private native library ABI. Entries in `group_entries` use
+    workgroup barriers or shared memory, so their lanes run together; the others use Slang's serial loop."""
+    info = json.loads(reflection.read_text())
+    parameters = info.get("parameters", [])
+    size = 0
+    globals_code = "void *globals = nullptr;"
+    if parameters:
+        # The RHI shader ABI has one root constant block. Slang emits a pointer to it at offset
+        # zero in its global parameters. Texture/sampler descriptors in the block are pointers.
+        if (
+            len(parameters) != 1
+            or parameters[0]["type"]["kind"] != "constantBuffer"
+            or parameters[0]["binding"]["offset"] != 0
+        ):
+            raise ValueError(f"{reflection}: CPU kernels require at most one root constant block")
+        size = parameters[0]["type"]["elementVarLayout"]["binding"]["size"]
+        globals_code = "void *globals = &push;"
+    source = generated.read_text()
+    # Isolate the shader's exported name from C runtime and C++ library symbols (e.g. "copy").
+    wrappers = []
+    entries = []
+    for i, entry in enumerate(info["entryPoints"]):
+        name = entry["name"]
+        x, y, z = entry["threadGroupSize"]
+        # Slang's lane entry point has no workgroup context. Adapt it only for kernels that use
+        # our workgroup intrinsics. The other kernels use Slang's own serial grid loop.
+        uses_group = name in group_entries
+        wrappers.append(f"""
+static void dispatch{i}(light_rhi_cpu::Grid groups, void *push)
+{{
+    {globals_code}
+    ComputeVaryingInput varying{{{{0, 0, 0}}, {{groups.X, groups.Y, groups.Z}}}};
+    lrh_shader::{name}(&varying, nullptr, globals);
+}}
+""")
+        if uses_group:
+            wrappers.append(f"""
+static void lane{i}(light_rhi_cpu::Grid group, light_rhi_cpu::Grid lane, void *push,
+                    const light_rhi_cpu::Workgroup *context)
+{{
+    {globals_code}
+    ComputeThreadVaryingInput varying{{{{group.X, group.Y, group.Z}}, {{lane.X, lane.Y, lane.Z}}}};
+    light_rhi_cpu::CurrentWorkgroup = context;
+    lrh_shader::{name}_Thread(&varying, nullptr, globals);
+    light_rhi_cpu::CurrentWorkgroup = nullptr;
+}}
+""")
+        lane = f"lane{i}" if uses_group else "nullptr"
+        wrappers.append(
+            f"static constexpr light_rhi_cpu::Kernel kernel{i}{{dispatch{i}, {lane}, {{{x}, {y}, {z}}}, {size}}};"
+        )
+        entries.append(f'    if (std::strcmp(name, "{name}") == 0) return &kernel{i};')
+    # Slang's output starts with its prelude include; everything after it goes in the shader's namespace.
+    lines = source.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.startswith("#include") and "prelude" in line), None)
+    if first is None:
+        raise ValueError(f"{generated}: Slang's C++ output has no prelude include")
+    prelude, body = "\n".join(lines[: first + 1]), "\n".join(lines[first + 1 :])
+    # Keep only the bridge in the native library's exported symbol table.
+    generated.write_text(
+        f'#include "kernel_abi.h"\n#include <cstring>\n{prelude}\n'
+        "#undef SLANG_PRELUDE_EXPORT\n#define SLANG_PRELUDE_EXPORT\n"
+        f"namespace lrh_shader {{\n{body}\n}}\n"
+        + "\n".join(wrappers)
+        + "\nSLANG_PRELUDE_EXTERN_C SLANG_PRELUDE_SHARED_LIB_EXPORT\n"
+        "const light_rhi_cpu::Kernel *lightRhiFindCpuKernel(const char *name)\n{\n"
+        + "\n".join(entries)
+        + "\n    return nullptr;\n}\n"
+    )
+
+
+def cpu_group_entries(cmd: list[str], output: pathlib.Path, entries: list[str]) -> set[str]:
+    """The entries whose code uses workgroup intrinsics. Slang emits only what an entry reaches, so one
+    entry compiled alone shows exactly what it uses; that is done only when the library uses them at all."""
+    if not GROUP_INTRINSIC.search(output.read_text()):
+        return set()
+    if len(entries) <= 1:
+        return set(entries)
+    # The same compile, without the outputs, the entry list and the reflection, which each run sets itself.
+    base, skip = [], False
+    for arg in cmd:
+        if skip:
+            skip = False
+        elif arg in ("-o", "-entry", "-reflection-json"):
+            skip = True
+        else:
+            base.append(arg)
+    source = base.pop()
+    found = set()
+    for entry in entries:
+        alone = output.with_name(f"{output.stem}.{entry}.cpp")
+        subprocess.run(base + ["-o", str(alone), source, "-entry", entry], check=True)
+        if GROUP_INTRINSIC.search(alone.read_text()):
+            found.add(entry)
+        alone.unlink()
+    return found
+
+
+def compile_library(
+    slangc: str,
+    source: pathlib.Path,
+    backend: str,
+    out_dir: pathlib.Path,
+    include_dirs: list[pathlib.Path],
+    defines: list[str],
+    metal_sdk: str | None,
+    metal_debug_info: bool,
+    cpu_entries: list[str],
+) -> pathlib.Path:
+    """Compile a source into one library, with only its listed compute entries on CPU."""
     library = source.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [slangc]
-    if backend == "vulkan":
+    if backend == "cpu":
+        output = out_dir / "intermediate" / f"{library}.cpp"
+        cmd += ["-target", "cpp", "-D", "LIGHTRHI_CPU=1"]
+    elif backend == "vulkan":
         output = out_dir / f"{library}.spv"
         # GPU-addressed structs are shared with C++: emit their C-compatible member layout. Keep
         # each entry point's own name instead of Slang's default "main", so one module can hold
@@ -280,17 +394,23 @@ def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pa
     reflection = out_dir / "intermediate" / f"{library}.reflection.json"
     reflection.parent.mkdir(parents=True, exist_ok=True)
     cmd += ["-reflection-json", str(reflection)]
-    # No -entry: slangc takes every [shader(...)] entry point the source declares.
     cmd += ["-o", str(msl if backend == "metal" else output), str(source)]
+    for entry in cpu_entries:
+        cmd += ["-entry", entry]
     print(f"[compile_shaders] {source.name} -> {output.name}")
     subprocess.run(cmd, check=True)
     write_layout(reflection, out_dir / f"{library}.layout")
+    if backend == "cpu":
+        write_cpu_bridge(output, reflection, cpu_group_entries(cmd, output, cpu_entries))
 
     if backend == "metal":
         postprocess_metal_file(msl)
         if metal_sdk:
             air = msl.with_suffix(".air")
-            subprocess.run(["xcrun", "-sdk", metal_sdk, "metal", "-c", str(msl), "-o", str(air)], check=True)
+            metal_flags = ["-frecord-sources", "-gline-tables-only"] if metal_debug_info else []
+            subprocess.run(
+                ["xcrun", "-sdk", metal_sdk, "metal", *metal_flags, "-c", str(msl), "-o", str(air)], check=True
+            )
             subprocess.run(["xcrun", "-sdk", metal_sdk, "metallib", str(air), "-o", str(output)], check=True)
     return output
 
@@ -298,33 +418,81 @@ def compile_library(slangc: str, source: pathlib.Path, backend: str, out_dir: pa
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shaders-json", required=True, type=pathlib.Path)
-    parser.add_argument("--output-dir", required=True, type=pathlib.Path,
-                        help="Where the libraries are written, one per .slang file")
+    parser.add_argument(
+        "--output-dir", required=True, type=pathlib.Path, help="Where the libraries are written, one per .slang file"
+    )
     parser.add_argument("--slangc", required=True, help="Path to the slangc compiler")
-    parser.add_argument("--backend", choices=["vulkan", "metal"], required=True)
-    parser.add_argument("--only-source", help="Compile only this .slang file from the manifest (lets the build "
-                                              "system compile each library as its own step, in parallel)")
-    parser.add_argument("--include-dir", action="append", dest="include_dirs", default=[], type=pathlib.Path,
-                        help="Extra directory for slangc to resolve #include \"...\" against (repeatable) - "
-                             "needed when a shader includes a header living outside its own directory.")
-    parser.add_argument("--metal-sdk", help="Compile Metal libraries ahead of time for this Apple SDK "
-                                            "(macosx, iphoneos, iphonesimulator, ...)")
-    parser.add_argument("--define", action="append", dest="defines", default=[],
-                        help="Slang preprocessor definition as NAME or NAME=VALUE (repeatable).")
+    parser.add_argument("--backend", choices=["vulkan", "metal", "cpu"], required=True)
+    parser.add_argument(
+        "--only-source",
+        help="Compile only this .slang file from the manifest (lets the build "
+        "system compile each library as its own step, in parallel)",
+    )
+    parser.add_argument(
+        "--include-dir",
+        action="append",
+        dest="include_dirs",
+        default=[],
+        type=pathlib.Path,
+        help='Extra directory for slangc to resolve #include "..." against (repeatable) - '
+        "needed when a shader includes a header living outside its own directory.",
+    )
+    parser.add_argument(
+        "--metal-sdk",
+        help="Compile Metal libraries ahead of time for this Apple SDK (macosx, iphoneos, iphonesimulator, ...)",
+    )
+    parser.add_argument(
+        "--metal-debug-info",
+        action="store_true",
+        help="Embed Metal shader source and line tables in precompiled libraries.",
+    )
+    parser.add_argument(
+        "--define",
+        action="append",
+        dest="defines",
+        default=[],
+        help="Slang preprocessor definition as NAME or NAME=VALUE (repeatable).",
+    )
     args = parser.parse_args()
+    if args.metal_debug_info and (args.backend != "metal" or not args.metal_sdk):
+        parser.error("--metal-debug-info requires --backend metal and --metal-sdk")
 
     manifest = load_manifest(args.shaders_json)
     shaders_root = args.shaders_json.parent
 
-    sources = list(dict.fromkeys(entry["source"] for entry in manifest["shaders"]))
+    sources = list(
+        dict.fromkeys(
+            entry["source"] for entry in manifest["shaders"] if args.backend != "cpu" or entry["stage"] == "compute"
+        )
+    )
     if args.only_source is not None:
         if args.only_source not in sources:
             raise ValueError(f"{args.shaders_json}: no shader entry comes from '{args.only_source}'")
         sources = [args.only_source]
 
     for source in sources:
-        compile_library(args.slangc, shaders_root / source, args.backend, args.output_dir,
-                        args.include_dirs, args.defines, args.metal_sdk)
+        cpu_entries = (
+            list(
+                dict.fromkeys(
+                    entry["entryPoint"]
+                    for entry in manifest["shaders"]
+                    if entry["source"] == source and entry["stage"] == "compute"
+                )
+            )
+            if args.backend == "cpu"
+            else []
+        )
+        compile_library(
+            args.slangc,
+            shaders_root / source,
+            args.backend,
+            args.output_dir,
+            args.include_dirs,
+            args.defines,
+            args.metal_sdk,
+            args.metal_debug_info,
+            cpu_entries,
+        )
     return 0
 
 

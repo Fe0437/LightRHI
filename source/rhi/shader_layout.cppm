@@ -34,8 +34,8 @@ export namespace rhi
         std::uint32_t Size{};   ///< Bytes it takes.
         /**
          * The type as a layout names it: a scalar ("float32", "uint32"), a vector of one
-         * ("float32x2"), or a pointer to a type as the shader language names that type
-         * ("pointer float2").
+         * ("float32x2"), a pointer to a type as the shader language names that type
+         * ("pointer float2"), or a struct by its name ("struct ChannelRulesPacked").
          */
         std::string Type;
     };
@@ -137,20 +137,23 @@ export namespace rhi
         /** {brief} Read one line after the header; false when it is neither a parameter nor a field of one. */
         [[nodiscard]] bool _read(std::string_view line)
         {
-            const auto word{[&line]
-                            {
-                                const auto space{line.find(' ')};
-                                const auto taken{line.substr(0, space)};
-                                line = space == std::string_view::npos ? std::string_view{} : line.substr(space + 1U);
-                                return taken;
-                            }};
-            const auto number{[&word](std::uint32_t &value)
-                              {
-                                  const auto text{word()};
-                                  const auto [end,
-                                              error]{std::from_chars(text.data(), text.data() + text.size(), value)};
-                                  return error == std::errc{} && end == text.data() + text.size();
-                              }};
+            const auto word{
+                [&line]
+                {
+                    const auto space{line.find(' ')};
+                    const auto taken{line.substr(0, space)};
+                    line = space == std::string_view::npos ? std::string_view{} : line.substr(space + 1U);
+                    return taken;
+                },
+            };
+            const auto number{
+                [&word](std::uint32_t &value)
+                {
+                    const auto text{word()};
+                    const auto [end, error]{std::from_chars(text.data(), text.data() + text.size(), value)};
+                    return error == std::errc{} && end == text.data() + text.size();
+                },
+            };
             const auto kind{word()};
             if (kind == "parameter" && !line.empty())
             {
